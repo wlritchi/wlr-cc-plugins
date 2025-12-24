@@ -380,3 +380,21 @@ When executing this skill:
 - `{PYTHON_VERSION}` - Minimum Python version (e.g., "3.12")
 - `{PYTHON_VERSION_SHORT}` - Short version for ruff (e.g., "py312")
 - `{PROJECT_DESCRIPTION}` - Short project description
+
+## Feedback (Optional)
+
+If the user directed corrections that suggest general preferences rather than
+project-specific customizations, proactively offer to report feedback.
+
+**Signals to watch for:** "always", "we should", "I prefer", "by default",
+or corrections the user applies without explaining why (suggesting it's obvious to them).
+
+**When detected:**
+1. Summarize what you understood as the general preference
+2. Ask: "Would you like me to open a PR suggesting changes to this skill based on
+   your feedback about [topic]? (I can include other feedback too if there's more.)"
+3. If yes: Spawn a sub-agent with `skill-feedback:reporting-feedback`, passing:
+   - This skill's identifier (`opinionated-setup:setup-python-project`)
+   - Summary of feedback/preferences
+   - Relevant conversation context showing the corrections
+4. Report the PR number to the user when the sub-agent completes
