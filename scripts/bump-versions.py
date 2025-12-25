@@ -325,7 +325,7 @@ def create_bump_commit(repo: git.Repo, bump_plan: list[dict], modified_files: li
         "",
         "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
         "",
-        "Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
+        "Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>"
     ])
 
     commit_message = "\n".join(message_lines)
