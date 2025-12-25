@@ -51,6 +51,42 @@ def get_plugins() -> list[dict]:
     return plugins
 
 
+def find_last_version_bump(repo: git.Repo, plugin_name: str) -> Optional[str]:
+    """Find the last commit that bumped this plugin's version.
+
+    Returns the commit SHA, or None if no version bump found.
+    """
+    # Files to check for version changes
+    files_to_check = [
+        ".claude-plugin/marketplace.json",
+        f"{plugin_name}/.claude-plugin/plugin.json"
+    ]
+
+    # Get commit history for these files
+    try:
+        commits = list(repo.iter_commits(paths=files_to_check, max_count=100))
+    except git.GitCommandError:
+        return None
+
+    # Check each commit to see if it actually changed the version
+    for commit in commits:
+        try:
+            # Check the diff for this commit
+            if commit.parents:
+                parent = commit.parents[0]
+                diffs = parent.diff(commit, paths=files_to_check, create_patch=True)
+
+                for diff in diffs:
+                    # Look for version field changes in the patch
+                    if diff.diff and b'"version"' in diff.diff:
+                        # Found a version change
+                        return commit.hexsha
+        except (IndexError, git.GitCommandError):
+            continue
+
+    return None
+
+
 def main() -> int:
     """Main entry point for version bumping script."""
     print("🔍 Analyzing repository for version bumps...")
@@ -72,6 +108,15 @@ def main() -> int:
 
     # Load plugins
     plugins = get_plugins()
+
+    # Find last version bump for each plugin
+    print("\n🔎 Finding last version bumps...")
+    for plugin in plugins:
+        last_bump = find_last_version_bump(repo, plugin["name"])
+        if last_bump:
+            print(f"  - {plugin['name']}: {last_bump[:8]}")
+        else:
+            print(f"  - {plugin['name']}: (no version bump found, using repo root)")
 
     return 0
 
