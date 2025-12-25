@@ -1,5 +1,6 @@
 #!/usr/bin/env -S uv run -qs
 # /// script
+# requires-python = ">=3.12"
 # dependencies = [
 #   "anthropic>=0.40.0",
 #   "gitpython>=3.1.0",
@@ -244,7 +245,7 @@ Version bump type:"""
 
     try:
         response = client.messages.create(
-            model="claude-haiku-4-20250514",
+            model="claude-haiku-4-5",
             max_tokens=10,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -325,7 +326,7 @@ def create_bump_commit(repo: git.Repo, bump_plan: list[dict], modified_files: li
         "",
         "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
         "",
-        "Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
+        "Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>"
     ])
 
     commit_message = "\n".join(message_lines)
