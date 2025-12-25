@@ -312,6 +312,63 @@ def update_plugin_versions(bump_plan: list[dict]) -> list[str]:
     return modified_files
 
 
+def create_bump_commit(repo: git.Repo, bump_plan: list[dict], modified_files: list[str]) -> None:
+    """Create commit for version bumps."""
+    # Build commit message
+    message_lines = ["chore: bump versions", ""]
+
+    for plan in bump_plan:
+        line = f"- {plan['plugin_name']}: {plan['current_version']} → {plan['new_version']} ({plan['bump_type']})"
+        message_lines.append(line)
+
+    message_lines.extend([
+        "",
+        "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "",
+        "Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
+    ])
+
+    commit_message = "\n".join(message_lines)
+
+    # Stage modified files using git command
+    repo.git.add(modified_files)
+
+    # Create commit using git command
+    repo.git.commit("-m", commit_message)
+    print("\n✓ Created version bump commit")
+
+
+def push_changes(repo: git.Repo) -> bool:
+    """Push changes with fast-forward-only semantics.
+
+    Returns True if push succeeded, False if rejected (another commit arrived).
+    """
+    try:
+        # Push to main with no force
+        origin = repo.remote("origin")
+        push_info = origin.push("HEAD:main")[0]
+
+        # Check if push was rejected
+        if push_info.flags & push_info.ERROR:
+            print("\n⚠️  Push rejected (another commit arrived). Exiting gracefully.")
+            print("   (Next workflow run will pick up all changes)")
+            return False
+
+        print("\n✓ Version bump pushed successfully")
+        return True
+
+    except git.GitCommandError as e:
+        error_msg = str(e).lower()
+        if "non-fast-forward" in error_msg or "rejected" in error_msg:
+            print("\n⚠️  Push rejected (another commit arrived). Exiting gracefully.")
+            print("   (Next workflow run will pick up all changes)")
+            return False
+        else:
+            # Actual error
+            print(f"\n❌ Push error: {e}")
+            raise
+
+
 def main() -> int:
     """Main entry point for version bumping script."""
     print("🔍 Analyzing repository for version bumps...")
@@ -396,6 +453,12 @@ def main() -> int:
     # Update JSON files
     print("\n📝 Updating version files...")
     modified_files = update_plugin_versions(bump_plan)
+
+    # Create commit
+    create_bump_commit(repo, bump_plan, modified_files)
+
+    # Push changes
+    success = push_changes(repo)
 
     return 0
 
