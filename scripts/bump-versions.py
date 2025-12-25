@@ -18,6 +18,30 @@ import anthropic
 import git
 
 
+def load_marketplace_config() -> dict:
+    """Load marketplace.json to get list of plugins."""
+    marketplace_path = Path(".claude-plugin/marketplace.json")
+
+    if not marketplace_path.exists():
+        print(f"❌ Error: {marketplace_path} not found")
+        sys.exit(1)
+
+    with open(marketplace_path) as f:
+        return json.load(f)
+
+
+def get_plugins() -> list[dict]:
+    """Get list of plugins from marketplace config."""
+    config = load_marketplace_config()
+    plugins = config.get("plugins", [])
+
+    print(f"📦 Found {len(plugins)} plugins:")
+    for plugin in plugins:
+        print(f"  - {plugin['name']} (v{plugin['version']})")
+
+    return plugins
+
+
 def main() -> int:
     """Main entry point for version bumping script."""
     print("🔍 Analyzing repository for version bumps...")
@@ -36,6 +60,10 @@ def main() -> int:
         return 1
 
     print("✓ Environment validated")
+
+    # Load plugins
+    plugins = get_plugins()
+
     return 0
 
 
