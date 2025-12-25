@@ -148,6 +148,8 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 ```
 
+**Note:** The script must be executable (`chmod +x deps-runtime.sh`) before adding to your repository. The example commands shown are for illustration—your project may not need package installation or may require different setup steps depending on your dependencies.
+
 **Benefits:** Easier to maintain, better readability for long package lists, can be versioned and tested independently, enables conditional logic that's awkward in Dockerfile RUN.
 
 ### Entrypoint Script Pattern
@@ -175,6 +177,8 @@ else
     exec python -m your_package.entrypoint
 fi
 ```
+
+**Note:** The entrypoint script must be executable (`chmod +x entrypoint.sh`) before adding to your repository. The example logic shown (working directory handling, config copying) is for illustration—adapt these patterns to your project's specific initialization needs or omit them if not required.
 
 **Dockerfile usage:**
 ```dockerfile
