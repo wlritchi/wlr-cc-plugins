@@ -5,6 +5,8 @@ description: Use when a sub-agent needs to open a PR with skill improvement sugg
 
 # Reporting Feedback
 
+<!-- Test change for version bump automation -->
+
 Open a PR in the wlr-cc-plugins repo suggesting changes to a skill based on user feedback from a skill execution session.
 
 ## Input Expected
