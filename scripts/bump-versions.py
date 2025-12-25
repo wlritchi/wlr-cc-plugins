@@ -10,6 +10,7 @@
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -78,9 +79,12 @@ def find_last_version_bump(repo: git.Repo, plugin_name: str) -> Optional[str]:
 
                 for diff in diffs:
                     # Look for version field changes in the patch
-                    if diff.diff and b'"version"' in diff.diff:
-                        # Found a version change
-                        return commit.hexsha
+                    if diff.diff:
+                        # Match actual JSON version field changes like: "version": "0.1.0"
+                        # This requires the pattern to appear on changed lines (+ or - in diff)
+                        version_pattern = rb'[+-].*"version"\s*:\s*"[0-9]+\.[0-9]+\.[0-9]+"'
+                        if re.search(version_pattern, diff.diff):
+                            return commit.hexsha
         except (IndexError, git.GitCommandError):
             continue
 
