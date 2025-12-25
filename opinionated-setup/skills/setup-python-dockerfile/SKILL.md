@@ -37,7 +37,11 @@ FROM python:3.12-slim-bookworm AS runtime
 WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 # Optional: install runtime system deps
-RUN apt-get update && apt-get install -y --no-install-recommends tini {RUNTIME_APT} && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends tini {RUNTIME_APT} && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash app
 USER app
@@ -74,7 +78,11 @@ ARG BUILD_DATE
 LABEL org.opencontainers.image.version="$VERSION" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.created="$BUILD_DATE"
-RUN apt-get update && apt-get install -y --no-install-recommends tini {RUNTIME_APT} && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends tini {RUNTIME_APT} && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --shell /bin/bash app
 USER app
 WORKDIR /home/app
@@ -89,8 +97,95 @@ CMD ["/home/app/.venv/bin/python", "-m", "{ENTRYPOINT}"]
 
 - **Enable BuildKit**: Set `DOCKER_BUILDKIT=1` when building to allow cache mounts
 - **Deterministic runtime**: Copy `.venv` from build stage instead of running pip installs at runtime
-- **Process management**: Use `tini` or `dumb-init` as ENTRYPOINT to handle signals and avoid orphaned processes
+- **Process management**: Use `tini` or `dumb-init` as ENTRYPOINT to handle signals and avoid orphaned processes (see Init Systems section below)
 - **Native libraries**: If you need helper scripts to install native libs, generate them in the build stage and COPY them into runtime
+- **DEBIAN_FRONTEND**: Always set `DEBIAN_FRONTEND=noninteractive` in apt-get RUN commands to prevent interactive prompts from hanging builds
+- **Security hardening** (optional): Add `apt-get -y upgrade` before installing packages to apply security patches to base image packages. Tradeoff: less reproducible builds, larger layers, longer build times
+- **ARG propagation**: Build args don't propagate between stages automatically—redeclare them in each stage where needed (e.g., `ARG VERSION` must be declared in both build and runtime stages to use in labels)
+
+### Init Systems
+
+Both `tini` and `dumb-init` handle proper PID 1 behavior (reaping zombies, signal forwarding):
+
+| Init System | Package | Notes |
+|-------------|---------|-------|
+| tini | `tini` | Lightweight, widely used, single binary |
+| dumb-init | `dumb-init` | From Yelp, similar functionality |
+
+```dockerfile
+# tini
+ENTRYPOINT ["tini", "--"]
+
+# dumb-init (--single-child for similar behavior to tini)
+ENTRYPOINT ["/usr/bin/dumb-init", "--single-child", "--"]
+```
+
+## Advanced Patterns
+
+### External Scripts for Complex Setups
+
+For projects with complex runtime setup needs (GPG key imports, conditional dependencies, config file handling), use external shell scripts instead of inline RUN commands:
+
+```dockerfile
+# Build stage copies scripts
+COPY docker/ /app/docker/
+
+# Runtime stage uses scripts
+COPY --from=build /app/docker /app/docker
+RUN /app/docker/deps-runtime.sh
+```
+
+**Example `deps-runtime.sh`:**
+```bash
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get -y install --no-install-recommends \
+    your-package-1 \
+    your-package-2
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+```
+
+**Note:** The script must be executable (`chmod +x deps-runtime.sh`) before adding to your repository. The example commands shown are for illustration—your project may not need package installation or may require different setup steps depending on your dependencies.
+
+**Benefits:** Easier to maintain, better readability for long package lists, can be versioned and tested independently, enables conditional logic that's awkward in Dockerfile RUN.
+
+### Entrypoint Script Pattern
+
+For runtime initialization (config copying, secret handling, working directory setup), use an entrypoint script:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Optional: handle working directory
+if [ -n "${WORKING_DIR:-}" ]; then
+    cd "$WORKING_DIR"
+fi
+
+# Optional: copy config from mounted volumes
+if [ -d /config ] && [ -f /config/app.conf ]; then
+    cp /config/app.conf ~/.config/app/
+fi
+
+# Execute command or default
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+else
+    exec python -m your_package.entrypoint
+fi
+```
+
+**Note:** The entrypoint script must be executable (`chmod +x entrypoint.sh`) before adding to your repository. The example logic shown (working directory handling, config copying) is for illustration—adapt these patterns to your project's specific initialization needs or omit them if not required.
+
+**Dockerfile usage:**
+```dockerfile
+COPY --from=build --chown=app:app /app/docker/entrypoint.sh /app/entrypoint.sh
+ENTRYPOINT ["tini", "--", "/app/entrypoint.sh"]
+CMD ["python", "-m", "your_package.entrypoint"]
+```
 
 ## Execution Instructions
 
