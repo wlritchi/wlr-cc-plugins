@@ -183,20 +183,6 @@ ENTRYPOINT ["tini", "--", "/app/entrypoint.sh"]
 CMD ["python", "-m", "your_package.entrypoint"]
 ```
 
-### HEALTHCHECK (Optional)
-
-For production deployments, add health checks:
-
-```dockerfile
-# Basic Python import check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import your_package" || exit 1
-
-# For web services
-HEALTHCHECK --interval=30s --timeout=3s \
-    CMD curl -f http://localhost:8000/health || exit 1
-```
-
 ## Execution Instructions
 
 When executing this skill:
