@@ -26,8 +26,12 @@ def load_marketplace_config() -> dict:
         print(f"❌ Error: {marketplace_path} not found")
         sys.exit(1)
 
-    with open(marketplace_path) as f:
-        return json.load(f)
+    try:
+        with open(marketplace_path) as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"❌ Error: Invalid JSON in {marketplace_path}: {e}")
+        sys.exit(1)
 
 
 def get_plugins() -> list[dict]:
@@ -37,7 +41,12 @@ def get_plugins() -> list[dict]:
 
     print(f"📦 Found {len(plugins)} plugins:")
     for plugin in plugins:
-        print(f"  - {plugin['name']} (v{plugin['version']})")
+        name = plugin.get('name', 'unknown')
+        version = plugin.get('version', 'unknown')
+        if name == 'unknown' or version == 'unknown':
+            print(f"  ⚠️  Plugin missing name or version: {plugin}")
+            continue
+        print(f"  - {name} (v{version})")
 
     return plugins
 
