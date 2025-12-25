@@ -1,5 +1,6 @@
 #!/usr/bin/env -S uv run -qs
 # /// script
+# requires-python = ">=3.12"
 # dependencies = [
 #   "anthropic>=0.40.0",
 #   "gitpython>=3.1.0",
