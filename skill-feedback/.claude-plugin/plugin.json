@@ -1,6 +1,8 @@
 {
   "name": "skill-feedback",
   "description": "Capture and report feedback about skill execution to improve skills over time",
-  "version": "0.1.0",
-  "author": { "name": "wlritchi" }
+  "version": "0.2.0",
+  "author": {
+    "name": "wlritchi"
+  }
 }

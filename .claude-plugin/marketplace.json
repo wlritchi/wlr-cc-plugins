@@ -8,15 +8,19 @@
       "name": "opinionated-setup",
       "source": "./opinionated-setup",
       "description": "Opinionated project and Dockerfile setup: pyproject, pre-commit, Dockerfile templates and helper instructions",
-      "version": "0.1.0",
-      "author": { "name": "wlritchi" }
+      "version": "0.2.0",
+      "author": {
+        "name": "wlritchi"
+      }
     },
     {
       "name": "skill-feedback",
       "source": "./skill-feedback",
       "description": "Capture and report feedback about skill execution to improve skills over time",
-      "version": "0.1.0",
-      "author": { "name": "wlritchi" }
+      "version": "0.2.0",
+      "author": {
+        "name": "wlritchi"
+      }
     }
   ]
 }
