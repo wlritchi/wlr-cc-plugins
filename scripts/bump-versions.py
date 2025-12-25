@@ -205,6 +205,63 @@ def bump_version(current: str, bump_type: str) -> str:
         return f"{major}.{minor + 1}.0"
 
 
+def analyze_changes_with_claude(
+    client: anthropic.Anthropic,
+    plugin_name: str,
+    current_version: str,
+    changes_context: dict
+) -> str:
+    """Use Claude to analyze changes and determine bump type.
+
+    Returns: "major", "minor", or "patch"
+    """
+    commit_messages = changes_context["commit_messages"]
+    diff = changes_context["diff"]
+
+    # Truncate diff if too long (Claude has token limits)
+    max_diff_length = 50000
+    if len(diff) > max_diff_length:
+        diff = diff[:max_diff_length] + "\n\n[... diff truncated ...]"
+
+    prompt = f"""Analyze these changes to the "{plugin_name}" Claude Code plugin and determine the appropriate semantic version bump.
+
+Current version: {current_version}
+
+Commit messages since last bump:
+{commit_messages}
+
+Full diff:
+{diff}
+
+Context: This is a Claude Code plugin consisting primarily of skills (prompt templates) and documentation for Claude.
+
+Respond with ONLY one word: "patch", "minor", or "major"
+- patch: Bug fixes, typo corrections, small refinements
+- minor: New features, significant improvements (default if uncertain)
+- major: Breaking changes, incompatible modifications
+
+Version bump type:"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-20250514",
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        bump_type = response.content[0].text.strip().lower()
+
+        # Validate response
+        if bump_type not in ["patch", "minor", "major"]:
+            print(f"  ⚠️  Claude returned unexpected value '{bump_type}', defaulting to 'minor'")
+            return "minor"
+
+        return bump_type
+    except Exception as e:
+        print(f"  ⚠️  Claude API error: {e}, defaulting to 'minor'")
+        return "minor"
+
+
 def main() -> int:
     """Main entry point for version bumping script."""
     print("🔍 Analyzing repository for version bumps...")
@@ -251,6 +308,40 @@ def main() -> int:
         return 0
 
     print(f"\n📝 {len(plugins_to_bump)} plugin(s) need version bumps")
+
+    # Analyze each plugin with Claude
+    client = anthropic.Anthropic(api_key=api_key)
+    bump_plan = []
+
+    print("\n🤖 Analyzing changes with Claude...")
+    for item in plugins_to_bump:
+        plugin = item["plugin"]
+        plugin_name = plugin["name"]
+        current_version = plugin["version"]
+
+        print(f"\n  Analyzing {plugin_name}...")
+
+        # Get changes context
+        changes = get_changes_context(repo, plugin_name, item["last_bump"])
+
+        # Ask Claude
+        bump_type = analyze_changes_with_claude(client, plugin_name, current_version, changes)
+        new_version = bump_version(current_version, bump_type)
+
+        print(f"    {current_version} → {new_version} ({bump_type})")
+
+        bump_plan.append({
+            "plugin_name": plugin_name,
+            "current_version": current_version,
+            "new_version": new_version,
+            "bump_type": bump_type,
+            "plugin_dir": plugin["source"]
+        })
+
+    # Display summary
+    print("\n📋 Version bump plan:")
+    for plan in bump_plan:
+        print(f"  - {plan['plugin_name']}: {plan['current_version']} → {plan['new_version']} ({plan['bump_type']})")
 
     return 0
 
