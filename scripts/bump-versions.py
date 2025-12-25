@@ -170,6 +170,41 @@ def get_changes_context(repo: git.Repo, plugin_name: str, since_commit: Optional
     }
 
 
+def parse_version(version: str) -> tuple[int, int, int]:
+    """Parse semantic version string into (major, minor, patch)."""
+    parts = version.split('.')
+    if len(parts) != 3:
+        raise ValueError(f"Invalid version format: {version}")
+
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        raise ValueError(f"Invalid version format: {version}")
+
+
+def bump_version(current: str, bump_type: str) -> str:
+    """Bump a semantic version based on bump type.
+
+    Args:
+        current: Current version (e.g., "0.1.0")
+        bump_type: One of "major", "minor", or "patch"
+
+    Returns:
+        New version string
+    """
+    major, minor, patch = parse_version(current)
+
+    if bump_type == "major":
+        return f"{major + 1}.0.0"
+    elif bump_type == "minor":
+        return f"{major}.{minor + 1}.0"
+    elif bump_type == "patch":
+        return f"{major}.{minor}.{patch + 1}"
+    else:
+        # Default to minor if uncertain
+        return f"{major}.{minor + 1}.0"
+
+
 def main() -> int:
     """Main entry point for version bumping script."""
     print("🔍 Analyzing repository for version bumps...")
