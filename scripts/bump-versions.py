@@ -262,6 +262,56 @@ Version bump type:"""
         return "minor"
 
 
+def update_plugin_versions(bump_plan: list[dict]) -> list[str]:
+    """Update version fields in plugin.json and marketplace.json.
+
+    Returns list of modified file paths.
+    """
+    modified_files = []
+
+    # Update individual plugin.json files
+    for plan in bump_plan:
+        plugin_json_path = Path(plan["plugin_dir"]) / ".claude-plugin" / "plugin.json"
+
+        # Read plugin.json
+        with open(plugin_json_path) as f:
+            plugin_data = json.load(f)
+
+        # Update version
+        plugin_data["version"] = plan["new_version"]
+
+        # Write back with formatting
+        with open(plugin_json_path, "w") as f:
+            json.dump(plugin_data, f, indent=2)
+            f.write("\n")  # Add trailing newline
+
+        modified_files.append(str(plugin_json_path))
+        print(f"  ✓ Updated {plugin_json_path}")
+
+    # Update marketplace.json
+    marketplace_path = Path(".claude-plugin/marketplace.json")
+
+    with open(marketplace_path) as f:
+        marketplace_data = json.load(f)
+
+    # Update versions for each plugin
+    for plan in bump_plan:
+        for plugin in marketplace_data.get("plugins", []):
+            if plugin["name"] == plan["plugin_name"]:
+                plugin["version"] = plan["new_version"]
+                break
+
+    # Write back
+    with open(marketplace_path, "w") as f:
+        json.dump(marketplace_data, f, indent=2)
+        f.write("\n")
+
+    modified_files.append(str(marketplace_path))
+    print(f"  ✓ Updated {marketplace_path}")
+
+    return modified_files
+
+
 def main() -> int:
     """Main entry point for version bumping script."""
     print("🔍 Analyzing repository for version bumps...")
@@ -342,6 +392,10 @@ def main() -> int:
     print("\n📋 Version bump plan:")
     for plan in bump_plan:
         print(f"  - {plan['plugin_name']}: {plan['current_version']} → {plan['new_version']} ({plan['bump_type']})")
+
+    # Update JSON files
+    print("\n📝 Updating version files...")
+    modified_files = update_plugin_versions(bump_plan)
 
     return 0
 
