@@ -26,7 +26,7 @@ Convert the skill identifier to a file path:
 
 ```bash
 SKILL_PATH="{plugin}/skills/{skill}/SKILL.md"
-gh api repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH \
+gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" \
   --jq '.content' | base64 -d > /tmp/skill-edit.md
 ```
 
@@ -68,11 +68,11 @@ Use a short, descriptive branch name based on the feedback topic (e.g., `feedbac
 
 ```bash
 # Get current file SHA (needed for update)
-FILE_SHA=$(gh api repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH \
-  -H "ref: refs/heads/main" --jq '.sha')
+FILE_SHA=$(gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" \
+  --jq '.sha')
 
 # Commit the edited file
-gh api repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH \
+gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" \
   -X PUT \
   -f message="feat({plugin}): {short description}" \
   -f content="$(base64 -w 0 < /tmp/skill-edit.md)" \
