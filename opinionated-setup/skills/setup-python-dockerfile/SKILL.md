@@ -75,7 +75,11 @@ FROM python:3.12-slim-bookworm AS runtime
 ARG VERSION
 ARG VCS_REF
 ARG BUILD_DATE
-LABEL org.opencontainers.image.version="$VERSION" \
+ARG IMAGE_TITLE
+ARG IMAGE_SOURCE
+LABEL org.opencontainers.image.title="$IMAGE_TITLE" \
+      org.opencontainers.image.source="$IMAGE_SOURCE" \
+      org.opencontainers.image.version="$VERSION" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.created="$BUILD_DATE"
 RUN export DEBIAN_FRONTEND=noninteractive && \
@@ -187,6 +191,59 @@ ENTRYPOINT ["tini", "--", "/app/entrypoint.sh"]
 CMD ["python", "-m", "your_package.entrypoint"]
 ```
 
+### Multi-Entrypoint Base Image Pattern
+
+For monorepo-style projects or images that serve multiple purposes, build a "base" image with shared dependencies and use a generic placeholder CMD. Specific entrypoints are provided at runtime via `docker run` arguments or Kubernetes command overrides.
+
+**Dockerfile:**
+```dockerfile
+# ... build stage as usual ...
+
+FROM python:3.12-slim-bookworm AS runtime
+# ... setup as usual ...
+ENTRYPOINT ["tini", "--"]
+CMD ["echo", "Configure a command via docker run or Kubernetes command override"]
+```
+
+**Usage examples:**
+```bash
+# Run the API server
+docker run myapp python -m mypackage.api
+
+# Run the worker
+docker run myapp python -m mypackage.worker
+
+# Run a one-off migration script
+docker run myapp python -m mypackage.migrate
+```
+
+**Kubernetes example:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        image: myapp:latest
+        command: ["python", "-m", "mypackage.api"]
+---
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+      - name: worker
+        image: myapp:latest
+        command: ["python", "-m", "mypackage.worker"]
+```
+
+**Benefits:** Single image to build/push/scan, shared dependencies reduce storage and build time, consistent environment across all services.
+
+**When to use:** Multiple services sharing the same codebase, CLI tools packaged alongside services, scheduled jobs using the same dependencies as the main application.
+
 ## Execution Instructions
 
 When executing this skill:
@@ -213,6 +270,8 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg VERSION=$(git describe --tags --always) \
   --build-arg VCS_REF=$(git rev-parse --short HEAD) \
   --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+  --build-arg IMAGE_TITLE="My Application" \
+  --build-arg IMAGE_SOURCE="https://github.com/org/repo" \
   -t myapp .
 
 # Run the container
