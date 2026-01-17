@@ -5,6 +5,15 @@
   },
   "plugins": [
     {
+      "name": "a2a",
+      "source": "./a2a",
+      "description": "Agent-to-agent communication framework using filesystem-based messaging",
+      "version": "0.1.0",
+      "author": {
+        "name": "wlritchi"
+      }
+    },
+    {
       "name": "opinionated-setup",
       "source": "./opinionated-setup",
       "description": "Opinionated project and Dockerfile setup: pyproject, pre-commit, Dockerfile templates and helper instructions",
