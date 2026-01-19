@@ -30,7 +30,23 @@ This skill enables communication between Claude Code agents running in separate 
 | Send message | Write to `~/a2a/{recipient}/` |
 | Check inbox | List `*.md` without `.seen` marker |
 | Mark read | `touch {message}.seen` |
-| Watch for messages | `fswatch -1` or `inotifywait` or poll with `find` |
+| Watch for messages | Poll loop with `sleep` (recommended) or `fswatch`/`inotifywait` |
+
+---
+
+## Critical: Agent Lifecycle and Message Handling
+
+**When expecting to receive a2a messages, DO NOT send a final response to the user who launched you.**
+
+In SDK-style interactions (`claude -p "Prompt here..."`), returning a final message to the user terminates the agent. If you're running as a long-lived agent waiting for messages:
+
+- **DO NOT** announce to the user "I'm ready and listening for messages" - this terminates you
+- **DO NOT** send status updates that require no user action
+- **DO** enter your polling/watching loop silently
+- **DO** only communicate with other agents via the a2a directory
+- **DO** use background processes for watching if the harness supports it
+
+If you need to report status to the user, ensure you can continue your polling loop afterward. In most SDK contexts, any response you generate ends your session.
 
 ---
 
@@ -105,8 +121,11 @@ expects-reply: {true|false}
 
 `{timestamp}-{subject-slug}.md`
 
-- Timestamp: ISO 8601 with hyphens for filesystem safety (e.g., `2026-01-16T10-30-00Z`)
+- **Filename timestamp:** ISO 8601 with hyphens replacing colons for filesystem safety (e.g., `2026-01-16T10-30-00Z`)
+- **YAML frontmatter timestamp:** Standard ISO 8601 with colons (e.g., `2026-01-16T10:30:00Z`)
 - Subject slug: lowercase, hyphens, brief (e.g., `db-ready`, `schema-change`)
+
+**Note:** Colons are invalid in filenames on some systems (Windows), so we use hyphens in filenames but standard ISO 8601 in the YAML frontmatter where colons are safe.
 
 ### Before sending
 
@@ -167,34 +186,69 @@ When you find unread messages:
 
 When blocked or idle, watch your inbox for new messages.
 
-### Using fswatch (macOS)
+### Recommended: Polling Loop
+
+Polling is the most reliable approach across all environments (containers, minimal Linux, macOS). Use this as your default:
+
+```bash
+# Simple polling loop - check every 30 seconds
+while true; do
+  for f in ~/a2a/{your-agent-name}/*.md; do
+    [ -f "$f" ] && [ ! -f "$f.seen" ] && echo "UNREAD: $f"
+  done
+  sleep 30
+done
+```
+
+For long-running agents, use a longer sleep interval (e.g., 60-300 seconds) to reduce overhead.
+
+### Check Once Pattern
+
+When you just need to check for messages without blocking:
+
+```bash
+# Check once and return - no waiting
+for f in ~/a2a/{your-agent-name}/*.md; do
+  [ -f "$f" ] && [ ! -f "$f.seen" ] && echo "$f"
+done
+```
+
+This is useful when you're doing primary work and want to periodically check between tasks.
+
+### Using fswatch (macOS only)
 
 ```bash
 fswatch -1 -r ~/a2a/{your-agent-name}/
 ```
 
-### Using inotifywait (Linux)
+### Using inotifywait (Linux with inotify-tools)
 
 ```bash
 inotifywait -e create ~/a2a/{your-agent-name}/
 ```
 
-### Fallback: Polling with find
+**Note:** `fswatch` and `inotifywait` are often unavailable in containers or minimal environments. Prefer the polling approach unless you've verified these tools are installed.
+
+### Timeout and Background Handling
+
+When running long commands in Claude Code:
+
+- Commands may be backgrounded after the harness timeout (typically 60 seconds)
+- If backgrounded, you'll need to read the output file to check results
+- After a command goes to background, **kill it and restart** with a fresh polling loop
+- Track which messages you've processed to avoid duplicates when switching between background output and direct polling
+
+**Handling backgrounded watchers:**
 
 ```bash
-# Create timestamp marker
-touch /tmp/{your-agent-name}-last-check
+# If your watcher went to background, kill it by ID
+kill $BACKGROUND_SHELL_ID
 
-# Sleep, then check for new files
-sleep 300  # 5 minutes
-find ~/a2a/{your-agent-name}/ -name '*.md' -newer /tmp/{your-agent-name}-last-check -type f
+# Then restart with a fresh check
+for f in ~/a2a/{your-agent-name}/*.md; do
+  [ -f "$f" ] && [ ! -f "$f.seen" ] && echo "$f"
+done
 ```
-
-### Timeout handling
-
-- Set timeout as long as the harness allows (up to 1 hour if available)
-- If the command goes to background due to timeout, kill it and relaunch
-- After each timeout/wake, check for unread messages before waiting again
 
 ---
 
