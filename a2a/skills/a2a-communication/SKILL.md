@@ -186,21 +186,35 @@ When you find unread messages:
 
 When blocked or idle, watch your inbox for new messages.
 
-### Recommended: Polling Loop
+### Environment Configuration
 
-Polling is the most reliable approach across all environments (containers, minimal Linux, macOS). Use this as your default:
+For long-running agents, extend the bash timeout in `~/.claude/settings.json`:
 
-```bash
-# Simple polling loop - check every 30 seconds
-while true; do
-  for f in ~/a2a/{your-agent-name}/*.md; do
-    [ -f "$f" ] && [ ! -f "$f.seen" ] && echo "UNREAD: $f"
-  done
-  sleep 30
-done
+```json
+{
+  "BASH_DEFAULT_TIMEOUT_MS": 3600000
+}
 ```
 
-For long-running agents, use a longer sleep interval (e.g., 60-300 seconds) to reduce overhead.
+This allows foreground polling for up to 1 hour, which is more token-efficient than backgrounding + manual checkins.
+
+### Recommended: Foreground Polling Loop
+
+Polling is the most reliable approach across all environments (containers, minimal Linux, macOS). **Foreground polling is preferred** because it avoids the repeated LLM context checkins that happen when backgrounding + manual polling.
+
+```bash
+# Print start time for passive timeout discovery
+echo "Poll started at $(date +%s)"
+for i in {1..360}; do  # 1 hour at 10s intervals
+  for f in ~/a2a/{your-agent-name}/*.md; do
+    [ -f "$f" ] && [ ! -f "$f.seen" ] && cat "$f" && touch "$f.seen" && exit 0
+  done
+  sleep 10
+done
+echo "Poll completed naturally"
+```
+
+The start timestamp helps you learn your actual timeout if the loop gets backgrounded.
 
 ### Check Once Pattern
 
@@ -233,10 +247,19 @@ inotifywait -e create ~/a2a/{your-agent-name}/
 
 When running long commands in Claude Code:
 
-- Commands may be backgrounded after the harness timeout (typically 60 seconds)
-- If backgrounded, you'll need to read the output file to check results
-- After a command goes to background, **kill it and restart** with a fresh polling loop
-- Track which messages you've processed to avoid duplicates when switching between background output and direct polling
+- Default timeout is often 60 seconds; set `BASH_DEFAULT_TIMEOUT_MS` for longer
+- When a command is backgrounded, you'll need to read the output file to check results
+- The polling loop prints a start timestamp - compare it to current time to learn your actual timeout
+
+**Passive timeout discovery:**
+
+If your polling loop gets backgrounded mid-execution:
+
+1. Note current time vs. the printed start timestamp to learn actual timeout
+2. Kill the backgrounded task (it's still running but not useful for foreground interaction)
+3. Start a fresh loop sized to stay under the learned timeout
+
+No dedicated "calibration" step needed - just learn when backgrounding naturally happens.
 
 **Handling backgrounded watchers:**
 
@@ -244,9 +267,12 @@ When running long commands in Claude Code:
 # If your watcher went to background, kill it by ID
 kill $BACKGROUND_SHELL_ID
 
-# Then restart with a fresh check
-for f in ~/a2a/{your-agent-name}/*.md; do
-  [ -f "$f" ] && [ ! -f "$f.seen" ] && echo "$f"
+# Then restart with shorter duration based on learned timeout
+for i in {1..30}; do  # Adjust based on learned timeout
+  for f in ~/a2a/{your-agent-name}/*.md; do
+    [ -f "$f" ] && [ ! -f "$f.seen" ] && cat "$f" && touch "$f.seen" && exit 0
+  done
+  sleep 10
 done
 ```
 
