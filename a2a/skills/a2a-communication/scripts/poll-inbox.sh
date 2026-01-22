@@ -21,6 +21,24 @@ AGENT_NAME="$1"
 MAX_ITERATIONS="$2"
 DELAY_SECONDS="$3"
 
+# Validate agent name format
+if [[ ! "${AGENT_NAME}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Error: agent name must contain only alphanumeric characters, underscores, or hyphens" >&2
+    exit 1
+fi
+
+# Validate max-iterations is a positive integer
+if ! [[ "${MAX_ITERATIONS}" =~ ^[0-9]+$ ]] || [[ "${MAX_ITERATIONS}" -lt 1 ]]; then
+    echo "Error: max-iterations must be a positive integer" >&2
+    exit 1
+fi
+
+# Validate delay-seconds is a non-negative integer
+if ! [[ "${DELAY_SECONDS}" =~ ^[0-9]+$ ]]; then
+    echo "Error: delay-seconds must be a non-negative integer" >&2
+    exit 1
+fi
+
 A2A_DIR="${HOME}/a2a"
 INBOX_DIR="${A2A_DIR}/${AGENT_NAME}"
 
@@ -33,10 +51,13 @@ fi
 echo "Polling inbox for ${AGENT_NAME} (max ${MAX_ITERATIONS} iterations, ${DELAY_SECONDS}s delay)"
 echo "Poll started at $(date +%s)"
 
+# Enable nullglob so empty globs expand to nothing instead of the literal pattern
+shopt -s nullglob
+
 for ((i=1; i<=MAX_ITERATIONS; i++)); do
     # Check for unread messages
     for f in "${INBOX_DIR}"/*.md; do
-        if [[ -f "$f" ]] && [[ ! -f "$f.seen" ]]; then
+        if [[ ! -f "$f.seen" ]]; then
             echo "--- Found unread message (iteration ${i}) ---"
             echo "Path: $f"
             echo "--- Content ---"

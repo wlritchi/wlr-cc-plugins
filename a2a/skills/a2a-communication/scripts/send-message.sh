@@ -21,6 +21,24 @@ SUBJECT="$3"
 EXPECTS_REPLY="$4"
 BODY="${5:-}"
 
+# Validate agent name format for FROM
+if [[ ! "${FROM}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Error: 'from' agent name must contain only alphanumeric characters, underscores, or hyphens" >&2
+    exit 1
+fi
+
+# Validate agent name format for TO
+if [[ ! "${TO}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Error: 'to' agent name must contain only alphanumeric characters, underscores, or hyphens" >&2
+    exit 1
+fi
+
+# Validate expects-reply is a boolean
+if [[ "${EXPECTS_REPLY}" != "true" && "${EXPECTS_REPLY}" != "false" ]]; then
+    echo "Error: expects-reply must be 'true' or 'false'" >&2
+    exit 1
+fi
+
 A2A_DIR="${HOME}/a2a"
 RECIPIENT_DIR="${A2A_DIR}/${TO}"
 
