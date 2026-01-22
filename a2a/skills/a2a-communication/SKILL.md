@@ -12,6 +12,39 @@ This skill enables communication between Claude Code agents running in separate 
 - Collaborating on a large project with decomposed tasks
 - You need to notify another agent of changes or request their help
 
+## Helper Scripts
+
+This skill includes helper scripts for common operations. These scripts make it easier to whitelist a2a operations in Claude Code's approval system.
+
+**Locating the scripts:** Use a two-step pattern:
+
+1. **First Bash call** - find all skill directories (there may be multiple versions):
+   ```bash
+   find ~/.claude/plugins/cache -type d -name a2a-communication
+   ```
+   This returns paths like:
+   ```
+   ~/.claude/plugins/cache/wlr-cc-plugins/a2a/0.2.0/skills/a2a-communication
+   ~/.claude/plugins/cache/wlr-cc-plugins/a2a/0.3.0/skills/a2a-communication
+   ```
+   **Pick the one with the highest version number.**
+
+2. **Second Bash call** - run the script using the path from step 1 (keep the `~` prefix):
+   ```bash
+   ~/.claude/plugins/cache/wlr-cc-plugins/a2a/0.3.0/skills/a2a-communication/scripts/register-agent.sh arg1 arg2 ...
+   ```
+
+**Important:** Run `find` as a separate Bash call first, then use the returned path directly in subsequent script calls. Only run one script per Bash call. Do NOT combine `find` with script execution in a single command.
+
+### Available Scripts
+
+| Script | Purpose | Arguments |
+|--------|---------|-----------|
+| `register-agent.sh` | Register yourself as an agent | `<name> <description> <capabilities> <working-dir>` |
+| `send-message.sh` | Send a message to another agent | `<from> <to> <subject> <expects-reply> [body]` |
+| `mark-read.sh` | Mark a message as read | `<message-path>` |
+| `poll-inbox.sh` | Poll for new messages | `<agent-name> <max-iterations> <delay-seconds>` |
+
 ## Directory Structure
 
 ```
@@ -21,16 +54,6 @@ This skill enables communication between Claude Code agents running in separate 
 │   ├── {timestamp}-{subject}.md  # Messages
 │   └── {timestamp}-{subject}.md.seen  # Read markers (0-byte)
 ```
-
-## Quick Reference
-
-| Action | Command |
-|--------|---------|
-| Register | Append to `~/a2a/active-agents.md`, create inbox dir |
-| Send message | Write to `~/a2a/{recipient}/` |
-| Check inbox | List `*.md` without `.seen` marker |
-| Mark read | `touch {message}.seen` |
-| Watch for messages | Poll loop with `sleep` (recommended) or `fswatch`/`inotifywait` |
 
 ---
 
@@ -62,48 +85,43 @@ Use kebab-case, descriptive of your role:
 - `frontend-app`
 - `pa` (personal assistant)
 
-### 2. Create your inbox
+### 2. Register using the helper script
 
+First, find the skill directory:
 ```bash
-mkdir -p ~/a2a/{your-agent-name}
+find ~/.claude/plugins/cache -type d -name a2a-communication -print -quit
 ```
 
-### 3. Register in active-agents.md
-
-Append a section to `~/a2a/active-agents.md`:
-
-```markdown
-## {your-agent-name}
-
-{Brief description of your purpose and what you're working on.}
-
-**Capabilities:** {what you can help with}
-**Working in:** {repo or directory, if applicable}
-**Started:** {ISO 8601 timestamp}
-**Status:** active
+Then run the registration script with the returned path:
+```bash
+~/.claude/plugins/cache/.../a2a-communication/scripts/register-agent.sh devspace-manager "Manages the devspace development environment" "devspace operations, k8s/docker, environment troubleshooting" ~/repos/infrastructure
 ```
 
-Example:
-
-```markdown
-## devspace-manager
-
-Manages the devspace development environment. Handles database provisioning,
-service deployment, port forwarding, and environment health checks.
-
-**Capabilities:** devspace operations, k8s/docker, environment troubleshooting
-**Working in:** ~/repos/infrastructure
-**Started:** 2026-01-16T09:00:00Z
-**Status:** active
-```
+This creates your inbox directory and adds your entry to `~/a2a/active-agents.md`.
 
 ---
 
 ## Sending Messages
 
-### Message format
+### Using the helper script
 
-Write markdown files with YAML frontmatter:
+After finding the skill directory (see above), run the send script:
+
+```bash
+~/.claude/plugins/cache/.../a2a-communication/scripts/send-message.sh devspace-manager backend-api "Database connection ready" false "The devspace DB is now available at postgres://dev:dev@localhost:5432/app. Connection verified and migrations applied."
+```
+
+For longer messages, pipe the body via stdin:
+
+```bash
+echo "The devspace DB is now available at postgres://dev:dev@localhost:5432/app.
+
+Connection verified and migrations applied. You can proceed with API integration." | ~/.claude/plugins/cache/.../a2a-communication/scripts/send-message.sh devspace-manager backend-api "Database connection ready" false
+```
+
+### Message format (for reference)
+
+Messages are stored as markdown files with YAML frontmatter:
 
 ```markdown
 ---
@@ -125,60 +143,36 @@ expects-reply: {true|false}
 - **YAML frontmatter timestamp:** Standard ISO 8601 with colons (e.g., `2026-01-16T10:30:00Z`)
 - Subject slug: lowercase, hyphens, brief (e.g., `db-ready`, `schema-change`)
 
-**Note:** Colons are invalid in filenames on some systems (Windows), so we use hyphens in filenames but standard ISO 8601 in the YAML frontmatter where colons are safe.
-
-### Before sending
-
-Verify the recipient exists:
-
-```bash
-[ -d ~/a2a/{recipient} ] || echo "Warning: recipient may not be registered"
-```
-
-### Example: Sending a notification
-
-```bash
-cat > ~/a2a/backend-api/2026-01-16T10-30-00Z-db-ready.md << 'EOF'
----
-from: devspace-manager
-to: backend-api
-timestamp: 2026-01-16T10:30:00Z
-subject: Database connection ready
-expects-reply: false
----
-
-The devspace DB is now available at `postgres://dev:dev@localhost:5432/app`.
-
-Connection verified and migrations applied. You can proceed with API integration.
-EOF
-```
-
 ---
 
 ## Checking Your Inbox
 
-### Find unread messages
+### Poll for messages using the helper script
+
+After finding the skill directory, run the poll script:
 
 ```bash
-for f in ~/a2a/{your-agent-name}/*.md; do
-  [ -f "$f" ] && [ ! -f "$f.seen" ] && echo "$f"
-done
+~/.claude/plugins/cache/.../a2a-communication/scripts/poll-inbox.sh my-agent 30 10
 ```
+
+This polls 30 times with 10-second delays (5 minutes total). It outputs the first unread message found and exits with code 0 if found, code 1 if nothing after all iterations.
 
 ### Mark a message as read
 
+After processing a message, mark it as read:
+
 ```bash
-touch "{message-path}.seen"
+~/.claude/plugins/cache/.../a2a-communication/scripts/mark-read.sh ~/a2a/my-agent/2026-01-16T10-30-00Z-db-ready.md
 ```
 
-### Process messages
+### Process messages workflow
 
-When you find unread messages:
+When you find an unread message:
 
-1. Read the message content
+1. The poll script outputs the message path and content
 2. Determine if action is needed
 3. If `expects-reply: true`, prioritize responding
-4. Mark as read: `touch {message}.seen`
+4. Mark as read using the mark-read script
 
 ---
 
@@ -198,50 +192,15 @@ For long-running agents, extend the bash timeout in `~/.claude/settings.json`:
 
 This allows foreground polling for up to 1 hour, which is more token-efficient than backgrounding + manual checkins.
 
-### Recommended: Foreground Polling Loop
+### Recommended: Use poll-inbox.sh
 
-Polling is the most reliable approach across all environments (containers, minimal Linux, macOS). **Foreground polling is preferred** because it avoids the repeated LLM context checkins that happen when backgrounding + manual polling.
-
-```bash
-# Print start time for passive timeout discovery
-echo "Poll started at $(date +%s)"
-for i in {1..360}; do  # 1 hour at 10s intervals
-  for f in ~/a2a/{your-agent-name}/*.md; do
-    [ -f "$f" ] && [ ! -f "$f.seen" ] && cat "$f" && touch "$f.seen" && exit 0
-  done
-  sleep 10
-done
-echo "Poll completed naturally"
-```
-
-The start timestamp helps you learn your actual timeout if the loop gets backgrounded.
-
-### Check Once Pattern
-
-When you just need to check for messages without blocking:
+The polling script handles the loop for you:
 
 ```bash
-# Check once and return - no waiting
-for f in ~/a2a/{your-agent-name}/*.md; do
-  [ -f "$f" ] && [ ! -f "$f.seen" ] && echo "$f"
-done
+~/.claude/plugins/cache/.../a2a-communication/scripts/poll-inbox.sh my-agent 360 10
 ```
 
-This is useful when you're doing primary work and want to periodically check between tasks.
-
-### Using fswatch (macOS only)
-
-```bash
-fswatch -1 -r ~/a2a/{your-agent-name}/
-```
-
-### Using inotifywait (Linux with inotify-tools)
-
-```bash
-inotifywait -e create ~/a2a/{your-agent-name}/
-```
-
-**Note:** `fswatch` and `inotifywait` are often unavailable in containers or minimal environments. Prefer the polling approach unless you've verified these tools are installed.
+This polls for 1 hour (360 iterations × 10 seconds). The script prints the start timestamp to help with timeout discovery.
 
 ### Timeout and Background Handling
 
@@ -249,32 +208,15 @@ When running long commands in Claude Code:
 
 - Default timeout is often 60 seconds; set `BASH_DEFAULT_TIMEOUT_MS` for longer
 - When a command is backgrounded, you'll need to read the output file to check results
-- The polling loop prints a start timestamp - compare it to current time to learn your actual timeout
+- The polling script prints a start timestamp - compare it to current time to learn your actual timeout
 
 **Passive timeout discovery:**
 
-If your polling loop gets backgrounded mid-execution:
+If your polling script gets backgrounded mid-execution:
 
 1. Note current time vs. the printed start timestamp to learn actual timeout
 2. Kill the backgrounded task (it's still running but not useful for foreground interaction)
-3. Start a fresh loop sized to stay under the learned timeout
-
-No dedicated "calibration" step needed - just learn when backgrounding naturally happens.
-
-**Handling backgrounded watchers:**
-
-```bash
-# If your watcher went to background, kill it by ID
-kill $BACKGROUND_SHELL_ID
-
-# Then restart with shorter duration based on learned timeout
-for i in {1..30}; do  # Adjust based on learned timeout
-  for f in ~/a2a/{your-agent-name}/*.md; do
-    [ -f "$f" ] && [ ! -f "$f.seen" ] && cat "$f" && touch "$f.seen" && exit 0
-  done
-  sleep 10
-done
-```
+3. Start a fresh poll with fewer iterations sized to stay under the learned timeout
 
 ---
 
@@ -285,10 +227,10 @@ When running as a long-lived agent:
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  1. Do primary work (if any pending tasks)              │
-│  2. Check inbox for unread messages                     │
-│  3. Process any unread messages                         │
+│  2. Poll inbox for unread messages                      │
+│  3. Process any unread messages (mark read after)       │
 │  4. If blocked (waiting for reply / no work):           │
-│     └─> Watch inbox with long timeout                   │
+│     └─> Poll inbox with long timeout                    │
 │  5. On new message or timeout, goto 1                   │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -358,10 +300,10 @@ See [message-examples.md](message-examples.md) for full examples of:
 When beginning a session where you'll use A2A:
 
 - [ ] Choose your agent name (kebab-case)
-- [ ] Create inbox: `mkdir -p ~/a2a/{name}`
-- [ ] Register in `~/a2a/active-agents.md`
-- [ ] Check for any unread messages in your inbox
-- [ ] Read `active-agents.md` to see who else is active
+- [ ] Find skill directories: `find ~/.claude/plugins/cache -type d -name a2a-communication` (pick highest version)
+- [ ] Register using: `~/.claude/plugins/cache/.../a2a-communication/scripts/register-agent.sh <name> <desc> <caps> <dir>`
+- [ ] Poll for any unread messages using poll-inbox.sh
+- [ ] Read `~/a2a/active-agents.md` to see who else is active
 
 ---
 
