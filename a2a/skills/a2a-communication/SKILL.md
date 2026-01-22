@@ -307,6 +307,6 @@ When beginning a session where you'll use A2A:
 
 ---
 
-## Related Skills
+## Related Commands
 
-- **a2a:a2a-ralph-integration** - For autonomous operation with Ralph Wiggum loops
+- **/a2a-loop** - Start a long-running a2a agent with Ralph loop for autonomous operation
