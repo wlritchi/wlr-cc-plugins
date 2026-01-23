@@ -26,10 +26,15 @@ Convert the skill identifier to a file path:
 
 ### 2. Fetch Current Skill Content
 
+**Note**: The Bash tool may have issues with variable assignments and line continuations in compound commands. Use a single-line command with the path inlined:
+
 ```bash
-SKILL_PATH="{plugin}/skills/{skill}/SKILL.md"
-gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" \
-  --jq '.content' | base64 -d > /tmp/skill-edit.md
+gh api "repos/wlritchi/wlr-cc-plugins/contents/{plugin}/skills/{skill}/SKILL.md" --jq '.content' | base64 -d > /tmp/skill-edit.md
+```
+
+Example for `opinionated-setup:setup-python-project`:
+```bash
+gh api "repos/wlritchi/wlr-cc-plugins/contents/opinionated-setup/skills/setup-python-project/SKILL.md" --jq '.content' | base64 -d > /tmp/skill-edit.md
 ```
 
 ### 3. Read and Analyze
@@ -53,34 +58,35 @@ Use the Edit tool to make precise, minimal changes to `/tmp/skill-edit.md`. Pref
 
 ### 6. Create a Branch
 
-```bash
-# Get main branch SHA
-MAIN_SHA=$(gh api repos/wlritchi/wlr-cc-plugins/git/refs/heads/main --jq '.object.sha')
+Run these as separate Bash tool calls to avoid variable/escaping issues:
 
-# Create branch with descriptive name
-BRANCH_NAME="feedback/{plugin}-{short-description}"
-gh api repos/wlritchi/wlr-cc-plugins/git/refs \
-  -f ref="refs/heads/$BRANCH_NAME" \
-  -f sha="$MAIN_SHA"
+First, get the main branch SHA:
+```bash
+MAIN_SHA=$(gh api repos/wlritchi/wlr-cc-plugins/git/refs/heads/main --jq '.object.sha')
+echo "Main SHA: $MAIN_SHA"
+```
+
+Then create the branch (substitute values inline):
+```bash
+gh api repos/wlritchi/wlr-cc-plugins/git/refs -f ref="refs/heads/feedback/{plugin}-{short-description}" -f sha="{MAIN_SHA_VALUE}"
 ```
 
 Use a short, descriptive branch name based on the feedback topic (e.g., `feedback/opinionated-setup-strict-typing`).
 
 ### 7. Commit the Changes
 
-```bash
-# Get current file SHA (needed for update)
-FILE_SHA=$(gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" \
-  --jq '.sha')
+Get the file SHA and commit in one command (inline the skill path):
 
-# Commit the edited file
-gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" \
-  -X PUT \
-  -f message="feat({plugin}): {short description}" \
-  -f content="$(base64 -w 0 < /tmp/skill-edit.md)" \
-  -f sha="$FILE_SHA" \
-  -f branch="$BRANCH_NAME"
+```bash
+SKILL_PATH="{plugin}/skills/{skill}/SKILL.md"
+FILE_SHA=$(gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" --jq '.sha')
+echo "File SHA: $FILE_SHA"
+
+BRANCH_NAME="feedback/{plugin}-{short-description}"
+gh api "repos/wlritchi/wlr-cc-plugins/contents/$SKILL_PATH" -X PUT -f message="feat({plugin}): {short description}" -f content="$(base64 -w 0 < /tmp/skill-edit.md)" -f sha="$FILE_SHA" -f branch="$BRANCH_NAME" --jq '.commit.sha'
 ```
+
+**Tip**: Combining the variable assignments with the `gh api` call in a single Bash invocation works because the variables are used in the same shell session.
 
 ### 8. Open the PR
 
