@@ -1,6 +1,11 @@
 ---
 name: a2a-communication
 description: Use when working on multi-repo projects, collaborating with other agents, running as a long-lived worker agent, or needing to notify another agent of changes
+allowed-tools:
+  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/register-agent.sh:*)"
+  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/send-message.sh:*)"
+  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/poll-inbox.sh:*)"
+  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/mark-read.sh:*)"
 ---
 
 # Agent-to-Agent Communication
@@ -14,27 +19,7 @@ This skill enables communication between Claude Code agents running in separate 
 
 ## Helper Scripts
 
-This skill includes helper scripts for common operations. These scripts make it easier to whitelist a2a operations in Claude Code's approval system.
-
-**Locating the scripts:** Use a two-step pattern:
-
-1. **First Bash call** - find all skill directories (there may be multiple versions):
-   ```bash
-   find ~/.claude/plugins/cache -type d -name a2a-communication
-   ```
-   This returns paths like:
-   ```
-   ~/.claude/plugins/cache/wlr-cc-plugins/a2a/0.2.0/skills/a2a-communication
-   ~/.claude/plugins/cache/wlr-cc-plugins/a2a/0.3.0/skills/a2a-communication
-   ```
-   **Pick the one with the highest version number.**
-
-2. **Second Bash call** - run the script using the path from step 1 (keep the `~` prefix):
-   ```bash
-   ~/.claude/plugins/cache/wlr-cc-plugins/a2a/0.3.0/skills/a2a-communication/scripts/register-agent.sh arg1 arg2 ...
-   ```
-
-**Important:** Run `find` as a separate Bash call first, then use the returned path directly in subsequent script calls. Only run one script per Bash call. Do NOT combine `find` with script execution in a single command.
+This skill includes helper scripts for common operations. The scripts are auto-approved via the `allowed-tools` frontmatter.
 
 ### Available Scripts
 
@@ -87,14 +72,8 @@ Use kebab-case, descriptive of your role:
 
 ### 2. Register using the helper script
 
-First, find the skill directory:
 ```bash
-find ~/.claude/plugins/cache -type d -name a2a-communication -print -quit
-```
-
-Then run the registration script with the returned path:
-```bash
-~/.claude/plugins/cache/.../a2a-communication/scripts/register-agent.sh devspace-manager "Manages the devspace development environment" "devspace operations, k8s/docker, environment troubleshooting" ~/repos/infrastructure
+"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/register-agent.sh" devspace-manager "Manages the devspace development environment" "devspace operations, k8s/docker, environment troubleshooting" ~/repos/infrastructure
 ```
 
 This creates your inbox directory and adds your entry to `~/a2a/active-agents.md`.
@@ -105,10 +84,8 @@ This creates your inbox directory and adds your entry to `~/a2a/active-agents.md
 
 ### Using the helper script
 
-After finding the skill directory (see above), run the send script:
-
 ```bash
-~/.claude/plugins/cache/.../a2a-communication/scripts/send-message.sh devspace-manager backend-api "Database connection ready" false "The devspace DB is now available at postgres://dev:dev@localhost:5432/app. Connection verified and migrations applied."
+"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/send-message.sh" devspace-manager backend-api "Database connection ready" false "The devspace DB is now available at postgres://dev:dev@localhost:5432/app. Connection verified and migrations applied."
 ```
 
 For longer messages, pipe the body via stdin:
@@ -116,7 +93,7 @@ For longer messages, pipe the body via stdin:
 ```bash
 echo "The devspace DB is now available at postgres://dev:dev@localhost:5432/app.
 
-Connection verified and migrations applied. You can proceed with API integration." | ~/.claude/plugins/cache/.../a2a-communication/scripts/send-message.sh devspace-manager backend-api "Database connection ready" false
+Connection verified and migrations applied. You can proceed with API integration." | "${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/send-message.sh" devspace-manager backend-api "Database connection ready" false
 ```
 
 ### Message format (for reference)
@@ -149,10 +126,8 @@ expects-reply: {true|false}
 
 ### Poll for messages using the helper script
 
-After finding the skill directory, run the poll script:
-
 ```bash
-~/.claude/plugins/cache/.../a2a-communication/scripts/poll-inbox.sh my-agent 30 10
+"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/poll-inbox.sh" my-agent 30 10
 ```
 
 This polls 30 times with 10-second delays (5 minutes total). It outputs the first unread message found and exits with code 0 if found, code 1 if nothing after all iterations.
@@ -162,7 +137,7 @@ This polls 30 times with 10-second delays (5 minutes total). It outputs the firs
 After processing a message, mark it as read:
 
 ```bash
-~/.claude/plugins/cache/.../a2a-communication/scripts/mark-read.sh ~/a2a/my-agent/2026-01-16T10-30-00Z-db-ready.md
+"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/mark-read.sh" ~/a2a/my-agent/2026-01-16T10-30-00Z-db-ready.md
 ```
 
 ### Process messages workflow
@@ -197,7 +172,7 @@ This allows foreground polling for up to 1 hour, which is more token-efficient t
 The polling script handles the loop for you:
 
 ```bash
-~/.claude/plugins/cache/.../a2a-communication/scripts/poll-inbox.sh my-agent 360 10
+"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/poll-inbox.sh" my-agent 360 10
 ```
 
 This polls for 1 hour (360 iterations × 10 seconds). The script prints the start timestamp to help with timeout discovery.
@@ -300,8 +275,7 @@ See [message-examples.md](message-examples.md) for full examples of:
 When beginning a session where you'll use A2A:
 
 - [ ] Choose your agent name (kebab-case)
-- [ ] Find skill directories: `find ~/.claude/plugins/cache -type d -name a2a-communication` (pick highest version)
-- [ ] Register using: `~/.claude/plugins/cache/.../a2a-communication/scripts/register-agent.sh <name> <desc> <caps> <dir>`
+- [ ] Register using: `"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/register-agent.sh" <name> <desc> <caps> <dir>`
 - [ ] Poll for any unread messages using poll-inbox.sh
 - [ ] Read `~/a2a/active-agents.md` to see who else is active
 
@@ -310,3 +284,4 @@ When beginning a session where you'll use A2A:
 ## Related Commands
 
 - **/a2a-loop** - Start a long-running a2a agent with Ralph loop for autonomous operation
+
