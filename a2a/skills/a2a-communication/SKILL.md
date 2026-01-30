@@ -2,10 +2,13 @@
 name: a2a-communication
 description: Use when working on multi-repo projects, collaborating with other agents, running as a long-lived worker agent, or needing to notify another agent of changes
 allowed-tools:
-  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/register-agent.sh:*)"
-  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/send-message.sh:*)"
-  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/poll-inbox.sh:*)"
-  - "Bash(${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/mark-read.sh:*)"
+  - mcp__plugin_a2a_a2a__register_agent
+  - mcp__plugin_a2a_a2a__unregister_agent
+  - mcp__plugin_a2a_a2a__send_message
+  - mcp__plugin_a2a_a2a__poll_inbox
+  - mcp__plugin_a2a_a2a__mark_read
+  - mcp__plugin_a2a_a2a__list_agents
+  - mcp__plugin_a2a_a2a__list_inbox
 ---
 
 # Agent-to-Agent Communication
@@ -17,18 +20,21 @@ This skill enables communication between Claude Code agents running in separate 
 - Collaborating on a large project with decomposed tasks
 - You need to notify another agent of changes or request their help
 
-## Helper Scripts
+## MCP Tools
 
-This skill includes helper scripts for common operations. The scripts are auto-approved via the `allowed-tools` frontmatter.
+This plugin provides MCP tools for a2a operations. The tools are available as `mcp__a2a__<tool_name>`.
 
-### Available Scripts
+### Available Tools
 
-| Script | Purpose | Arguments |
-|--------|---------|-----------|
-| `register-agent.sh` | Register yourself as an agent | `<name> <description> <capabilities> <working-dir>` |
-| `send-message.sh` | Send a message to another agent | `<from> <to> <subject> <expects-reply> [body]` |
-| `mark-read.sh` | Mark a message as read | `<message-path>` |
-| `poll-inbox.sh` | Poll for new messages | `<agent-name> <max-iterations> <delay-seconds>` |
+| Tool | Purpose | Key Parameters |
+|------|---------|----------------|
+| `register_agent` | Register yourself as an agent | `agent_name`, `description`, `capabilities`, `working_dir` |
+| `unregister_agent` | Unregister an agent | `agent_name`, `delete_inbox` (optional) |
+| `send_message` | Send a message to another agent | `from_agent`, `to_agent`, `subject`, `expects_reply`, `body` |
+| `mark_read` | Mark a message as read | `message_path` |
+| `poll_inbox` | Poll for new messages | `agent_name`, `max_iterations`, `delay_seconds` |
+| `list_agents` | List all registered agents | (none) |
+| `list_inbox` | List messages in an inbox | `agent_name`, `include_read` (optional) |
 
 ## Directory Structure
 
@@ -70,10 +76,15 @@ Use kebab-case, descriptive of your role:
 - `frontend-app`
 - `pa` (personal assistant)
 
-### 2. Register using the helper script
+### 2. Register using the MCP tool
 
-```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/register-agent.sh" devspace-manager "Manages the devspace development environment" "devspace operations, k8s/docker, environment troubleshooting" ~/repos/infrastructure
+```
+mcp__a2a__register_agent(
+    agent_name="devspace-manager",
+    description="Manages the devspace development environment",
+    capabilities="devspace operations, k8s/docker, environment troubleshooting",
+    working_dir="~/repos/infrastructure"
+)
 ```
 
 This creates your inbox directory and adds your entry to `~/a2a/active-agents.md`.
@@ -82,18 +93,16 @@ This creates your inbox directory and adds your entry to `~/a2a/active-agents.md
 
 ## Sending Messages
 
-### Using the helper script
+### Using the MCP tool
 
-```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/send-message.sh" devspace-manager backend-api "Database connection ready" false "The devspace DB is now available at postgres://dev:dev@localhost:5432/app. Connection verified and migrations applied."
 ```
-
-For longer messages, pipe the body via stdin:
-
-```bash
-echo "The devspace DB is now available at postgres://dev:dev@localhost:5432/app.
-
-Connection verified and migrations applied. You can proceed with API integration." | "${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/send-message.sh" devspace-manager backend-api "Database connection ready" false
+mcp__a2a__send_message(
+    from_agent="devspace-manager",
+    to_agent="backend-api",
+    subject="Database connection ready",
+    expects_reply=false,
+    body="The devspace DB is now available at postgres://dev:dev@localhost:5432/app.\n\nConnection verified and migrations applied."
+)
 ```
 
 ### Message format (for reference)
@@ -124,30 +133,46 @@ expects-reply: {true|false}
 
 ## Checking Your Inbox
 
-### Poll for messages using the helper script
+### List inbox contents
 
-```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/poll-inbox.sh" my-agent 30 10
+```
+mcp__a2a__list_inbox(agent_name="my-agent")
 ```
 
-This polls 30 times with 10-second delays (5 minutes total). It outputs the first unread message found and exits with code 0 if found, code 1 if nothing after all iterations.
+To include already-read messages:
+
+```
+mcp__a2a__list_inbox(agent_name="my-agent", include_read=true)
+```
+
+### Poll for messages
+
+```
+mcp__a2a__poll_inbox(
+    agent_name="my-agent",
+    max_iterations=30,
+    delay_seconds=10
+)
+```
+
+This polls 30 times with 10-second delays (5 minutes total). It returns the first unread message found, or indicates no messages were found after all iterations.
 
 ### Mark a message as read
 
 After processing a message, mark it as read:
 
-```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/mark-read.sh" ~/a2a/my-agent/2026-01-16T10-30-00Z-db-ready.md
+```
+mcp__a2a__mark_read(message_path="/home/user/a2a/my-agent/2026-01-16T10-30-00Z-db-ready.md")
 ```
 
 ### Process messages workflow
 
 When you find an unread message:
 
-1. The poll script outputs the message path and content
+1. The poll tool returns the message path and content
 2. Determine if action is needed
 3. If `expects-reply: true`, prioritize responding
-4. Mark as read using the mark-read script
+4. Mark as read using `mark_read`
 
 ---
 
@@ -155,43 +180,32 @@ When you find an unread message:
 
 When blocked or idle, watch your inbox for new messages.
 
-### Environment Configuration
+### Recommended: Use poll_inbox
 
-For long-running agents, extend the bash timeout in `~/.claude/settings.json`:
-
-```json
-{
-  "BASH_DEFAULT_TIMEOUT_MS": 3600000
-}
+```
+mcp__a2a__poll_inbox(
+    agent_name="my-agent",
+    max_iterations=360,
+    delay_seconds=10
+)
 ```
 
-This allows foreground polling for up to 1 hour, which is more token-efficient than backgrounding + manual checkins.
+This polls for 1 hour (360 iterations × 10 seconds). The tool prints the start timestamp to help with timeout discovery.
 
-### Recommended: Use poll-inbox.sh
+### Timeout Handling
 
-The polling script handles the loop for you:
+When running long polling operations:
 
-```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/poll-inbox.sh" my-agent 360 10
-```
-
-This polls for 1 hour (360 iterations × 10 seconds). The script prints the start timestamp to help with timeout discovery.
-
-### Timeout and Background Handling
-
-When running long commands in Claude Code:
-
-- Default timeout is often 60 seconds; set `BASH_DEFAULT_TIMEOUT_MS` for longer
-- When a command is backgrounded, you'll need to read the output file to check results
-- The polling script prints a start timestamp - compare it to current time to learn your actual timeout
+- Default Claude Code timeout may be 60 seconds unless configured otherwise
+- When a command times out, the tool may be backgrounded
+- The polling tool prints a start timestamp - compare it to current time to learn your actual timeout
 
 **Passive timeout discovery:**
 
-If your polling script gets backgrounded mid-execution:
+If your polling gets backgrounded mid-execution:
 
 1. Note current time vs. the printed start timestamp to learn actual timeout
-2. Kill the backgrounded task (it's still running but not useful for foreground interaction)
-3. Start a fresh poll with fewer iterations sized to stay under the learned timeout
+2. Start a fresh poll with fewer iterations sized to stay under the learned timeout
 
 ---
 
@@ -236,7 +250,7 @@ These are soft guidelines, not enforced by infrastructure:
 ### Shutdown courtesy
 
 - Before going inactive, reply to pending `expects-reply` messages
-- Update your status in `active-agents.md` to `inactive`
+- Unregister yourself: `mcp__a2a__unregister_agent(agent_name="my-agent")`
 - Optionally notify collaborators: "Shutting down, will resume tomorrow"
 
 ---
@@ -275,13 +289,12 @@ See [message-examples.md](message-examples.md) for full examples of:
 When beginning a session where you'll use A2A:
 
 - [ ] Choose your agent name (kebab-case)
-- [ ] Register using: `"${CLAUDE_PLUGIN_ROOT}/skills/a2a-communication/scripts/register-agent.sh" <name> <desc> <caps> <dir>`
-- [ ] Poll for any unread messages using poll-inbox.sh
-- [ ] Read `~/a2a/active-agents.md` to see who else is active
+- [ ] Register using `mcp__a2a__register_agent`
+- [ ] Check for unread messages using `mcp__a2a__list_inbox` or `mcp__a2a__poll_inbox`
+- [ ] List active agents using `mcp__a2a__list_agents`
 
 ---
 
 ## Related Commands
 
 - **/a2a-loop** - Start a long-running a2a agent with Ralph loop for autonomous operation
-
