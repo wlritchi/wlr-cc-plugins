@@ -16,6 +16,7 @@ Or via uv:    uv run -qs a2a-server.py
 # dependencies = ["mcp"]
 # ///
 
+import asyncio
 import re
 import time
 from datetime import datetime, timezone
@@ -251,7 +252,7 @@ expects-reply: {expects_reply_str}
 
 
 @mcp.tool()
-def poll_inbox(
+async def poll_inbox(
     agent_name: str,
     max_iterations: int = 30,
     delay_seconds: int = 10,
@@ -277,25 +278,35 @@ def poll_inbox(
         f"Poll started at {start_time}",
     ]
 
-    for i in range(1, max_iterations + 1):
-        # Check for unread messages
-        for msg_file in sorted(inbox_dir.glob("*.md")):
-            seen_file = msg_file.with_suffix(".md.seen")
-            if not seen_file.exists():
-                content = msg_file.read_text()
-                return "\n".join(
-                    [
-                        *result_lines,
-                        f"--- Found unread message (iteration {i}) ---",
-                        f"Path: {msg_file}",
-                        "--- Content ---",
-                        content,
-                    ]
-                )
+    try:
+        for i in range(1, max_iterations + 1):
+            # Check for unread messages
+            for msg_file in sorted(inbox_dir.glob("*.md")):
+                seen_file = msg_file.with_suffix(".md.seen")
+                if not seen_file.exists():
+                    content = msg_file.read_text()
+                    return "\n".join(
+                        [
+                            *result_lines,
+                            f"--- Found unread message (iteration {i}) ---",
+                            f"Path: {msg_file}",
+                            "--- Content ---",
+                            content,
+                        ]
+                    )
 
-        # Sleep unless last iteration
-        if i < max_iterations:
-            time.sleep(delay_seconds)
+            # Sleep unless last iteration (using async sleep for proper cancellation)
+            if i < max_iterations:
+                await asyncio.sleep(delay_seconds)
+
+    except asyncio.CancelledError:
+        # Handle graceful cancellation - don't leave server in bad state
+        return "\n".join(
+            [
+                *result_lines,
+                "Polling cancelled by client request",
+            ]
+        )
 
     return "\n".join(
         [
