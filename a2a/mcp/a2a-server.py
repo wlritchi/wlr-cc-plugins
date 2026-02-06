@@ -13,7 +13,7 @@ Or via uv:    uv run -qs a2a-server.py
 
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["mcp"]
+# dependencies = ["mcp", "pyyaml"]
 # ///
 
 import asyncio
@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
 from mcp.server.fastmcp import FastMCP
 
 A2A_DIR = Path.home() / "a2a"
@@ -235,17 +236,19 @@ def send_message(
     filepath = recipient_dir / filename
 
     # Write message with YAML frontmatter
-    expects_reply_str = "true" if expects_reply else "false"
-    message_content = f"""---
-from: {from_agent}
-to: {to_agent}
-timestamp: {timestamp}
-subject: {subject}
-expects-reply: {expects_reply_str}
----
-
-{body}
-"""
+    frontmatter = yaml.dump(
+        {
+            "from": from_agent,
+            "to": to_agent,
+            "timestamp": timestamp,
+            "subject": subject,
+            "expects-reply": expects_reply,
+        },
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+    ).rstrip("\n")
+    message_content = f"---\n{frontmatter}\n---\n\n{body}\n"
     filepath.write_text(message_content)
 
     return f"{warning}Sent message to {to_agent}: {filepath}"
