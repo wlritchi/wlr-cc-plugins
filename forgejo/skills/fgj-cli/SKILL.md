@@ -28,7 +28,7 @@ The `fgj` CLI is a command-line tool for interacting with Forgejo instances (inc
 | List issues | `fgj issue list` |
 | View issue | `fgj issue view <number>` |
 | Close issue | `fgj issue close <number>` |
-| Comment on issue | `fgj issue comment <number> -b "Comment"` |
+| Comment on issue/PR | `fgj issue comment <number> -b "Comment"` |
 | List releases | `fgj release list` |
 | Create release | `fgj release create <tag>` |
 | Clone repo | `fgj repo clone owner/name` |
@@ -104,8 +104,11 @@ fgj issue list
 # View issue details
 fgj issue view 123
 
-# Add comment
+# Add comment (works for both issues AND PRs — PRs are issues in Forgejo)
 fgj issue comment 123 -b "I can reproduce this on version X"
+
+# Comment on a PR (use the same command — there is no separate `fgj pr comment`)
+fgj issue comment 42 -R owner/repo -b "LGTM, merging now"
 
 # Close issue
 fgj issue close 123
@@ -216,6 +219,7 @@ fgj pr create -t "Feature: Add X" -b "## Summary
 | Feature | gh (GitHub) | fgj (Forgejo/Gitea) |
 |---------|-------------|---------------------|
 | Config location | `~/.config/gh/` | `~/.config/fgj/` |
+| PR comments | `gh pr comment` | `fgj issue comment` (PRs are issues) |
 | PR review | `gh pr review` | Not yet supported |
 | PR checks | `gh pr checks` | Not yet supported |
 | Gists | `gh gist` | Not supported (no Forgejo equivalent) |
