@@ -35,7 +35,7 @@
       "name": "forgejo",
       "source": "./forgejo",
       "description": "Tools and guidance for working with Forgejo and Gitea instances using the fgj CLI",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "wlritchi"
       }
