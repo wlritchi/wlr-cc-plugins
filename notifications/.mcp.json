@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "notifications": {
+      "command": "uv",
+      "args": ["run", "-qs", "${CLAUDE_PLUGIN_ROOT}/mcp/notifications-server.py"]
+    }
+  }
+}
