@@ -9,7 +9,10 @@ resolution-markers = [
 ]
 
 [manifest]
-requirements = [{ name = "mcp" }]
+requirements = [
+    { name = "anyio" },
+    { name = "mcp" },
+]
 
 [[package]]
 name = "annotated-types"
