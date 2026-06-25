@@ -1,37 +1,37 @@
 #!/usr/bin/env -S uv run -qs
 # vim: filetype=python
 """
-Notifications MCP Server
+Notifications MCP relay
 
-Groundwork for a Claude Code notification framework, built around the Claude
-Code "channels" feature (https://code.claude.com/docs/en/channels.md): this
-stdio server declares the experimental `claude/channel` capability and pushes
-`notifications/claude/channel` events into the session that loaded it.
+A thin per-session stdio MCP server. It owns no schedule and no persistence; all
+of that lives in the persistent notifications daemon (../daemon/notifications-daemon.py).
+This relay only knows how to:
 
-Proof-of-concept capability: schedule a callback notification N seconds out (5
-minutes by default). The callback is persisted to disk keyed by session id, so
-if every Claude session is closed and reopened, each restarted server recovers
-its session id (via the SessionStart hook's state file, see
-../lib/session_state.py), reloads its scheduled callbacks, and dispatches any
-that are now due. The persistence and the notification body are throwaway demos
-to prove channel delivery + session-id recovery.
+  - find its own Claude Code session id and stay current on it (SessionStart hook
+    + state file, see ../lib/session_state.py)
+  - open a WebSocket to the daemon and register under that session id
+  - receive notifications from the daemon and deliver them to the agent as
+    Claude Code channel events (notifications/claude/channel)
+  - acknowledge delivered notifications back to the daemon
+  - forward the agent's schedule tool call to the daemon
 
-To receive the events the session must be launched with the channel enabled,
-e.g. `claude --dangerously-load-development-channels plugin:notifications@wlr-cc-plugins`
-during the channels research preview.
+The daemon must be running (it is started manually or via systemd --user; this
+relay never spawns it). If it isn't reachable, the relay keeps retrying and the
+schedule/list tools report it as unavailable.
+
+To receive the channel events the session must be launched with the channel
+enabled, e.g. `claude --dangerously-load-development-channels plugin:notifications@wlr-cc-plugins`.
 
 Run directly: ./notifications-server.py
-Or via uv:    uv run -qs notifications-server.py
 """
 
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["mcp", "anyio"]
+# dependencies = ["mcp", "anyio", "websockets"]
 # ///
 
+import json
 import sys
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import anyio
@@ -39,20 +39,21 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed, InvalidURI, WebSocketException
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-import scheduler  # noqa: E402
 import session_state  # noqa: E402
-
-# How often the dispatcher re-checks the session-id state file and the store.
-POLL_INTERVAL_SECONDS = 5.0
-# Brief settle time before the first dispatch so we don't push a recovered
-# (past-due) event before the client has finished the MCP/channel handshake.
-STARTUP_GRACE_SECONDS = 3.0
-DEFAULT_DELAY_SECONDS = 300
+import wsproto  # noqa: E402
 
 CHANNEL_METHOD = "notifications/claude/channel"
+RECONNECT_BACKOFF_SECONDS = 3.0
+SESSION_POLL_SECONDS = 5.0
+# Settle time before connecting, so a recovered (past-due) event isn't pushed
+# into the channel before the client has finished the MCP/channel handshake.
+STARTUP_GRACE_SECONDS = 3.0
+REQUEST_TIMEOUT_SECONDS = 10.0
 
 INSTRUCTIONS = (
     "This plugin delivers scheduled notifications through the Claude Code "
@@ -65,120 +66,206 @@ INSTRUCTIONS = (
 mcp = FastMCP("notifications", instructions=INSTRUCTIONS)
 
 
-def _iso(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+class DaemonClient:
+    """Maintains the WebSocket to the daemon and bridges it to the channel."""
+
+    def __init__(self) -> None:
+        self._ws = None
+        self._write_stream = None
+        self._req_id = 0
+        self._pending: dict[int, object] = {}  # req_id -> memory send stream
+        self._registered_session: str | None = None
+
+    def attach_write_stream(self, write_stream) -> None:
+        self._write_stream = write_stream
+
+    @property
+    def connected(self) -> bool:
+        return self._ws is not None
+
+    async def wait_connected(self, timeout: float = 8.0) -> bool:
+        """Wait briefly for the connection (covers startup grace / reconnects)."""
+        if self.connected:
+            return True
+        with anyio.move_on_after(timeout):
+            while not self.connected:
+                await anyio.sleep(0.1)
+        return self.connected
+
+    async def _deliver_channel(self, content: str, meta: dict | None) -> None:
+        params: dict[str, object] = {"content": content}
+        if meta:
+            params["meta"] = meta
+        notification = JSONRPCNotification(
+            jsonrpc="2.0", method=CHANNEL_METHOD, params=params
+        )
+        await self._write_stream.send(
+            SessionMessage(message=JSONRPCMessage(notification))
+        )
+
+    async def request(self, payload: dict) -> dict:
+        """Send a request to the daemon and await its correlated reply."""
+        ws = self._ws
+        if ws is None:
+            raise ConnectionError("daemon not connected")
+        self._req_id += 1
+        req_id = self._req_id
+        send_stream, receive_stream = anyio.create_memory_object_stream(1)
+        self._pending[req_id] = send_stream
+        try:
+            await ws.send(json.dumps({**payload, "req_id": req_id}))
+            with anyio.fail_after(REQUEST_TIMEOUT_SECONDS):
+                return await receive_stream.receive()
+        finally:
+            self._pending.pop(req_id, None)
+
+    async def run(self) -> None:
+        await anyio.sleep(STARTUP_GRACE_SECONDS)
+        while True:
+            try:
+                await self._connect_once()
+            except (
+                OSError,
+                ConnectionClosed,
+                InvalidURI,
+                WebSocketException,
+                ConnectionError,
+            ):
+                pass
+            finally:
+                self._ws = None
+                self._registered_session = None
+            await anyio.sleep(RECONNECT_BACKOFF_SECONDS)
+
+    async def _connect_once(self) -> None:
+        async with connect(wsproto.uri(), open_timeout=5) as ws:
+            self._ws = ws
+            await self._register(ws)
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(self._recv_loop, ws, tg)
+                tg.start_soon(self._session_watch, ws, tg)
+
+    async def _register(self, ws) -> None:
+        session_id, _ = session_state.effective_session_id()
+        self._registered_session = session_id
+        await ws.send(json.dumps({"type": wsproto.REGISTER, "session_id": session_id}))
+
+    async def _recv_loop(self, ws, tg) -> None:
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if msg.get("type") == wsproto.NOTIFY:
+                    await self._deliver_channel(msg.get("content", ""), msg.get("meta"))
+                    await ws.send(
+                        json.dumps({"type": wsproto.ACK, "id": msg.get("id")})
+                    )
+                else:
+                    stream = self._pending.get(msg.get("req_id"))
+                    if stream is not None:
+                        await stream.send(msg)
+        finally:
+            tg.cancel_scope.cancel()  # connection ended; tear down and reconnect
+
+    async def _session_watch(self, ws, tg) -> None:
+        """Re-register if the session id changes (e.g. after a resume)."""
+        while True:
+            await anyio.sleep(SESSION_POLL_SECONDS)
+            session_id, _ = session_state.effective_session_id()
+            if session_id and session_id != self._registered_session:
+                self._registered_session = session_id
+                try:
+                    await ws.send(
+                        json.dumps({"type": wsproto.REGISTER, "session_id": session_id})
+                    )
+                except ConnectionClosed:
+                    tg.cancel_scope.cancel()
+                    return
+
+
+DAEMON = DaemonClient()
+
+
+def _daemon_unreachable_message() -> str:
+    return (
+        f"The notifications daemon is not reachable at {wsproto.uri()}. Start it "
+        "(systemctl --user start notifications-daemon, or run "
+        "notifications-daemon.py) and try again."
+    )
 
 
 @mcp.tool()
 def get_session_id() -> str:
-    """Report the Claude Code session ID this notifications server is attached to.
+    """Report the Claude Code session ID this relay is attached to.
 
     Prefers the id recorded by the SessionStart hook (correct across `/resume`),
     falling back to the CLAUDE_CODE_SESSION_ID environment variable.
     """
     session_id, source = session_state.effective_session_id()
+    daemon = "connected" if DAEMON.connected else "disconnected"
     if not session_id:
         return (
             "No session ID available: neither the SessionStart hook's state file "
-            f"nor {session_state.SESSION_ID_ENV_VAR} is set."
+            f"nor {session_state.SESSION_ID_ENV_VAR} is set. Daemon: {daemon}."
         )
-    return f"session_id={session_id} (source: {source})"
+    return f"session_id={session_id} (source: {source}); daemon: {daemon}"
 
 
 @mcp.tool()
-def schedule_test_notification(delay_seconds: int = DEFAULT_DELAY_SECONDS) -> str:
-    """Schedule a callback notification to fire `delay_seconds` from now (default 300).
+async def schedule_test_notification(delay_seconds: int = 300) -> str:
+    """Ask the daemon to schedule a callback notification `delay_seconds` out (default 300).
 
-    The callback is persisted to disk and will be delivered as a channel event
-    even if this session is closed and later reopened. The event reports this
-    server's session id, demonstrating session-id recovery.
+    The daemon persists it and delivers it as a channel event reporting this
+    session's id, even across closing and reopening the session.
     """
     session_id, _ = session_state.effective_session_id()
     if not session_id:
-        return (
-            "Cannot schedule: this server does not yet know its session id (the "
-            "SessionStart hook may not have run). Try get_session_id first."
+        return "Cannot schedule: this relay does not yet know its session id."
+    if not await DAEMON.wait_connected():
+        return _daemon_unreachable_message()
+    try:
+        reply = await DAEMON.request(
+            {
+                "type": wsproto.SCHEDULE,
+                "session_id": session_id,
+                "delay_seconds": max(0, delay_seconds),
+                "kind": "scheduled_test",
+            }
         )
-    due_at = time.time() + max(0, delay_seconds)
-    callback_id = scheduler.schedule(session_id, due_at, kind="scheduled_test")
+    except (ConnectionError, TimeoutError):
+        return _daemon_unreachable_message()
+    if reply.get("type") == wsproto.ERROR:
+        return f"Daemon rejected the schedule request: {reply.get('error')}"
     return (
-        f"Scheduled callback {callback_id} for session {session_id}; due "
-        f"{_iso(due_at)} (in {max(0, delay_seconds)}s). It will arrive as a "
-        "<channel> event from this plugin, even across a restart."
+        f"Scheduled callback {reply.get('id')} for session {session_id} in "
+        f"{max(0, delay_seconds)}s. The daemon will deliver it as a <channel> "
+        "event, even across a restart."
     )
 
 
 @mcp.tool()
-def list_scheduled_notifications() -> str:
-    """List this session's pending (not-yet-delivered) scheduled notifications."""
+async def list_scheduled_notifications() -> str:
+    """List this session's pending notifications (queried from the daemon)."""
     session_id, _ = session_state.effective_session_id()
     if not session_id:
         return "Session id unknown; cannot list scheduled notifications."
-    entries = scheduler.pending(session_id)
-    if not entries:
+    if not await DAEMON.wait_connected():
+        return _daemon_unreachable_message()
+    try:
+        reply = await DAEMON.request({"type": wsproto.LIST, "session_id": session_id})
+    except (ConnectionError, TimeoutError):
+        return _daemon_unreachable_message()
+    items = reply.get("items", [])
+    if not items:
         return f"No scheduled notifications for session {session_id}."
-    now = time.time()
     lines = [f"Scheduled notifications for session {session_id}:"]
-    for entry in entries:
-        due = float(entry.get("due_at", 0))
-        rel = int(due - now)
-        when = "overdue" if rel <= 0 else f"in {rel}s"
-        lines.append(f"  {entry['id']}  due {_iso(due)} ({when})")
+    for item in items:
+        lines.append(
+            f"  {item.get('id')}  due_at={item.get('due_at')}  kind={item.get('kind')}"
+        )
     return "\n".join(lines)
-
-
-def _dispatch_content(entry: dict, session_id: str, now: float) -> str:
-    due = float(entry.get("due_at", now))
-    created_for = entry.get("session_id", "?")
-    late = int(now - due)
-    recovered = " (recovered after restart)" if late >= POLL_INTERVAL_SECONDS else ""
-    return (
-        f"Scheduled notification fired{recovered}. callback_id={entry.get('id')} "
-        f"session_id={session_id} (scheduled for {created_for}) "
-        f"due_at={_iso(due)} now={_iso(now)} late_by={late}s"
-    )
-
-
-async def _send_channel_event(
-    write_stream, content: str, meta: dict[str, str] | None = None
-) -> None:
-    params: dict[str, object] = {"content": content}
-    if meta:
-        params["meta"] = meta
-    notification = JSONRPCNotification(
-        jsonrpc="2.0", method=CHANNEL_METHOD, params=params
-    )
-    await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
-
-
-async def _run_dispatcher(write_stream) -> None:
-    """Poll the session-id state file and the store; deliver due callbacks.
-
-    Polling (rather than on-demand) is what makes recovery proactive: a freshly
-    restarted server learns its real session id and fires past-due callbacks
-    without waiting for the agent to call a tool.
-    """
-    await anyio.sleep(STARTUP_GRACE_SECONDS)
-    while True:
-        try:
-            session_id, _ = session_state.effective_session_id()
-            if session_id:
-                now = time.time()
-                for entry in scheduler.due_callbacks(session_id, now):
-                    meta = {
-                        "severity": "info",
-                        "kind": str(entry.get("kind", "scheduled")),
-                        "callback_id": str(entry.get("id", "")),
-                    }
-                    await _send_channel_event(
-                        write_stream, _dispatch_content(entry, session_id, now), meta
-                    )
-                    scheduler.mark_dispatched(entry)
-        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
-            return  # transport closed; stop dispatching
-        except Exception:
-            pass  # best-effort: never let dispatch errors kill the loop
-        await anyio.sleep(POLL_INTERVAL_SECONDS)
 
 
 async def _serve() -> None:
@@ -187,10 +274,11 @@ async def _serve() -> None:
         experimental_capabilities={"claude/channel": {}},
     )
     async with stdio_server() as (read_stream, write_stream):
+        DAEMON.attach_write_stream(write_stream)
         async with anyio.create_task_group() as tg:
-            tg.start_soon(_run_dispatcher, write_stream)
+            tg.start_soon(DAEMON.run)
             await server.run(read_stream, write_stream, init_options)
-            tg.cancel_scope.cancel()  # transport closed: stop the dispatcher
+            tg.cancel_scope.cancel()  # transport closed: stop the daemon client
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+[Unit]
+Description=wlr notifications daemon (Claude Code channels proof-of-concept)
+After=default.target
+
+[Service]
+Type=simple
+# EDIT the two absolute paths below for your machine:
+#   1. the path to `uv`             -> run: command -v uv
+#   2. the path to the daemon script (a repo checkout is the most stable choice;
+#      the installed plugin lives at a version-specific cache path that changes
+#      on every upgrade)
+ExecStart=%h/.local/bin/uv run -qs %h/wlr-cc-plugins/notifications/daemon/notifications-daemon.py
+Restart=on-failure
+RestartSec=2
+
+# Optional overrides (defaults shown):
+# Environment=NOTIFICATIONS_WS_HOST=127.0.0.1
+# Environment=NOTIFICATIONS_WS_PORT=8137
+# Environment=NOTIFICATIONS_DATA_DIR=%h/.claude/notifications
+
+[Install]
+WantedBy=default.target

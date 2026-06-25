@@ -2,13 +2,16 @@
 """Persistent store of scheduled callback notifications, keyed by session id.
 
 Proof-of-concept persistence for the notifications plugin. Each scheduled
-callback is a small JSON file under a per-session directory, so that when every
-Claude session is closed and the stdio MCP servers die, the schedule survives on
-disk. On restart each server recovers the callbacks for *its* recovered session
-id (see ../lib/session_state.py) and the dispatcher fires any that are due,
-including ones that came due while nothing was running.
+callback is a small JSON file under a per-session directory, so the schedule
+survives across restarts. The store is owned by the persistent notifications
+daemon (see ../daemon/notifications-daemon.py); it schedules callbacks on behalf
+of relays, delivers due ones over the WebSocket, and deletes them on ack.
 
-stdlib only; the MCP server adds the actual channel delivery on top.
+The store location is fixed (not derived from CLAUDE_PLUGIN_DATA) so the daemon
+finds the same files whether launched from a plugin context or from a bare
+systemd --user unit. Override with NOTIFICATIONS_DATA_DIR.
+
+stdlib only.
 """
 
 import json
@@ -23,7 +26,7 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 def store_dir() -> Path:
     """Root directory for persisted callbacks (survives across sessions)."""
-    base = os.environ.get("CLAUDE_PLUGIN_DATA")
+    base = os.environ.get("NOTIFICATIONS_DATA_DIR")
     root = Path(base) if base else Path.home() / ".claude" / "notifications"
     return root / "scheduled"
 
@@ -80,14 +83,17 @@ def due_callbacks(session_id: str, now: float) -> list[dict]:
     return [e for e in pending(session_id) if float(e.get("due_at", 0)) <= now]
 
 
-def mark_dispatched(entry: dict) -> None:
-    """Remove a callback once delivered (callbacks are one-shot)."""
-    session_id = entry.get("session_id")
-    callback_id = entry.get("id")
+def delete(session_id: str, callback_id: str) -> None:
+    """Remove a callback once acknowledged (callbacks are one-shot)."""
     if not session_id or not callback_id:
         return
-    path = _session_dir(str(session_id)) / f"{callback_id}.json"
+    path = _session_dir(session_id) / f"{callback_id}.json"
     try:
         path.unlink()
     except OSError:
         pass
+
+
+def mark_dispatched(entry: dict) -> None:
+    """Remove a callback by entry dict."""
+    delete(str(entry.get("session_id", "")), str(entry.get("id", "")))
