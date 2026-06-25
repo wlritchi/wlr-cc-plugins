@@ -33,12 +33,12 @@ Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
 import asyncio
 import json
 import os
+import random
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import httpx
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
@@ -54,6 +54,8 @@ import wsproto  # noqa: E402
 DISPATCH_POLL_SECONDS = 2.0
 # A scheduled callback this far past due was held while nothing was connected.
 RECOVERED_THRESHOLD_SECONDS = 30
+# consecutive-no-update level that forces ~max (8h) backoff after an auth failure.
+AUTH_BACKOFF_LEVEL = 14
 
 # session id -> its current connection
 CONNECTIONS: dict[str, "Connection"] = {}
@@ -390,29 +392,52 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             tracker.wake.clear()
             await tracker.wake.wait()  # resumed when a subscribed session reconnects
             continue
+        delay: float | None = None
         try:
             await tracker.poll_once()
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
+        except github_client.GitHubNotFound as exc:
+            tracker.append(
+                [
+                    pr_monitor.synthetic_event(
+                        "pr_gone",
+                        "high",
+                        f"{tracker.key} could not be fetched ({exc} — deleted, or the token lost "
+                        "access). Polling stopped and you've been unsubscribed.",
+                        tracker.key,
+                    )
+                ]
+            )
+            pr_monitor.save_tracker(tracker)
+            return
+        except github_client.GitHubRateLimited as exc:
+            wait = max(1.0, exc.reset_at - time.time())
+            print(
+                f"notifications daemon: {tracker.key} rate limited; waiting {int(wait)}s",
+                file=sys.stderr,
+            )
+            delay = wait + random.uniform(1.0, 15.0)  # defer; not a "no update"
+        except github_client.GitHubAuthError as exc:
+            if not tracker.auth_notified:
                 tracker.append(
                     [
                         pr_monitor.synthetic_event(
-                            "pr_gone",
+                            "pr_auth_error",
                             "high",
-                            f"{tracker.key} could not be fetched (404 — deleted, or the token lost "
-                            "access). Polling stopped and you've been unsubscribed.",
+                            f"GitHub access to {tracker.key} failed ({exc}). Polling is paused until "
+                            "the daemon's GITHUB_TOKEN is fixed (restart the daemon with a valid token).",
                             tracker.key,
                         )
                     ]
                 )
-                pr_monitor.save_tracker(tracker)
-                return
+                tracker.auth_notified = True
+            tracker.consecutive_no_update = max(
+                tracker.consecutive_no_update, AUTH_BACKOFF_LEVEL
+            )
             print(
-                f"notifications daemon: poll error {tracker.key}: {exc}",
+                f"notifications daemon: auth error {tracker.key}: {exc}",
                 file=sys.stderr,
             )
-            tracker.consecutive_no_update += 1
-        except Exception as exc:  # noqa: BLE001 - keep polling through transient errors
+        except Exception as exc:  # noqa: BLE001 - transient/server/network: back off and retry
             print(
                 f"notifications daemon: poll error {tracker.key}: {exc}",
                 file=sys.stderr,
@@ -423,9 +448,15 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
         if tracker.terminal:  # merged: deliver the final event, then stop polling
             return
 
-        delay = _poll_delay(tracker)
+        if delay is None:
+            delay = _poll_delay(tracker)
+            throttle_until = GH.should_throttle() if GH is not None else None
+            if throttle_until is not None:
+                delay = max(
+                    delay, throttle_until - time.time() + random.uniform(1.0, 15.0)
+                )
         try:
-            await asyncio.wait_for(tracker.wake.wait(), timeout=delay)
+            await asyncio.wait_for(tracker.wake.wait(), timeout=max(0.2, delay))
             tracker.wake.clear()
         except asyncio.TimeoutError:
             pass

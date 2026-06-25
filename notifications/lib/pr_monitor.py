@@ -114,6 +114,119 @@ def snapshot_from_api(data: dict) -> dict:
     return snap
 
 
+def _nodes(connection: dict | None) -> list[dict]:
+    return (connection or {}).get("nodes") or []
+
+
+def _mergeable_map(value: str | None) -> str:
+    return {"MERGEABLE": "clean", "CONFLICTING": "dirty"}.get(value or "", "unknown")
+
+
+def _reviewer_name(node: dict | None) -> str | None:
+    if not node:
+        return None
+    return node.get("login") or node.get("name")
+
+
+def snapshot_from_graphql(pr: dict) -> dict:
+    """Normalize a GraphQL pullRequest node into the same snapshot shape as REST.
+
+    Enums are lowercased and CONFLICTING -> "dirty" so the transport-agnostic
+    diff() is unchanged. Extra facet fields (draft, labels, requested reviewers,
+    review-thread resolution, force pushes) are stashed for later diff rules.
+    """
+    snap: dict = {
+        "state": "open" if pr.get("state") == "OPEN" else "closed",
+        "merged": bool(pr.get("merged")),
+        "merged_by": (pr.get("mergedBy") or {}).get("login"),
+        "mergeable_state": _mergeable_map(pr.get("mergeable")),
+        "head_sha": pr.get("headRefOid"),
+        "title": pr.get("title"),
+        "url": pr.get("url"),
+        "draft": bool(pr.get("isDraft")),
+        "labels": sorted(
+            str(n["name"]) for n in _nodes(pr.get("labels")) if n.get("name")
+        ),
+        "requested_reviewers": sorted(
+            r
+            for n in _nodes(pr.get("reviewRequests"))
+            if (r := _reviewer_name(n.get("requestedReviewer")))
+        ),
+        "reviews": {},
+        "review_comments": {},
+        "issue_comments": {},
+        "check_runs": {},
+        "statuses": {},
+        "review_threads": {},
+        "force_pushes": [],
+    }
+    for r in _nodes(pr.get("reviews")):
+        if r.get("state") == "PENDING":
+            continue
+        snap["reviews"][str(r.get("id"))] = {
+            "state": r.get("state"),
+            "user": (r.get("author") or {}).get("login"),
+            "body": r.get("body") or "",
+            "url": r.get("url"),
+        }
+    for th in _nodes(pr.get("reviewThreads")):
+        snap["review_threads"][str(th.get("id"))] = {
+            "resolved": bool(th.get("isResolved")),
+            "path": th.get("path"),
+            "line": th.get("line"),
+            "start_line": th.get("startLine"),
+        }
+        for c in _nodes(th.get("comments")):
+            snap["review_comments"][str(c.get("id"))] = {
+                "user": (c.get("author") or {}).get("login"),
+                "body": c.get("body") or "",
+                "path": c.get("path") or th.get("path"),
+                "line": c.get("line") if c.get("line") is not None else th.get("line"),
+                "start_line": c.get("startLine")
+                if c.get("startLine") is not None
+                else th.get("startLine"),
+                "original_line": c.get("originalLine"),
+                "original_start_line": c.get("originalStartLine"),
+                "diff_hunk": c.get("diffHunk"),
+                "url": c.get("url"),
+            }
+    for c in _nodes(pr.get("comments")):
+        snap["issue_comments"][str(c.get("id"))] = {
+            "user": (c.get("author") or {}).get("login"),
+            "body": c.get("body") or "",
+            "url": c.get("url"),
+        }
+    commits = _nodes(pr.get("commits"))
+    rollup = (
+        (commits[0].get("commit") or {}).get("statusCheckRollup") if commits else None
+    )
+    for ctx in _nodes((rollup or {}).get("contexts")):
+        if ctx.get("__typename") == "CheckRun":
+            snap["check_runs"][str(ctx.get("id"))] = {
+                "name": ctx.get("name"),
+                "status": (ctx.get("status") or "").lower(),
+                "conclusion": (ctx.get("conclusion") or "").lower() or None,
+                "url": ctx.get("detailsUrl"),
+                "title": ctx.get("title"),
+                "summary": ctx.get("summary"),
+            }
+        elif ctx.get("__typename") == "StatusContext":
+            snap["statuses"][ctx.get("context")] = {
+                "state": (ctx.get("state") or "").lower(),
+                "url": ctx.get("targetUrl"),
+                "desc": ctx.get("description"),
+            }
+    for ev in _nodes(pr.get("timelineItems")):
+        if ev.get("__typename") == "HeadRefForcePushedEvent":
+            snap["force_pushes"].append(
+                {
+                    "before": (ev.get("beforeCommit") or {}).get("oid"),
+                    "after": (ev.get("afterCommit") or {}).get("oid"),
+                }
+            )
+    return snap
+
+
 def diff(old: dict | None, new: dict, key: str) -> list[dict]:
     """Events introduced by `new` relative to `old`. None old => baseline (no events)."""
     if old is None:
@@ -328,6 +441,7 @@ class PRTracker:
         self.merged = False
         self.terminal = False  # merged or gone: stop polling, unsubscribe on ack
         self.terminal_seq: int | None = None
+        self.auth_notified = False  # the one-time auth-failure event was emitted
         self.task = None
         self.wake = asyncio.Event()
 
@@ -350,14 +464,14 @@ class PRTracker:
 
     async def initial_poll(self) -> str:
         """Establish the baseline snapshot (no events) and return a status summary."""
-        data = await self.client.fetch_pr_state(self.owner, self.repo, self.number)
-        self.snapshot = snapshot_from_api(data)
+        pr = await self.client.fetch_pr(self.owner, self.repo, self.number)
+        self.snapshot = snapshot_from_graphql(pr)
         self.merged = self.snapshot["merged"]
         return summarize(self.snapshot)
 
     async def poll_once(self) -> bool:
-        data = await self.client.fetch_pr_state(self.owner, self.repo, self.number)
-        new = snapshot_from_api(data)
+        pr = await self.client.fetch_pr(self.owner, self.repo, self.number)
+        new = snapshot_from_graphql(pr)
         events = diff(self.snapshot, new, self.key)
         self.snapshot = new
         if events:
@@ -396,6 +510,7 @@ def save_tracker(t: PRTracker) -> None:
         "merged": t.merged,
         "terminal": t.terminal,
         "terminal_seq": t.terminal_seq,
+        "auth_notified": t.auth_notified,
     }
     path = _store_path(t.key)
     tmp = path.with_name(path.name + ".tmp")
@@ -430,5 +545,6 @@ def load_trackers(client) -> list[PRTracker]:
         t.merged = bool(data.get("merged"))
         t.terminal = bool(data.get("terminal"))
         t.terminal_seq = data.get("terminal_seq")
+        t.auth_notified = bool(data.get("auth_notified"))
         trackers.append(t)
     return trackers

@@ -16,6 +16,9 @@ It provides two capabilities:
 - **GitHub PR monitoring** — `subscribe_github_pr(org/repo#number)` polls the PR
   for checks, reviews, comments and mergeability and pushes rich notifications
   (merge conflicts, short comments inline, inline-comment line ranges, links).
+  Each poll is a single GraphQL query (few API calls); rate-limit headers are
+  honoured (it throttles as the budget runs low) and failures are classified
+  (auth / not-found / rate-limited / transient) so recovery is tailored to each.
   Polling backs off (5 min, doubling after every 2 idle polls, up to 8 h) but is
   capped to ~1 h during business hours (8am ET–8pm PT, Mon–Fri). Each subscriber
   has an acked high-water mark; new subscribers join without replay; polling
@@ -31,6 +34,7 @@ It provides two capabilities:
 | `NOTIFICATIONS_DATA_DIR`      | `~/.claude/notifications` | Where callbacks and PR state are persisted    |
 | `GITHUB_TOKEN`                | —                         | Token for PR polling (`gh auth token`)        |
 | `GITHUB_API_URL`              | `https://api.github.com`  | API base (set for GitHub Enterprise / tests)  |
+| `GITHUB_GRAPHQL_URL`          | `{GITHUB_API_URL}/graphql`| GraphQL endpoint (override for Enterprise)    |
 | `NOTIFICATIONS_PR_POLL_SECONDS` | —                       | Force a fixed PR poll cadence (override/testing) |
 
 The relay reads the same `NOTIFICATIONS_WS_HOST`/`PORT`, so if you change the
