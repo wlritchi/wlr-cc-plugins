@@ -13,6 +13,10 @@ ExecStart=%h/.local/bin/uv run -qs %h/wlr-cc-plugins/notifications/daemon/notifi
 Restart=on-failure
 RestartSec=2
 
+# GitHub PR monitoring needs a token. systemd --user has no inherited env, so
+# provide it explicitly, e.g. an EnvironmentFile containing GITHUB_TOKEN=...:
+# EnvironmentFile=%h/.config/notifications-daemon.env
+
 # Optional overrides (defaults shown):
 # Environment=NOTIFICATIONS_WS_HOST=127.0.0.1
 # Environment=NOTIFICATIONS_WS_PORT=8137

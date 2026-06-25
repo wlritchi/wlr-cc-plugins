@@ -32,6 +32,7 @@ Run directly: ./notifications-server.py
 
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -294,6 +295,97 @@ async def list_scheduled_notifications() -> str:
         lines.append(
             f"  {item.get('id')}  due_at={item.get('due_at')}  kind={item.get('kind')}"
         )
+    return "\n".join(lines)
+
+
+_PR_REF_RE = re.compile(r"^\s*([^/\s]+)/([^/#\s]+)#(\d+)\s*$")
+
+
+async def _pr_request(payload: dict) -> dict | str:
+    """Common guard + request for the PR tools; returns the reply or an error string."""
+    if not await DAEMON.wait_connected():
+        return _daemon_unreachable_message()
+    try:
+        return await DAEMON.request(payload)
+    except (ConnectionError, TimeoutError):
+        return _daemon_unreachable_message()
+
+
+@mcp.tool()
+async def subscribe_github_pr(pr: str) -> str:
+    """Subscribe this session to notifications for a GitHub PR, given as org/repo#number.
+
+    The daemon polls the PR (checks, reviews, comments, mergeability) and delivers
+    updates as <channel> events with enough detail to act on. Subscriptions persist
+    in the daemon; a merged PR auto-unsubscribes you.
+    """
+    match = _PR_REF_RE.match(pr or "")
+    if not match:
+        return "Invalid PR reference. Use org/repo#number, e.g. octocat/hello-world#42."
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot subscribe: this relay does not yet know its session id."
+    owner, repo, number = match.group(1), match.group(2), int(match.group(3))
+    reply = await _pr_request(
+        {
+            "type": wsproto.SUBSCRIBE_PR,
+            "session_id": session_id,
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not subscribe to {owner}/{repo}#{number}: {reply.get('error')}"
+    if reply.get("closed"):
+        return f"{reply.get('pr')} is already closed/merged ({reply.get('summary')}); not subscribing."
+    return f"Subscribed to {reply.get('pr')}. Current status: {reply.get('summary')}. Updates will arrive as <channel> events."
+
+
+@mcp.tool()
+async def unsubscribe_github_pr(pr: str) -> str:
+    """Unsubscribe this session from a GitHub PR, given as org/repo#number."""
+    match = _PR_REF_RE.match(pr or "")
+    if not match:
+        return "Invalid PR reference. Use org/repo#number, e.g. octocat/hello-world#42."
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot unsubscribe: this relay does not yet know its session id."
+    owner, repo, number = match.group(1), match.group(2), int(match.group(3))
+    reply = await _pr_request(
+        {
+            "type": wsproto.UNSUBSCRIBE_PR,
+            "session_id": session_id,
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    return f"Unsubscribed from {reply.get('pr')}."
+
+
+@mcp.tool()
+async def list_github_pr_subscriptions() -> str:
+    """List this session's active GitHub PR subscriptions (queried from the daemon)."""
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Session id unknown; cannot list PR subscriptions."
+    reply = await _pr_request(
+        {"type": wsproto.LIST_SUBSCRIPTIONS, "session_id": session_id}
+    )
+    if isinstance(reply, str):
+        return reply
+    items = reply.get("items", [])
+    if not items:
+        return "No active GitHub PR subscriptions for this session."
+    lines = ["GitHub PR subscriptions:"]
+    for item in items:
+        state = " (merged)" if item.get("merged") else ""
+        lines.append(f"  {item.get('pr')}{state}  pending={item.get('pending', 0)}")
     return "\n".join(lines)
 
 

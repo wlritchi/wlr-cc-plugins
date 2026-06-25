@@ -18,11 +18,17 @@ REGISTER = "register"  # {session_id}            attach this connection to a ses
 SCHEDULE = "schedule"  # {req_id, session_id, delay_seconds, kind}
 ACK = "ack"  # {id}                              a delivered notification was handled
 LIST = "list"  # {req_id, session_id}
+SUBSCRIBE_PR = "subscribe_pr"  # {req_id, session_id, owner, repo, number}
+UNSUBSCRIBE_PR = "unsubscribe_pr"  # {req_id, session_id, owner, repo, number}
+LIST_SUBSCRIPTIONS = "list_subscriptions"  # {req_id, session_id}
 
 # daemon -> relay
 NOTIFY = "notify"  # {id, content, meta}          deliver this to the agent, then ack
 SCHEDULED = "scheduled"  # {req_id, id, due_at}
 LIST_RESULT = "list_result"  # {req_id, items}
+SUBSCRIBED = "subscribed"  # {req_id, pr, summary, merged, closed}
+UNSUBSCRIBED = "unsubscribed"  # {req_id, pr}
+SUBSCRIPTIONS_RESULT = "subscriptions_result"  # {req_id, items}
 ERROR = "error"  # {req_id, error}
 
 

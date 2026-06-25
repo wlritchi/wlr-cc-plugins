@@ -3,62 +3,81 @@
 """
 Notifications daemon
 
-A persistent, single-instance WebSocket server that owns the notification
-schedule for all Claude sessions on this machine. The per-session stdio MCP
-relays (see ../mcp/notifications-server.py) connect to it over localhost,
-register their session id, forward the agent's schedule requests, receive
-due notifications, and acknowledge them.
+A persistent, single-instance WebSocket server that owns notification state for
+all Claude sessions on this machine. Per-session stdio MCP relays connect over
+localhost, register their session id, and exchange notifications.
 
-Responsibilities (everything stateful lives here, not in the relays):
-  - persist scheduled callbacks to disk, keyed by session id (../lib/scheduler.py)
-  - per connection, dispatch callbacks that are due for that session
-  - hold undelivered/unacked callbacks until a relay for that session connects,
-    so a callback that comes due while nothing is open is delivered on reconnect
-  - delete a callback only once the relay acks it (at-least-once delivery)
+It provides two capabilities:
+  - scheduled one-shot callbacks (proof-of-concept; ../lib/scheduler.py)
+  - GitHub PR monitoring (../lib/pr_monitor.py): polls subscribed PRs for checks,
+    reviews, comments and mergeability, and pushes rich notifications. Polling
+    cadence backs off but is capped during business hours (../lib/pr_schedule.py).
+    Updates are cached and each subscriber has an acked high-water mark; new
+    subscribers join existing polling without replay. Polling suspends while no
+    subscribed session is connected and resumes on reconnect. A merged PR
+    auto-unsubscribes everyone and stops polling.
 
-Run manually:   uv run -qs notifications-daemon.py
-Or via systemd:  see ./README.md  (systemctl --user)
+Run manually or via systemd --user (see ./README.md). The relay never spawns it.
 
 Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
                NOTIFICATIONS_WS_PORT (default 8137)
                NOTIFICATIONS_DATA_DIR (default ~/.claude/notifications)
+               GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com)
 """
 
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["websockets"]
+# dependencies = ["websockets", "httpx", "tzdata"]
 # ///
 
 import asyncio
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
+import github_client  # noqa: E402
+import pr_monitor  # noqa: E402
+import pr_schedule  # noqa: E402
 import scheduler  # noqa: E402
 import wsproto  # noqa: E402
 
-# How often each connection re-checks the store for newly-due callbacks.
+# How often each connection re-checks for newly-deliverable notifications.
 DISPATCH_POLL_SECONDS = 2.0
-# A callback this far past due was almost certainly held while nothing was
-# connected, rather than just late by a poll tick — label it as recovered.
+# A scheduled callback this far past due was held while nothing was connected.
 RECOVERED_THRESHOLD_SECONDS = 30
+
+# session id -> its current connection
+CONNECTIONS: dict[str, "Connection"] = {}
+# "owner/repo#number" -> PRTracker
+TRACKERS: dict[str, pr_monitor.PRTracker] = {}
+GH: github_client.GitHubClient | None = None
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _build_notification(
+# --------------------------------------------------------------------------- #
+# scheduled one-shot callbacks (proof-of-concept feature)
+# --------------------------------------------------------------------------- #
+
+
+def _build_callback_notification(
     entry: dict, session_id: str, now: float
 ) -> tuple[str, dict[str, str]]:
-    """The notification body the daemon owns and the relay relays verbatim."""
     due = float(entry.get("due_at", now))
     created_for = entry.get("session_id", "?")
     late = int(now - due)
@@ -78,40 +97,64 @@ def _build_notification(
     return content, meta
 
 
-class Connection:
-    """State for one connected relay (one Claude session)."""
+# --------------------------------------------------------------------------- #
+# connection handling + delivery
+# --------------------------------------------------------------------------- #
 
+
+class Connection:
     def __init__(self, websocket) -> None:
         self.ws = websocket
         self.session_id: str | None = None
-        self.inflight: set[str] = set()  # sent, awaiting ack
+        self.inflight: set[str] = set()  # notification ids sent, awaiting ack
+
+
+async def _safe_send(conn: Connection, payload: dict) -> bool:
+    try:
+        await conn.ws.send(json.dumps(payload))
+        return True
+    except ConnectionClosed:
+        return False
 
 
 async def _dispatch_loop(conn: Connection) -> None:
-    """Push due callbacks for this connection's session until it closes."""
+    """Deliver any undelivered notifications (callbacks + PR events) for this session."""
     while True:
         session_id = conn.session_id
         if session_id:
             now = time.time()
             for entry in scheduler.due_callbacks(session_id, now):
                 callback_id = str(entry.get("id", ""))
-                if not callback_id or callback_id in conn.inflight:
+                if callback_id and callback_id not in conn.inflight:
+                    content, meta = _build_callback_notification(entry, session_id, now)
+                    if not await _safe_send(
+                        conn,
+                        {
+                            "type": wsproto.NOTIFY,
+                            "id": callback_id,
+                            "content": content,
+                            "meta": meta,
+                        },
+                    ):
+                        return
+                    conn.inflight.add(callback_id)
+            for tracker in list(TRACKERS.values()):
+                if session_id not in tracker.subscribers:
                     continue
-                content, meta = _build_notification(entry, session_id, now)
-                try:
-                    await conn.ws.send(
-                        json.dumps(
-                            {
-                                "type": wsproto.NOTIFY,
-                                "id": callback_id,
-                                "content": content,
-                                "meta": meta,
-                            }
-                        )
-                    )
-                except ConnectionClosed:
-                    return
-                conn.inflight.add(callback_id)
+                hwm = tracker.hwm.get(session_id, 0)
+                for event in tracker.events_after(hwm):
+                    nid = f"pr:{tracker.key}:{event['seq']}"
+                    if nid in conn.inflight:
+                        continue
+                    payload = {
+                        "type": wsproto.NOTIFY,
+                        "id": nid,
+                        "content": event["content"],
+                        "meta": event["meta"],
+                    }
+                    if not await _safe_send(conn, payload):
+                        return
+                    conn.inflight.add(nid)
         await asyncio.sleep(DISPATCH_POLL_SECONDS)
 
 
@@ -127,34 +170,27 @@ async def _handle(websocket) -> None:
             kind = msg.get("type")
 
             if kind == wsproto.REGISTER:
-                conn.session_id = msg.get("session_id") or None
-                if dispatch_task is None and conn.session_id:
-                    dispatch_task = asyncio.create_task(_dispatch_loop(conn))
+                new_sid = msg.get("session_id") or None
+                if (
+                    conn.session_id
+                    and CONNECTIONS.get(conn.session_id) is conn
+                    and conn.session_id != new_sid
+                ):
+                    del CONNECTIONS[conn.session_id]
+                conn.session_id = new_sid
+                if new_sid:
+                    CONNECTIONS[new_sid] = conn
+                    for tracker in TRACKERS.values():
+                        if new_sid in tracker.subscribers:
+                            tracker.wake.set()  # resume polling for this session's PRs
+                    if dispatch_task is None:
+                        dispatch_task = asyncio.create_task(_dispatch_loop(conn))
 
             elif kind == wsproto.SCHEDULE:
-                session_id = msg.get("session_id") or conn.session_id
-                if not session_id:
-                    await _send(websocket, wsproto.ERROR, msg, error="no session id")
-                    continue
-                delay = max(0, int(msg.get("delay_seconds", 300)))
-                callback_id = scheduler.schedule(
-                    session_id,
-                    time.time() + delay,
-                    kind=str(msg.get("kind", "scheduled")),
-                )
-                await _send(
-                    websocket,
-                    wsproto.SCHEDULED,
-                    msg,
-                    id=callback_id,
-                    due_at=time.time() + delay,
-                )
+                await _handle_schedule(websocket, conn, msg)
 
             elif kind == wsproto.ACK:
-                callback_id = msg.get("id")
-                if conn.session_id and callback_id:
-                    scheduler.delete(conn.session_id, callback_id)
-                    conn.inflight.discard(callback_id)
+                _handle_ack(conn, msg)
 
             elif kind == wsproto.LIST:
                 session_id = msg.get("session_id") or conn.session_id
@@ -171,11 +207,228 @@ async def _handle(websocket) -> None:
                     else []
                 )
                 await _send(websocket, wsproto.LIST_RESULT, msg, items=items)
+
+            elif kind == wsproto.SUBSCRIBE_PR:
+                await _handle_subscribe(websocket, conn, msg)
+
+            elif kind == wsproto.UNSUBSCRIBE_PR:
+                _handle_unsubscribe(conn, msg)
+                await _send(websocket, wsproto.UNSUBSCRIBED, msg, pr=_msg_key(msg))
+
+            elif kind == wsproto.LIST_SUBSCRIPTIONS:
+                await _handle_list_subscriptions(websocket, conn, msg)
     except ConnectionClosed:
         pass
     finally:
         if dispatch_task is not None:
             dispatch_task.cancel()
+        if conn.session_id and CONNECTIONS.get(conn.session_id) is conn:
+            del CONNECTIONS[conn.session_id]
+
+
+async def _handle_schedule(websocket, conn: Connection, msg: dict) -> None:
+    session_id = msg.get("session_id") or conn.session_id
+    if not session_id:
+        await _send(websocket, wsproto.ERROR, msg, error="no session id")
+        return
+    delay = max(0, int(msg.get("delay_seconds", 300)))
+    callback_id = scheduler.schedule(
+        session_id, time.time() + delay, kind=str(msg.get("kind", "scheduled"))
+    )
+    await _send(
+        websocket, wsproto.SCHEDULED, msg, id=callback_id, due_at=time.time() + delay
+    )
+
+
+def _handle_ack(conn: Connection, msg: dict) -> None:
+    nid = msg.get("id")
+    if not nid:
+        return
+    if isinstance(nid, str) and nid.startswith("pr:"):
+        key, _, seq = nid[3:].rpartition(":")
+        tracker = TRACKERS.get(key)
+        if tracker is not None and conn.session_id and seq.isdigit():
+            value = int(seq)
+            if value > tracker.hwm.get(conn.session_id, 0):
+                tracker.hwm[conn.session_id] = value
+            conn.inflight.discard(nid)
+            pr_monitor.save_tracker(tracker)
+            _finalize_terminal(tracker, conn.session_id)
+    else:
+        if conn.session_id:
+            scheduler.delete(conn.session_id, nid)
+        conn.inflight.discard(nid)
+
+
+# --------------------------------------------------------------------------- #
+# PR subscription handling
+# --------------------------------------------------------------------------- #
+
+
+def _msg_key(msg: dict) -> str:
+    return pr_monitor.pr_key(msg.get("owner"), msg.get("repo"), msg.get("number"))
+
+
+async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
+    session_id = conn.session_id or msg.get("session_id")
+    owner, repo, number = msg.get("owner"), msg.get("repo"), msg.get("number")
+    if not session_id or not owner or not repo or number is None:
+        await _send(
+            websocket, wsproto.ERROR, msg, error="missing session id or PR reference"
+        )
+        return
+    key = pr_monitor.pr_key(owner, repo, number)
+    tracker = TRACKERS.get(key)
+
+    if tracker is None:
+        tracker = pr_monitor.PRTracker(owner, repo, int(number), GH)
+        try:
+            summary = await tracker.initial_poll()
+        except Exception as exc:  # noqa: BLE001 - report any fetch failure to the agent
+            await _send(
+                websocket, wsproto.ERROR, msg, error=f"could not fetch {key}: {exc}"
+            )
+            return
+        TRACKERS[key] = tracker
+        tracker.task = asyncio.create_task(_tracker_loop(tracker))
+    else:
+        summary = pr_monitor.summarize(tracker.snapshot)
+
+    if tracker.terminal:
+        await _send(
+            websocket,
+            wsproto.SUBSCRIBED,
+            msg,
+            pr=key,
+            summary=summary,
+            merged=tracker.merged,
+            closed=True,
+        )
+        return
+
+    tracker.subscribers.add(session_id)
+    tracker.hwm[session_id] = tracker.max_seq()  # join without replaying old events
+    pr_monitor.save_tracker(tracker)
+    tracker.wake.set()
+    await _send(
+        websocket,
+        wsproto.SUBSCRIBED,
+        msg,
+        pr=key,
+        summary=summary,
+        merged=tracker.merged,
+        closed=False,
+    )
+
+
+def _handle_unsubscribe(conn: Connection, msg: dict) -> None:
+    session_id = conn.session_id or msg.get("session_id")
+    key = _msg_key(msg)
+    tracker = TRACKERS.get(key)
+    if tracker is not None and session_id in tracker.subscribers:
+        tracker.subscribers.discard(session_id)
+        tracker.hwm.pop(session_id, None)
+        if not tracker.subscribers:
+            _remove_tracker(key)
+        else:
+            pr_monitor.save_tracker(tracker)
+
+
+async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> None:
+    session_id = conn.session_id or msg.get("session_id")
+    items = [
+        {
+            "pr": key,
+            "merged": t.merged,
+            "pending": len(t.events_after(t.hwm.get(session_id, 0))),
+        }
+        for key, t in TRACKERS.items()
+        if session_id in t.subscribers
+    ]
+    await _send(websocket, wsproto.SUBSCRIPTIONS_RESULT, msg, items=items)
+
+
+def _finalize_terminal(tracker: pr_monitor.PRTracker, session_id: str) -> None:
+    """After a subscriber acks the terminal (merged/gone) event, drop them."""
+    if (
+        tracker.terminal
+        and tracker.terminal_seq
+        and tracker.hwm.get(session_id, 0) >= tracker.terminal_seq
+    ):
+        tracker.subscribers.discard(session_id)
+        tracker.hwm.pop(session_id, None)
+        if not tracker.subscribers:
+            _remove_tracker(tracker.key)
+        else:
+            pr_monitor.save_tracker(tracker)
+
+
+def _poll_delay(tracker: pr_monitor.PRTracker) -> float:
+    """Seconds until this tracker's next poll. NOTIFICATIONS_PR_POLL_SECONDS forces
+    a fixed cadence (testing / manual override); otherwise use the backoff schedule."""
+    override = os.environ.get("NOTIFICATIONS_PR_POLL_SECONDS")
+    if override:
+        try:
+            return max(0.2, float(override))
+        except ValueError:
+            pass
+    nxt = pr_schedule.compute_next_poll(_now_utc(), tracker.consecutive_no_update)
+    return max(1.0, (nxt - _now_utc()).total_seconds())
+
+
+def _remove_tracker(key: str) -> None:
+    tracker = TRACKERS.pop(key, None)
+    if tracker is not None and tracker.task is not None:
+        tracker.task.cancel()
+    pr_monitor.delete_tracker(key)
+
+
+async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
+    """Poll a PR while at least one subscriber is connected; suspend otherwise."""
+    while True:
+        if not any(s in CONNECTIONS for s in tracker.subscribers):
+            tracker.wake.clear()
+            await tracker.wake.wait()  # resumed when a subscribed session reconnects
+            continue
+        try:
+            await tracker.poll_once()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                tracker.append(
+                    [
+                        pr_monitor.synthetic_event(
+                            "pr_gone",
+                            "high",
+                            f"{tracker.key} could not be fetched (404 — deleted, or the token lost "
+                            "access). Polling stopped and you've been unsubscribed.",
+                            tracker.key,
+                        )
+                    ]
+                )
+                pr_monitor.save_tracker(tracker)
+                return
+            print(
+                f"notifications daemon: poll error {tracker.key}: {exc}",
+                file=sys.stderr,
+            )
+            tracker.consecutive_no_update += 1
+        except Exception as exc:  # noqa: BLE001 - keep polling through transient errors
+            print(
+                f"notifications daemon: poll error {tracker.key}: {exc}",
+                file=sys.stderr,
+            )
+            tracker.consecutive_no_update += 1
+
+        pr_monitor.save_tracker(tracker)
+        if tracker.terminal:  # merged: deliver the final event, then stop polling
+            return
+
+        delay = _poll_delay(tracker)
+        try:
+            await asyncio.wait_for(tracker.wake.wait(), timeout=delay)
+            tracker.wake.clear()
+        except asyncio.TimeoutError:
+            pass
 
 
 async def _send(websocket, msg_type: str, request: dict, **fields: object) -> None:
@@ -189,16 +442,15 @@ async def _send(websocket, msg_type: str, request: dict, **fields: object) -> No
 
 
 async def main() -> None:
+    global GH
+    GH = github_client.GitHubClient()
+    for tracker in pr_monitor.load_trackers(GH):
+        TRACKERS[tracker.key] = tracker
+        tracker.task = asyncio.create_task(_tracker_loop(tracker))
+
     host, port = wsproto.host(), wsproto.port()
     try:
-        server_cm = serve(_handle, host, port)
-    except OSError as exc:  # pragma: no cover - defensive
-        print(
-            f"notifications daemon: cannot bind {host}:{port}: {exc}", file=sys.stderr
-        )
-        raise SystemExit(1) from exc
-    try:
-        async with server_cm:
+        async with serve(_handle, host, port):
             print(
                 f"notifications daemon listening on ws://{host}:{port}", file=sys.stderr
             )
