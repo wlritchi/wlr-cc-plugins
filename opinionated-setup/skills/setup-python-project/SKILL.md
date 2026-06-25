@@ -50,7 +50,8 @@ authors = [{name = "{AUTHOR_NAME}", email = "{AUTHOR_EMAIL}"}]
 requires-python = ">={PYTHON_VERSION}"
 dynamic = ["version"]
 
-[project.optional-dependencies]
+# Use dependency-groups (PEP 735) for dev dependencies - native to uv
+[dependency-groups]
 dev = [
     # Add selected tools here based on user choices
     # Example: "ruff", "mypy", "pytest", "pytest-cov", "pyright"
@@ -71,8 +72,25 @@ target-version = "py{PYTHON_VERSION_SHORT}"  # e.g., py312
 quote-style = "preserve"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "B", "C4", "RUF"]
-ignore = ["E501"]  # Line length handled by formatter
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "I",      # isort
+    "W",      # pycodestyle warnings
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "N",      # pep8-naming
+    "S",      # flake8-bandit (security)
+    "ANN",    # flake8-annotations
+    "ASYNC",  # flake8-async
+    "UP",     # pyupgrade
+    "RUF",    # ruff-specific rules
+    "T201",   # print statements
+]
+ignore = [
+    "E501",   # Line length handled by formatter
+    "S101",   # Allow assert in tests
+]
 
 [tool.mypy]
 python_version = "{PYTHON_VERSION}"
@@ -80,6 +98,9 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+enable_error_code = [
+    "truthy-bool",  # Catch mistakes like "if f.exists()" instead of "if await f.exists()"
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -94,33 +115,49 @@ addopts = [
 
 **IMPORTANT**: Must start with `---` for yamllint compliance. Use wrapper scripts for complex commands to avoid line-length violations.
 
+**VERSION NOTE**: Before creating this file, check for the latest versions of uv-pre-commit, ruff-pre-commit, pre-commit-hooks, yamllint, and codespell. The versions below are examples and may be outdated.
+
 ```yaml
 ---
+default_install_hook_types: [pre-commit, post-checkout]
+default_stages: [pre-commit, pre-push, manual]
 repos:
+  # Keep lockfile in sync - check https://github.com/astral-sh/uv-pre-commit for latest
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.5.30  # CHECK FOR LATEST VERSION
+    hooks:
+      - id: uv-lock
+        require_serial: true
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.9
+    rev: v0.8.6  # CHECK FOR LATEST VERSION
     hooks:
       - id: ruff
         args: [--fix]
       - id: ruff-format
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v5.0.0  # CHECK FOR LATEST VERSION
     hooks:
       - id: end-of-file-fixer
+        exclude: '\.md$'
       - id: trailing-whitespace
+        exclude: '(\.md|\.patch)$'
       - id: check-yaml
       - id: check-toml
       - id: check-json
       - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: mixed-line-ending
 
   - repo: https://github.com/adrienverge/yamllint
-    rev: v1.35.1
+    rev: v1.35.1  # CHECK FOR LATEST VERSION
     hooks:
       - id: yamllint
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.3.0
+    rev: v2.3.0  # CHECK FOR LATEST VERSION
     hooks:
       - id: codespell
         args: [--quiet-level=2]
@@ -133,6 +170,9 @@ repos:
         entry: bash scripts/run-pytest.sh
         language: system
         pass_filenames: false
+
+ci:
+  autoupdate_schedule: monthly
 ```
 
 ## Template: scripts/run-pytest.sh
@@ -185,7 +225,7 @@ echo "Installing git hooks..."
 for hook in pre-commit pre-push post-checkout; do
     cp "$SCRIPT_DIR/.git-hook-template" "$GIT_DIR/hooks/$hook"
     chmod +x "$GIT_DIR/hooks/$hook"
-    echo "  ✓ Installed $hook"
+    echo "  Installed $hook"
 done
 
 echo "Git hooks installed successfully!"
@@ -281,6 +321,7 @@ pythonVersion = "{PYTHON_VERSION}"
 typeCheckingMode = "basic"
 reportMissingImports = true
 reportMissingTypeStubs = false
+reportImplicitOverride = true
 ```
 
 ## Setup Instructions
@@ -294,7 +335,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Create virtual environment and install dependencies
 uv venv
 source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
-uv pip install -e .[dev]
+uv sync --group dev
 
 # Install git hooks
 ./install-hooks.sh
@@ -346,7 +387,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv pip install -e .[dev]
+        run: uv sync --group dev
 
       - name: Run pre-commit
         run: uv run pre-commit run --all-files
@@ -365,11 +406,12 @@ jobs:
 When executing this skill:
 
 1. **Ask the user** for all required information (project name, author, python version, tools, etc.)
-2. **Create all files** using the Write tool - substitute placeholders with actual values
-3. **Make scripts executable**: Run `chmod +x scripts/run-pytest.sh` and `chmod +x install-hooks.sh`
-4. **Initialize git** if not already a repo: `git init`
-5. **Provide the setup instructions**
-6. **Offer to run the setup** commands if the user wants
+2. **Check for latest versions** of pre-commit hook repos (uv-pre-commit, ruff-pre-commit, etc.)
+3. **Create all files** using the Write tool - substitute placeholders with actual values
+4. **Make scripts executable**: Run `chmod +x scripts/run-pytest.sh` and `chmod +x install-hooks.sh`
+5. **Initialize git** if not already a repo: `git init`
+6. **Provide the setup instructions**
+7. **Offer to run the setup** commands if the user wants
 
 ### Placeholder Reference
 
