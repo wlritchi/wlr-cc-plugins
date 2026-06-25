@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  notifications:
+    name: notifications (lint + tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Lint (ruff)
+        run: |
+          uvx ruff format --check notifications
+          uvx ruff check notifications
+
+      - name: Run notifications test suite
+        run: uv run -qs notifications/tests/run.py -q

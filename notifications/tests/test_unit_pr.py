@@ -1,0 +1,549 @@
+# vim: filetype=python
+"""Unit tests for PR monitoring: polling schedule, GitHub error classification,
+GraphQL snapshot + diff, the facet diff rules, content-addressed ids, and the
+split on-disk storage."""
+
+import random
+import time
+from datetime import datetime, timezone
+
+import httpx
+import pytest
+
+import github_client as gc
+import pr_monitor as pm
+import pr_schedule as ps
+
+UTC = timezone.utc
+
+
+def _utc(y, mo, d, h, mi=0):
+    return datetime(y, mo, d, h, mi, tzinfo=UTC)
+
+
+def gql(**override) -> dict:
+    """A GraphQL pullRequest node -> snapshot, with sensible defaults."""
+    pr = {
+        "title": "T",
+        "url": "https://gh/o/r/1",
+        "state": "OPEN",
+        "merged": False,
+        "isDraft": False,
+        "headRefOid": "a" * 40,
+        "mergedBy": None,
+        "mergeable": "MERGEABLE",
+        "labels": {"nodes": []},
+        "reviewRequests": {"nodes": []},
+        "reviews": {"nodes": []},
+        "reviewThreads": {"nodes": []},
+        "comments": {"nodes": []},
+        "commits": {
+            "nodes": [{"commit": {"oid": "a" * 40, "statusCheckRollup": None}}]
+        },
+        "timelineItems": {"nodes": []},
+    }
+    pr.update(override)
+    return pm.snapshot_from_graphql(pr)
+
+
+def _types(old, new):
+    return [e["type"] for e in pm.diff(old, new, "o/r#1")]
+
+
+def _only(old, new, kind):
+    events = [e for e in pm.diff(old, new, "o/r#1") if e["type"] == kind]
+    assert events, (kind, _types(old, new))
+    return events
+
+
+# --------------------------------------------------------------------------- #
+# schedule
+# --------------------------------------------------------------------------- #
+
+
+class TestSchedule:
+    def test_business_hours_dst_aware(self):
+        assert ps.in_business_hours(_utc(2026, 6, 25, 14))  # Thu 10:00 EDT
+        assert not ps.in_business_hours(_utc(2026, 6, 25, 6))  # Thu 02:00 EDT
+        assert not ps.in_business_hours(_utc(2026, 6, 27, 14))  # Saturday
+        assert not ps.in_business_hours(_utc(2026, 6, 26, 3, 30))  # Thu 23:30 EDT
+        assert ps.in_business_hours(_utc(2026, 1, 15, 15))  # Thu 10:00 EST (winter)
+
+    def test_backoff_doubling(self):
+        assert ps.base_interval_seconds(0) == 300
+        assert ps.base_interval_seconds(1) == 300
+        assert ps.base_interval_seconds(2) == 600
+        assert ps.base_interval_seconds(4) == 1200
+        assert ps.base_interval_seconds(100) == 8 * 3600
+
+    def test_business_hours_cap(self):
+        rng = random.Random(1)
+        now = _utc(2026, 6, 25, 14)  # in business hours
+        for _ in range(200):
+            gap = (ps.compute_next_poll(now, 100, rng) - now).total_seconds()
+            assert gap <= 3600 * 1.15 + 1
+
+    def test_pre_open_pull_in(self):
+        rng = random.Random(2)
+        now = _utc(2026, 6, 25, 11, 30)  # Thu 07:30 EDT; opens 12:00 UTC
+        opens = _utc(2026, 6, 25, 12)
+        for _ in range(200):
+            nxt = ps.compute_next_poll(now, 100, rng)
+            assert (nxt - opens).total_seconds() <= 3600 * 1.15 + 1
+            assert nxt > now
+
+    def test_weekend_full_backoff(self):
+        rng = random.Random(3)
+        now = _utc(2026, 6, 27, 6)  # Sat 02:00 EDT
+        gaps = [
+            (ps.compute_next_poll(now, 100, rng) - now).total_seconds()
+            for _ in range(200)
+        ]
+        assert min(gaps) >= 8 * 3600 * 0.85 - 1
+        assert max(gaps) <= 8 * 3600 * 1.15 + 1
+
+
+# --------------------------------------------------------------------------- #
+# github client error classification
+# --------------------------------------------------------------------------- #
+
+
+class TestErrorClassification:
+    def _resp(self, code, headers=None):
+        return httpx.Response(code, headers=headers or {}, json={})
+
+    def test_http_status_classification(self):
+        client = gc.GitHubClient(token="x")
+        future = str(int(time.time()) + 3600)
+        with pytest.raises(gc.GitHubAuthError):
+            client._classify_http(self._resp(401))
+        with pytest.raises(gc.GitHubAuthError):
+            client._classify_http(self._resp(403, {"X-RateLimit-Remaining": "7"}))
+        with pytest.raises(gc.GitHubRateLimited):
+            client._classify_http(
+                self._resp(
+                    403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": future}
+                )
+            )
+        with pytest.raises(gc.GitHubRateLimited):
+            client._classify_http(self._resp(429, {"Retry-After": "30"}))
+        with pytest.raises(gc.GitHubNotFound):
+            client._classify_http(self._resp(404))
+        with pytest.raises(gc.GitHubTransient):
+            client._classify_http(self._resp(502))
+        client._classify_http(self._resp(200))  # no raise
+
+    def test_graphql_error_classification(self):
+        with pytest.raises(gc.GitHubNotFound):
+            gc.GitHubClient._classify_graphql({"errors": [{"type": "NOT_FOUND"}]})
+        with pytest.raises(gc.GitHubAuthError):
+            gc.GitHubClient._classify_graphql({"errors": [{"type": "FORBIDDEN"}]})
+        with pytest.raises(gc.GitHubRateLimited):
+            gc.GitHubClient._classify_graphql({"errors": [{"type": "RATE_LIMITED"}]})
+        with pytest.raises(gc.GitHubTransient):
+            gc.GitHubClient._classify_graphql({"errors": [{"message": "boom"}]})
+        gc.GitHubClient._classify_graphql({"data": {}})  # no raise
+
+    def test_rate_limit_throttle(self):
+        client = gc.GitHubClient(token="x")
+        future = str(int(time.time()) + 3600)
+        client._update_rate_limit(
+            httpx.Headers({"X-RateLimit-Remaining": "10", "X-RateLimit-Reset": future})
+        )
+        assert client.should_throttle(threshold=50) == float(future)
+        client._update_rate_limit(
+            httpx.Headers(
+                {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": future}
+            )
+        )
+        assert client.should_throttle(threshold=50) is None
+
+
+# --------------------------------------------------------------------------- #
+# snapshot + diff
+# --------------------------------------------------------------------------- #
+
+
+class TestSnapshotAndDiff:
+    def test_snapshot_shape_and_baseline(self):
+        snap = gql(labels={"nodes": [{"name": "bug"}]})
+        assert snap["state"] == "open" and snap["mergeable_state"] == "clean"
+        assert snap["head_sha"] == "a" * 40 and snap["labels"] == ["bug"]
+        assert pm.diff(None, snap, "o/r#1") == []  # baseline never replays
+
+    def test_review_changes_requested_is_high(self):
+        new = gql(
+            reviews={
+                "nodes": [
+                    {
+                        "id": "R1",
+                        "state": "CHANGES_REQUESTED",
+                        "author": {"login": "alice"},
+                        "body": "fix the null check",
+                        "url": "u",
+                    }
+                ]
+            }
+        )
+        event = _only(gql(), new, "pr_review")[0]
+        assert event["meta"]["severity"] == "high"
+        assert "alice" in event["content"] and "null check" in event["content"]
+
+    def test_inline_comment_short_includes_code(self):
+        hunk = "@@ -10,3 +10,3 @@\n     a = 1\n-    b = 2\n+    b = 3"
+        new = gql(
+            reviewThreads={
+                "nodes": [
+                    {
+                        "id": "T1",
+                        "isResolved": False,
+                        "path": "x.py",
+                        "line": 12,
+                        "startLine": None,
+                        "comments": {
+                            "nodes": [
+                                {
+                                    "id": "C1",
+                                    "author": {"login": "bob"},
+                                    "body": "why 3?",
+                                    "url": "u",
+                                    "diffHunk": hunk,
+                                    "path": "x.py",
+                                    "line": 12,
+                                    "startLine": None,
+                                    "originalLine": 12,
+                                    "originalStartLine": None,
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        )
+        event = _only(gql(), new, "pr_inline_comment")[0]
+        assert "x.py:12" in event["content"] and "b = 3" in event["content"]
+
+    def test_inline_comment_long_gives_line_range(self):
+        new = gql(
+            reviewThreads={
+                "nodes": [
+                    {
+                        "id": "T2",
+                        "isResolved": False,
+                        "path": "x.py",
+                        "line": 80,
+                        "startLine": 20,
+                        "comments": {
+                            "nodes": [
+                                {
+                                    "id": "C2",
+                                    "author": {"login": "bob"},
+                                    "body": "big",
+                                    "url": "u",
+                                    "diffHunk": "@@\n x",
+                                    "path": "x.py",
+                                    "line": 80,
+                                    "startLine": 20,
+                                    "originalLine": 80,
+                                    "originalStartLine": 20,
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        )
+        event = _only(gql(), new, "pr_inline_comment")[0]
+        assert (
+            "x.py:20-80" in event["content"] and "spans lines 20–80" in event["content"]
+        )
+
+    def test_failed_check_includes_summary(self):
+        new = gql(
+            commits={
+                "nodes": [
+                    {
+                        "commit": {
+                            "oid": "a" * 40,
+                            "statusCheckRollup": {
+                                "state": "FAILURE",
+                                "contexts": {
+                                    "nodes": [
+                                        {
+                                            "__typename": "CheckRun",
+                                            "id": "C1",
+                                            "name": "build",
+                                            "status": "COMPLETED",
+                                            "conclusion": "FAILURE",
+                                            "detailsUrl": "https://gh/ch/1",
+                                            "title": "2 failing",
+                                            "summary": "test_foo test_bar",
+                                        }
+                                    ]
+                                },
+                            },
+                        }
+                    }
+                ]
+            }
+        )
+        event = _only(gql(), new, "pr_check")[0]
+        assert event["meta"]["severity"] == "high" and "test_foo" in event["content"]
+        assert event["meta"]["url"] == "https://gh/ch/1"
+
+    def test_merge_conflict_high(self):
+        event = _only(gql(), gql(mergeable="CONFLICTING"), "pr_conflict")[0]
+        assert event["meta"]["severity"] == "high"
+
+    def test_merged_is_terminal(self):
+        merged = gql(
+            state="MERGED",
+            merged=True,
+            mergedBy={"login": "carol"},
+            reviews={
+                "nodes": [
+                    {
+                        "id": "R1",
+                        "state": "APPROVED",
+                        "author": {"login": "x"},
+                        "body": "",
+                        "url": "u",
+                    }
+                ]
+            },
+        )
+        events = pm.diff(gql(), merged, "o/r#1")
+        assert (
+            len(events) == 1
+            and events[0]["type"] == "pr_merged"
+            and "carol" in events[0]["content"]
+        )
+
+    def test_rest_snapshot_diff_parity(self):
+        # snapshot_from_api still produces a diffable snapshot (transport-agnostic diff)
+        def api(**kw):
+            base = {
+                "pr": {
+                    "state": "open",
+                    "merged": False,
+                    "mergeable_state": "clean",
+                    "head": {"sha": "a" * 40},
+                    "title": "T",
+                    "html_url": "u",
+                },
+                "reviews": [],
+                "review_comments": [],
+                "issue_comments": [],
+                "check_runs": [],
+                "status": {},
+            }
+            base.update(kw)
+            return pm.snapshot_from_api(base)
+
+        base = api()
+        new = api(
+            reviews=[
+                {
+                    "id": 5,
+                    "state": "APPROVED",
+                    "user": {"login": "a"},
+                    "body": "lgtm",
+                    "html_url": "u",
+                }
+            ]
+        )
+        assert [e["type"] for e in pm.diff(base, new, "o/r#1")] == ["pr_review"]
+
+
+# --------------------------------------------------------------------------- #
+# facets (Phase 2)
+# --------------------------------------------------------------------------- #
+
+
+class TestFacets:
+    def test_labels_added_and_removed(self):
+        base, lbl = gql(), gql(labels={"nodes": [{"name": "bug"}, {"name": "urgent"}]})
+        added = _only(base, lbl, "pr_label")
+        assert len(added) == 2 and all("added" in e["content"] for e in added)
+        removed = _only(lbl, base, "pr_label")
+        assert len(removed) == 2 and all("removed" in e["content"] for e in removed)
+
+    def test_reviewers_requested_and_removed(self):
+        base = gql()
+        rr = gql(
+            reviewRequests={
+                "nodes": [
+                    {"requestedReviewer": {"__typename": "User", "login": "alice"}}
+                ]
+            }
+        )
+        assert (
+            "requested from alice"
+            in _only(base, rr, "pr_review_request")[0]["content"].lower()
+        )
+        assert "removed" in _only(rr, base, "pr_review_request")[0]["content"].lower()
+
+    def test_draft_toggle_both_ways(self):
+        base, draft = gql(), gql(isDraft=True)
+        assert "draft" in _only(base, draft, "pr_draft")[0]["content"]
+        assert "ready for review" in _only(draft, base, "pr_draft")[0]["content"]
+
+    def test_thread_resolved_and_reopened(self):
+        def thread(resolved):
+            return gql(
+                reviewThreads={
+                    "nodes": [
+                        {
+                            "id": "T1",
+                            "isResolved": resolved,
+                            "path": "x.py",
+                            "line": 12,
+                            "startLine": None,
+                            "comments": {"nodes": []},
+                        }
+                    ]
+                }
+            )
+
+        resolved = _only(thread(False), thread(True), "pr_thread")[0]
+        assert "resolved" in resolved["content"] and "x.py:12" in resolved["content"]
+        assert (
+            "reopened" in _only(thread(True), thread(False), "pr_thread")[0]["content"]
+        )
+
+    def test_all_green_recovery_and_no_false_positive(self):
+        def checks(conclusion):
+            return gql(
+                commits={
+                    "nodes": [
+                        {
+                            "commit": {
+                                "oid": "a" * 40,
+                                "statusCheckRollup": {
+                                    "state": conclusion,
+                                    "contexts": {
+                                        "nodes": [
+                                            {
+                                                "__typename": "CheckRun",
+                                                "id": "C1",
+                                                "name": "build",
+                                                "status": "COMPLETED",
+                                                "conclusion": conclusion,
+                                                "detailsUrl": "u",
+                                            }
+                                        ]
+                                    },
+                                },
+                            }
+                        }
+                    ]
+                }
+            )
+
+        failing, green = checks("FAILURE"), checks("SUCCESS")
+        assert (
+            "all checks are now passing"
+            in _only(failing, green, "pr_checks_green")[0]["content"].lower()
+        )
+        assert "pr_checks_green" not in _types(green, green)
+
+    def test_force_push_vs_plain_push(self):
+        base = gql()
+        forced = gql(
+            headRefOid="b" * 40,
+            timelineItems={
+                "nodes": [
+                    {
+                        "__typename": "HeadRefForcePushedEvent",
+                        "createdAt": "t",
+                        "beforeCommit": {"oid": "a" * 40},
+                        "afterCommit": {"oid": "b" * 40},
+                    }
+                ]
+            },
+        )
+        assert "force-pushed" in _only(base, forced, "pr_force_push")[0]["content"]
+        pushed = gql(headRefOid="b" * 40)
+        assert "New commits pushed" in _only(base, pushed, "pr_commits")[0]["content"]
+        assert "pr_force_push" not in _types(base, pushed)
+
+
+# --------------------------------------------------------------------------- #
+# content-addressed ids + storage (Phase 3)
+# --------------------------------------------------------------------------- #
+
+
+class TestContentIdsAndStorage:
+    def test_content_addressed_ids(self):
+        a = pm._event(
+            "pr_review", "info", "Review on o/r#1: alice approved.\nu", "o/r#1", "u"
+        )
+        b = pm._event(
+            "pr_review", "info", "Review on o/r#1: alice approved.\nu", "o/r#1", "u"
+        )
+        c = pm._event(
+            "pr_review", "info", "Review on o/r#1: bob approved.\nu", "o/r#1", "u"
+        )
+        assert a["id"] == b["id"] and a["id"] != c["id"] and len(a["id"]) == 16
+
+    def test_record_dedups_by_id(self):
+        tracker = pm.PRTracker("o", "r", 1, None)
+        a = pm._event("pr_review", "info", "same", "o/r#1", "u")
+        b = pm._event("pr_review", "info", "same", "o/r#1", "u")
+        c = pm._event("pr_review", "info", "other", "o/r#1", "u")
+        added = tracker.record([a, b, c])
+        assert [e["id"] for e in added] == [a["id"], c["id"]]
+        assert len(tracker.events) == 2
+
+    def test_split_storage_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        tracker = pm.PRTracker("o", "r", 1, None)
+        tracker.snapshot = {"labels": [], "state": "open"}
+        tracker.consecutive_no_update = 3
+        events = tracker.record(
+            [
+                pm._event("pr_review", "info", "one", "o/r#1", "u"),
+                pm._event("pr_review", "info", "two", "o/r#1", "u"),
+            ]
+        )
+        pm.save_state(tracker)
+        pm.append_events(tracker, events)
+        first_id = events[0]["id"]
+        tracker.subscribers.add("sidA")
+        tracker.acked["sidA"] = {first_id}
+        pm.save_subscriber(tracker, "sidA")
+
+        directory = pm._tracker_dir("o/r#1")
+        assert (directory / "state.json").exists()
+        assert len((directory / "events.jsonl").read_text().strip().splitlines()) == 2
+        assert (directory / "sub-sidA.json").exists()
+
+        loaded = {t.key: t for t in pm.load_trackers(None)}["o/r#1"]
+        assert loaded.consecutive_no_update == 3
+        assert loaded.event_ids == {events[0]["id"], events[1]["id"]}
+        assert loaded.subscribers == {"sidA"} and loaded.acked["sidA"] == {first_id}
+        assert [e["id"] for e in loaded.unacked_for("sidA")] == [events[1]["id"]]
+
+    def test_event_log_is_append_only(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        tracker = pm.PRTracker("o", "r", 1, None)
+        log = pm._tracker_dir("o/r#1") / "events.jsonl"
+        pm.append_events(
+            tracker,
+            tracker.record([pm._event("pr_review", "info", "one", "o/r#1", "u")]),
+        )
+        before = len(log.read_text().splitlines())
+        pm.append_events(
+            tracker,
+            tracker.record([pm._event("pr_review", "info", "two", "o/r#1", "u")]),
+        )
+        assert len(log.read_text().splitlines()) == before + 1
+
+    def test_delete_tracker_removes_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        tracker = pm.PRTracker("o", "r", 1, None)
+        pm.save_state(tracker)
+        directory = pm._tracker_dir("o/r#1")
+        assert directory.exists()
+        pm.delete_tracker("o/r#1")
+        assert not directory.exists()

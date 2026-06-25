@@ -1,7 +1,7 @@
 {
   "name": "notifications",
   "description": "Session-aware notification framework for Claude Code (groundwork)",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "author": {
     "name": "wlritchi"
   }
