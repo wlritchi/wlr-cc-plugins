@@ -12,8 +12,9 @@ It provides two capabilities:
   - GitHub PR monitoring (../lib/pr_monitor.py): polls subscribed PRs for checks,
     reviews, comments and mergeability, and pushes rich notifications. Polling
     cadence backs off but is capped during business hours (../lib/pr_schedule.py).
-    Updates are cached and each subscriber has an acked high-water mark; new
-    subscribers join existing polling without replay. Polling suspends while no
+    Updates are cached (content-addressed event ids) and each subscriber tracks
+    the ids it has acked; new subscribers join polling without replay. Polling
+    suspends while no
     subscribed session is connected and resumes on reconnect. A merged PR
     auto-unsubscribes everyone and stops polling.
 
@@ -143,9 +144,12 @@ async def _dispatch_loop(conn: Connection) -> None:
             for tracker in list(TRACKERS.values()):
                 if session_id not in tracker.subscribers:
                     continue
-                hwm = tracker.hwm.get(session_id, 0)
-                for event in tracker.events_after(hwm):
-                    nid = f"pr:{tracker.key}:{event['seq']}"
+                acked = tracker.acked.get(session_id, set())
+                for event in tracker.events:
+                    event_id = event["id"]
+                    if event_id in acked:
+                        continue
+                    nid = f"pr:{tracker.key}:{event_id}"
                     if nid in conn.inflight:
                         continue
                     payload = {
@@ -247,14 +251,12 @@ def _handle_ack(conn: Connection, msg: dict) -> None:
     if not nid:
         return
     if isinstance(nid, str) and nid.startswith("pr:"):
-        key, _, seq = nid[3:].rpartition(":")
+        key, _, event_id = nid[3:].rpartition(":")
         tracker = TRACKERS.get(key)
-        if tracker is not None and conn.session_id and seq.isdigit():
-            value = int(seq)
-            if value > tracker.hwm.get(conn.session_id, 0):
-                tracker.hwm[conn.session_id] = value
+        if tracker is not None and conn.session_id and conn.session_id in tracker.acked:
+            tracker.acked[conn.session_id].add(event_id)
             conn.inflight.discard(nid)
-            pr_monitor.save_tracker(tracker)
+            pr_monitor.save_subscriber(tracker, conn.session_id)
             _finalize_terminal(tracker, conn.session_id)
     else:
         if conn.session_id:
@@ -292,6 +294,7 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
             )
             return
         TRACKERS[key] = tracker
+        pr_monitor.save_state(tracker)
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
     else:
         summary = pr_monitor.summarize(tracker.snapshot)
@@ -309,8 +312,10 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
         return
 
     tracker.subscribers.add(session_id)
-    tracker.hwm[session_id] = tracker.max_seq()  # join without replaying old events
-    pr_monitor.save_tracker(tracker)
+    tracker.acked[session_id] = set(
+        tracker.event_ids
+    )  # join without replaying old events
+    pr_monitor.save_subscriber(tracker, session_id)
     tracker.wake.set()
     await _send(
         websocket,
@@ -329,11 +334,10 @@ def _handle_unsubscribe(conn: Connection, msg: dict) -> None:
     tracker = TRACKERS.get(key)
     if tracker is not None and session_id in tracker.subscribers:
         tracker.subscribers.discard(session_id)
-        tracker.hwm.pop(session_id, None)
+        tracker.acked.pop(session_id, None)
+        pr_monitor.delete_subscriber(tracker, session_id)
         if not tracker.subscribers:
             _remove_tracker(key)
-        else:
-            pr_monitor.save_tracker(tracker)
 
 
 async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> None:
@@ -342,7 +346,7 @@ async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> 
         {
             "pr": key,
             "merged": t.merged,
-            "pending": len(t.events_after(t.hwm.get(session_id, 0))),
+            "pending": len(t.unacked_for(session_id)),
         }
         for key, t in TRACKERS.items()
         if session_id in t.subscribers
@@ -354,15 +358,14 @@ def _finalize_terminal(tracker: pr_monitor.PRTracker, session_id: str) -> None:
     """After a subscriber acks the terminal (merged/gone) event, drop them."""
     if (
         tracker.terminal
-        and tracker.terminal_seq
-        and tracker.hwm.get(session_id, 0) >= tracker.terminal_seq
+        and tracker.terminal_id
+        and tracker.terminal_id in tracker.acked.get(session_id, set())
     ):
         tracker.subscribers.discard(session_id)
-        tracker.hwm.pop(session_id, None)
+        tracker.acked.pop(session_id, None)
+        pr_monitor.delete_subscriber(tracker, session_id)
         if not tracker.subscribers:
             _remove_tracker(tracker.key)
-        else:
-            pr_monitor.save_tracker(tracker)
 
 
 def _poll_delay(tracker: pr_monitor.PRTracker) -> float:
@@ -385,6 +388,11 @@ def _remove_tracker(key: str) -> None:
     pr_monitor.delete_tracker(key)
 
 
+def _emit(tracker: pr_monitor.PRTracker, event: dict) -> None:
+    """Record a daemon-originated event (e.g. gone/auth) and append it to the log."""
+    pr_monitor.append_events(tracker, tracker.record([event]))
+
+
 async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
     """Poll a PR while at least one subscriber is connected; suspend otherwise."""
     while True:
@@ -394,20 +402,23 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             continue
         delay: float | None = None
         try:
-            await tracker.poll_once()
-        except github_client.GitHubNotFound as exc:
-            tracker.append(
-                [
-                    pr_monitor.synthetic_event(
-                        "pr_gone",
-                        "high",
-                        f"{tracker.key} could not be fetched ({exc} — deleted, or the token lost "
-                        "access). Polling stopped and you've been unsubscribed.",
-                        tracker.key,
-                    )
-                ]
+            added = tracker.record(await tracker.poll_once())
+            pr_monitor.append_events(tracker, added)
+            tracker.consecutive_no_update = (
+                0 if added else tracker.consecutive_no_update + 1
             )
-            pr_monitor.save_tracker(tracker)
+        except github_client.GitHubNotFound as exc:
+            _emit(
+                tracker,
+                pr_monitor.synthetic_event(
+                    "pr_gone",
+                    "high",
+                    f"{tracker.key} could not be fetched ({exc} — deleted, or the token lost "
+                    "access). Polling stopped and you've been unsubscribed.",
+                    tracker.key,
+                ),
+            )
+            pr_monitor.save_state(tracker)
             return
         except github_client.GitHubRateLimited as exc:
             wait = max(1.0, exc.reset_at - time.time())
@@ -418,16 +429,15 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             delay = wait + random.uniform(1.0, 15.0)  # defer; not a "no update"
         except github_client.GitHubAuthError as exc:
             if not tracker.auth_notified:
-                tracker.append(
-                    [
-                        pr_monitor.synthetic_event(
-                            "pr_auth_error",
-                            "high",
-                            f"GitHub access to {tracker.key} failed ({exc}). Polling is paused until "
-                            "the daemon's GITHUB_TOKEN is fixed (restart the daemon with a valid token).",
-                            tracker.key,
-                        )
-                    ]
+                _emit(
+                    tracker,
+                    pr_monitor.synthetic_event(
+                        "pr_auth_error",
+                        "high",
+                        f"GitHub access to {tracker.key} failed ({exc}). Polling is paused until "
+                        "the daemon's GITHUB_TOKEN is fixed (restart the daemon with a valid token).",
+                        tracker.key,
+                    ),
                 )
                 tracker.auth_notified = True
             tracker.consecutive_no_update = max(
@@ -444,7 +454,7 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             )
             tracker.consecutive_no_update += 1
 
-        pr_monitor.save_tracker(tracker)
+        pr_monitor.save_state(tracker)
         if tracker.terminal:  # merged: deliver the final event, then stop polling
             return
 

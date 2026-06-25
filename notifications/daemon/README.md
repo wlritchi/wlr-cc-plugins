@@ -23,10 +23,11 @@ It provides two capabilities:
   honoured (it throttles as the budget runs low) and failures are classified
   (auth / not-found / rate-limited / transient) so recovery is tailored to each.
   Polling backs off (5 min, doubling after every 2 idle polls, up to 8 h) but is
-  capped to ~1 h during business hours (8am ET–8pm PT, Mon–Fri). Each subscriber
-  has an acked high-water mark; new subscribers join without replay; polling
-  suspends when no subscribed session is connected; a merged PR auto-unsubscribes
-  everyone. Requires `GITHUB_TOKEN` in the daemon's environment.
+  capped to ~1 h during business hours (8am ET–8pm PT, Mon–Fri). Events have
+  content-addressed ids and each subscriber tracks the ids it has acked; new
+  subscribers join without replay; polling suspends when no subscribed session is
+  connected; a merged PR auto-unsubscribes everyone. Requires `GITHUB_TOKEN` in
+  the daemon's environment.
 
 ## Configuration (environment)
 

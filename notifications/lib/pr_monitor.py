@@ -4,14 +4,19 @@ a per-PR tracker with on-disk persistence.
 
 The pure functions (snapshot_from_api, diff, summarize and the formatters) carry
 the "enough information to act without opening GitHub" requirement and are
-unit-tested directly. PRTracker holds the mutable per-PR state (subscribers,
-high-water marks, cached events, last snapshot); the daemon drives its polling.
+unit-tested directly. Events have content-addressed ids (a hash of their content)
+so dedup is idempotent across restarts. PRTracker holds the mutable per-PR state
+(subscribers, per-subscriber acked id sets, cached events, last snapshot); the
+daemon drives its polling. Persistence is split (state / append-only event log /
+per-subscriber files) to keep write amplification low.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -413,11 +418,12 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
         ):
             events.append(_status_event(ctx, s, key))
     if not _checks_all_green(old) and _checks_all_green(new):
+        head = (new.get("head_sha") or "")[:7]
         events.append(
             _event(
                 "pr_checks_green",
                 "info",
-                f"All checks are now passing on {key}.\n{new['url']}",
+                f"All checks are now passing on {key} (head {head}).\n{new['url']}",
                 key,
                 new["url"],
             )
@@ -467,7 +473,18 @@ def _event(kind: str, severity: str, content: str, key: str, url: str | None) ->
     meta = {"severity": severity, "kind": kind, "pr": key}
     if url:
         meta["url"] = url
-    return {"type": kind, "content": content, "meta": meta, "created_at": time.time()}
+    # Content-addressed id: a hash of (kind, content). The content is deterministic
+    # from the snapshot (it embeds the unique discriminators — review/comment urls,
+    # head shas, label names, conclusions), so the same underlying event always gets
+    # the same id, which makes dedup idempotent and reproducible across restarts.
+    event_id = hashlib.sha256(f"{kind}\n{content}".encode()).hexdigest()[:16]
+    return {
+        "id": event_id,
+        "type": kind,
+        "content": content,
+        "meta": meta,
+        "created_at": time.time(),
+    }
 
 
 def synthetic_event(
@@ -562,34 +579,36 @@ class PRTracker:
         self.key = pr_key(owner, repo, number)
         self.client = client
         self.subscribers: set[str] = set()
-        self.hwm: dict[str, int] = {}
+        self.acked: dict[str, set[str]] = {}  # session id -> set of acked event ids
         self.events: list[dict] = []
-        self.next_seq = 1
+        self.event_ids: set[str] = set()
         self.snapshot: dict | None = None
         self.consecutive_no_update = 0
         self.merged = False
         self.terminal = False  # merged or gone: stop polling, unsubscribe on ack
-        self.terminal_seq: int | None = None
+        self.terminal_id: str | None = None
         self.auth_notified = False  # the one-time auth-failure event was emitted
         self.task = None
         self.wake = asyncio.Event()
 
-    def max_seq(self) -> int:
-        return self.next_seq - 1
+    def unacked_for(self, session_id: str) -> list[dict]:
+        acked = self.acked.get(session_id, set())
+        return [e for e in self.events if e["id"] not in acked]
 
-    def events_after(self, seq: int) -> list[dict]:
-        return [e for e in self.events if e["seq"] > seq]
-
-    def append(self, events: list[dict]) -> None:
+    def record(self, events: list[dict]) -> list[dict]:
+        """Add not-yet-seen events to memory (content-addressed dedup); return the new ones."""
+        added: list[dict] = []
         for e in events:
-            e["seq"] = self.next_seq
-            self.next_seq += 1
+            event_id = e.get("id")
+            if not event_id or event_id in self.event_ids:
+                continue
             self.events.append(e)
+            self.event_ids.add(event_id)
+            added.append(e)
             if e["type"] in ("pr_merged", "pr_gone"):
                 self.terminal = True
-                self.terminal_seq = e["seq"]
-        if len(self.events) > MAX_CACHED_EVENTS:
-            self.events = self.events[-MAX_CACHED_EVENTS:]
+                self.terminal_id = event_id
+        return added
 
     async def initial_poll(self) -> str:
         """Establish the baseline snapshot (no events) and return a status summary."""
@@ -598,19 +617,23 @@ class PRTracker:
         self.merged = self.snapshot["merged"]
         return summarize(self.snapshot)
 
-    async def poll_once(self) -> bool:
+    async def poll_once(self) -> list[dict]:
+        """Fetch, diff against the last snapshot, and return the raw diff events."""
         pr = await self.client.fetch_pr(self.owner, self.repo, self.number)
         new = snapshot_from_graphql(pr)
         events = diff(self.snapshot, new, self.key)
         self.snapshot = new
-        if events:
-            self.append(events)
-            self.consecutive_no_update = 0
-        else:
-            self.consecutive_no_update += 1
         if new["merged"]:
             self.merged = True
-        return bool(events)
+        return events
+
+
+# Storage layout per PR (under NOTIFICATIONS_DATA_DIR/pr/<safe key>/):
+#   state.json      polling state (snapshot, backoff, flags) — tmp+rename per poll
+#   events.jsonl    append-only event log — appended to, rarely rewritten (compaction)
+#   sub-<sid>.json  one per subscriber (acked id set) — tmp+rename only on that ack
+# This keeps write amplification low: a poll appends a line and rewrites a small
+# state file; an ack rewrites one small subscriber file and never touches the log.
 
 
 def pr_store_dir() -> Path:
@@ -619,65 +642,131 @@ def pr_store_dir() -> Path:
     return root / "pr"
 
 
-def _store_path(key: str) -> Path:
-    return pr_store_dir() / f"{re.sub(r'[^A-Za-z0-9_.#-]', '_', key)}.json"
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.#-]", "_", name)
 
 
-def save_tracker(t: PRTracker) -> None:
-    directory = pr_store_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "owner": t.owner,
-        "repo": t.repo,
-        "number": t.number,
-        "subscribers": sorted(t.subscribers),
-        "hwm": t.hwm,
-        "next_seq": t.next_seq,
-        "events": t.events[-MAX_CACHED_EVENTS:],
-        "snapshot": t.snapshot,
-        "consecutive_no_update": t.consecutive_no_update,
-        "merged": t.merged,
-        "terminal": t.terminal,
-        "terminal_seq": t.terminal_seq,
-        "auth_notified": t.auth_notified,
-    }
-    path = _store_path(t.key)
+def _tracker_dir(key: str) -> Path:
+    return pr_store_dir() / _safe(key)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload))
+    tmp.write_text(text)
     os.replace(tmp, path)
 
 
-def delete_tracker(key: str) -> None:
+def save_state(t: PRTracker) -> None:
+    _atomic_write(
+        _tracker_dir(t.key) / "state.json",
+        json.dumps(
+            {
+                "owner": t.owner,
+                "repo": t.repo,
+                "number": t.number,
+                "snapshot": t.snapshot,
+                "consecutive_no_update": t.consecutive_no_update,
+                "merged": t.merged,
+                "terminal": t.terminal,
+                "terminal_id": t.terminal_id,
+                "auth_notified": t.auth_notified,
+            }
+        ),
+    )
+
+
+def append_events(t: PRTracker, events: list[dict]) -> None:
+    """Append new events to the JSONL log; compact + prune if the log grows large."""
+    if not events:
+        return
+    directory = _tracker_dir(t.key)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "events.jsonl").open("a") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+    if len(t.events) > MAX_CACHED_EVENTS:
+        t.events = t.events[-MAX_CACHED_EVENTS:]
+        t.event_ids = {e["id"] for e in t.events}
+        _atomic_write(
+            directory / "events.jsonl", "".join(json.dumps(e) + "\n" for e in t.events)
+        )
+        for sid in list(t.acked):  # drop acked ids for events that fell out of the log
+            t.acked[sid] &= t.event_ids
+            save_subscriber(t, sid)
+
+
+def save_subscriber(t: PRTracker, session_id: str) -> None:
+    _atomic_write(
+        _tracker_dir(t.key) / f"sub-{_safe(session_id)}.json",
+        json.dumps(
+            {"session_id": session_id, "acked": sorted(t.acked.get(session_id, set()))}
+        ),
+    )
+
+
+def delete_subscriber(t: PRTracker, session_id: str) -> None:
     try:
-        _store_path(key).unlink()
+        (_tracker_dir(t.key) / f"sub-{_safe(session_id)}.json").unlink()
     except OSError:
         pass
 
 
+def delete_tracker(key: str) -> None:
+    shutil.rmtree(_tracker_dir(key), ignore_errors=True)
+
+
 def load_trackers(client) -> list[PRTracker]:
-    directory = pr_store_dir()
-    if not directory.is_dir():
+    base = pr_store_dir()
+    if not base.is_dir():
         return []
     trackers: list[PRTracker] = []
-    for path in directory.glob("*.json"):
+    for directory in base.iterdir():
+        state_path = directory / "state.json"
+        if not directory.is_dir() or not state_path.exists():
+            continue
         try:
-            data = json.loads(path.read_text())
+            state = json.loads(state_path.read_text())
         except (OSError, ValueError):
             continue
-        t = PRTracker(data["owner"], data["repo"], int(data["number"]), client)
-        t.subscribers = set(data.get("subscribers", []))
-        t.hwm = {k: int(v) for k, v in (data.get("hwm") or {}).items()}
-        t.next_seq = int(data.get("next_seq", 1))
-        t.events = data.get("events", [])
-        t.snapshot = data.get("snapshot")
+        t = PRTracker(state["owner"], state["repo"], int(state["number"]), client)
+        snapshot = state.get("snapshot")
         # A snapshot from before the GraphQL switch has a different shape/ID space;
         # drop it so the next poll re-baselines silently instead of emitting noise.
-        if t.snapshot is not None and "labels" not in t.snapshot:
-            t.snapshot = None
-        t.consecutive_no_update = int(data.get("consecutive_no_update", 0))
-        t.merged = bool(data.get("merged"))
-        t.terminal = bool(data.get("terminal"))
-        t.terminal_seq = data.get("terminal_seq")
-        t.auth_notified = bool(data.get("auth_notified"))
+        if snapshot is not None and "labels" not in snapshot:
+            snapshot = None
+        t.snapshot = snapshot
+        t.consecutive_no_update = int(state.get("consecutive_no_update", 0))
+        t.merged = bool(state.get("merged"))
+        t.terminal = bool(state.get("terminal"))
+        t.terminal_id = state.get("terminal_id")
+        t.auth_notified = bool(state.get("auth_notified"))
+
+        events_path = directory / "events.jsonl"
+        if events_path.exists():
+            for line in events_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("id") and e["id"] not in t.event_ids:
+                    t.events.append(e)
+                    t.event_ids.add(e["id"])
+            if len(t.events) > MAX_CACHED_EVENTS:
+                t.events = t.events[-MAX_CACHED_EVENTS:]
+                t.event_ids = {e["id"] for e in t.events}
+
+        for sub_path in directory.glob("sub-*.json"):
+            try:
+                sub = json.loads(sub_path.read_text())
+            except (OSError, ValueError):
+                continue
+            session_id = sub.get("session_id")
+            if session_id:
+                t.subscribers.add(session_id)
+                t.acked[session_id] = set(sub.get("acked", []))
         trackers.append(t)
     return trackers
