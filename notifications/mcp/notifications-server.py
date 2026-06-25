@@ -31,7 +31,9 @@ Run directly: ./notifications-server.py
 # ///
 
 import json
+import random
 import sys
+import time
 from pathlib import Path
 
 import anyio
@@ -48,12 +50,29 @@ import session_state  # noqa: E402
 import wsproto  # noqa: E402
 
 CHANNEL_METHOD = "notifications/claude/channel"
-RECONNECT_BACKOFF_SECONDS = 3.0
 SESSION_POLL_SECONDS = 5.0
 # Settle time before connecting, so a recovered (past-due) event isn't pushed
 # into the channel before the client has finished the MCP/channel handshake.
 STARTUP_GRACE_SECONDS = 3.0
 REQUEST_TIMEOUT_SECONDS = 10.0
+
+# Reconnect backoff: binary (exponential) growth with +/- jitter, capped at a
+# jittered 30 minutes, after which it retries roughly every half hour forever.
+# The counter resets only after a connection that stayed up at least
+# RECONNECT_STABLE_SECONDS, so a flapping daemon still backs off.
+RECONNECT_INITIAL_SECONDS = 1.0
+RECONNECT_MAX_SECONDS = 30 * 60
+RECONNECT_JITTER = 0.2  # +/- 20%
+RECONNECT_STABLE_SECONDS = 30.0
+# Cap the exponent so 2**failures can't blow up (saturates well past the cap).
+_RECONNECT_MAX_FAILURES = 16
+
+
+def _reconnect_delay(failures: int) -> float:
+    """Exponential-with-jitter backoff for `failures` consecutive bad attempts."""
+    nominal = min(RECONNECT_MAX_SECONDS, RECONNECT_INITIAL_SECONDS * 2**failures)
+    return nominal * random.uniform(1.0 - RECONNECT_JITTER, 1.0 + RECONNECT_JITTER)
+
 
 INSTRUCTIONS = (
     "This plugin delivers scheduled notifications through the Claude Code "
@@ -75,6 +94,7 @@ class DaemonClient:
         self._req_id = 0
         self._pending: dict[int, object] = {}  # req_id -> memory send stream
         self._registered_session: str | None = None
+        self._connected_once = False  # did the current attempt establish a connection?
 
     def attach_write_stream(self, write_stream) -> None:
         self._write_stream = write_stream
@@ -121,7 +141,10 @@ class DaemonClient:
 
     async def run(self) -> None:
         await anyio.sleep(STARTUP_GRACE_SECONDS)
+        failures = 0
         while True:
+            started = time.monotonic()
+            self._connected_once = False
             try:
                 await self._connect_once()
             except (
@@ -135,11 +158,17 @@ class DaemonClient:
             finally:
                 self._ws = None
                 self._registered_session = None
-            await anyio.sleep(RECONNECT_BACKOFF_SECONDS)
+            stable = (
+                self._connected_once
+                and (time.monotonic() - started) >= RECONNECT_STABLE_SECONDS
+            )
+            failures = 0 if stable else min(failures + 1, _RECONNECT_MAX_FAILURES)
+            await anyio.sleep(_reconnect_delay(failures))
 
     async def _connect_once(self) -> None:
         async with connect(wsproto.uri(), open_timeout=5) as ws:
             self._ws = ws
+            self._connected_once = True
             await self._register(ws)
             async with anyio.create_task_group() as tg:
                 tg.start_soon(self._recv_loop, ws, tg)
