@@ -14,8 +14,11 @@ It provides two capabilities:
 
 - **Scheduled one-shot callbacks** — proof-of-concept (`schedule_test_notification`).
 - **GitHub PR monitoring** — `subscribe_github_pr(org/repo#number)` polls the PR
-  for checks, reviews, comments and mergeability and pushes rich notifications
-  (merge conflicts, short comments inline, inline-comment line ranges, links).
+  and pushes rich notifications (merge conflicts, short comments inline,
+  inline-comment line ranges, links) for checks, reviews, conversation + inline
+  comments, mergeability, labels, requested reviewers, draft toggles, review-thread
+  resolution, all-checks-green recovery, and force-pushes (distinguished from
+  plain pushes).
   Each poll is a single GraphQL query (few API calls); rate-limit headers are
   honoured (it throttles as the budget runs low) and failures are classified
   (auth / not-found / rate-limited / transient) so recovery is tailored to each.

@@ -227,6 +227,34 @@ def snapshot_from_graphql(pr: dict) -> dict:
     return snap
 
 
+_GREEN_CONCLUSIONS = {"success", "neutral", "skipped"}
+
+
+def _checks_all_green(snap: dict) -> bool:
+    """True iff there is at least one check/status and none is failing or pending."""
+    runs = snap.get("check_runs") or {}
+    statuses = snap.get("statuses") or {}
+    if not runs and not statuses:
+        return False
+    for c in runs.values():
+        if (
+            c.get("status") != "completed"
+            or c.get("conclusion") not in _GREEN_CONCLUSIONS
+        ):
+            return False
+    return all(s.get("state") == "success" for s in statuses.values())
+
+
+def _force_push_for(old: dict, new: dict) -> dict | None:
+    """A new force-push timeline event landing on the new head, if this head change
+    was a force-push (history rewrite) rather than fresh commits."""
+    old_fps = old.get("force_pushes") or []
+    for fp in new.get("force_pushes") or []:
+        if fp.get("after") == new.get("head_sha") and fp not in old_fps:
+            return fp
+    return None
+
+
 def diff(old: dict | None, new: dict, key: str) -> list[dict]:
     """Events introduced by `new` relative to `old`. None old => baseline (no events)."""
     if old is None:
@@ -257,11 +285,84 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             )
         )
     if old["head_sha"] and new["head_sha"] and old["head_sha"] != new["head_sha"]:
+        force_push = _force_push_for(old, new)
+        if force_push:
+            before = (force_push.get("before") or old["head_sha"])[:7]
+            after = (force_push.get("after") or new["head_sha"])[:7]
+            events.append(
+                _event(
+                    "pr_force_push",
+                    "info",
+                    f"{key} was force-pushed (history rewritten — rebase/amend/squash); "
+                    f"head {before} → {after}.\n{new['url']}",
+                    key,
+                    new["url"],
+                )
+            )
+        else:
+            events.append(
+                _event(
+                    "pr_commits",
+                    "info",
+                    f"New commits pushed to {key} (head is now {new['head_sha'][:7]}).\n{new['url']}",
+                    key,
+                    new["url"],
+                )
+            )
+    if old.get("draft") != new.get("draft"):
+        action = (
+            "converted to a draft" if new.get("draft") else "marked ready for review"
+        )
         events.append(
             _event(
-                "pr_commits",
+                "pr_draft",
                 "info",
-                f"New commits pushed to {key} (head is now {new['head_sha'][:7]}).\n{new['url']}",
+                f"{key} was {action}.\n{new['url']}",
+                key,
+                new["url"],
+            )
+        )
+    old_labels, new_labels = set(old.get("labels") or []), set(new.get("labels") or [])
+    for name in sorted(new_labels - old_labels):
+        events.append(
+            _event(
+                "pr_label",
+                "info",
+                f"Label '{name}' added to {key}.\n{new['url']}",
+                key,
+                new["url"],
+            )
+        )
+    for name in sorted(old_labels - new_labels):
+        events.append(
+            _event(
+                "pr_label",
+                "info",
+                f"Label '{name}' removed from {key}.\n{new['url']}",
+                key,
+                new["url"],
+            )
+        )
+    old_revs, new_revs = (
+        set(old.get("requested_reviewers") or []),
+        set(new.get("requested_reviewers") or []),
+    )
+    for name in sorted(new_revs - old_revs):
+        events.append(
+            _event(
+                "pr_review_request",
+                "info",
+                f"Review requested from {name} on {key}.\n{new['url']}",
+                key,
+                new["url"],
+            )
+        )
+    for name in sorted(old_revs - new_revs):
+        events.append(
+            _event(
+                "pr_review_request",
+                "info",
+                f"Review request for {name} was removed on {key}.\n{new['url']}",
                 key,
                 new["url"],
             )
@@ -272,6 +373,24 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
     for cid, c in new["review_comments"].items():
         if cid not in old["review_comments"]:
             events.append(_inline_comment_event(c, key))
+    for tid, th in (new.get("review_threads") or {}).items():
+        prev = (old.get("review_threads") or {}).get(tid)
+        if prev is not None and prev.get("resolved") != th.get("resolved"):
+            loc = (
+                f"{th.get('path')}:{th.get('line')}"
+                if th.get("line")
+                else (th.get("path") or "a file")
+            )
+            state = "resolved" if th.get("resolved") else "reopened (unresolved)"
+            events.append(
+                _event(
+                    "pr_thread",
+                    "info",
+                    f"A review thread on {key} ({loc}) was {state}.\n{new['url']}",
+                    key,
+                    new["url"],
+                )
+            )
     for cid, c in new["issue_comments"].items():
         if cid not in old["issue_comments"]:
             events.append(_comment_event(c, key))
@@ -293,6 +412,16 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             prev is None or prev.get("state") != s["state"]
         ):
             events.append(_status_event(ctx, s, key))
+    if not _checks_all_green(old) and _checks_all_green(new):
+        events.append(
+            _event(
+                "pr_checks_green",
+                "info",
+                f"All checks are now passing on {key}.\n{new['url']}",
+                key,
+                new["url"],
+            )
+        )
     return events
 
 
@@ -541,6 +670,10 @@ def load_trackers(client) -> list[PRTracker]:
         t.next_seq = int(data.get("next_seq", 1))
         t.events = data.get("events", [])
         t.snapshot = data.get("snapshot")
+        # A snapshot from before the GraphQL switch has a different shape/ID space;
+        # drop it so the next poll re-baselines silently instead of emitting noise.
+        if t.snapshot is not None and "labels" not in t.snapshot:
+            t.snapshot = None
         t.consecutive_no_update = int(data.get("consecutive_no_update", 0))
         t.merged = bool(data.get("merged"))
         t.terminal = bool(data.get("terminal"))
