@@ -1176,3 +1176,128 @@ def test_truncation_notice_delivered_once_then_ack_resets(
     # persisted reset survives a reload
     loaded = {t.key: t for t in pm.load_trackers(None)}[key]
     assert loaded.missed[sid] == 0
+
+
+# --------------------------------------------------------------------------- #
+# passing-check storm collapses into one summary event (daemon-side)
+# --------------------------------------------------------------------------- #
+
+
+def _check_node(cid: str, status: str, conclusion: str | None) -> dict:
+    return {
+        "__typename": "CheckRun",
+        "id": cid,
+        "name": cid,
+        "status": status,
+        "conclusion": conclusion,
+        "detailsUrl": "u",
+    }
+
+
+def _checks_snapshot(nodes: list[dict], head: str = "a" * 40) -> dict:
+    """A snapshot whose CheckRun rollup is exactly `nodes`."""
+    return gql(
+        headRefOid=head,
+        commits={
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": head,
+                        "statusCheckRollup": {
+                            "state": "SUCCESS",
+                            "contexts": {"nodes": nodes},
+                        },
+                    }
+                }
+            ]
+        },
+    )
+
+
+class TestCheckSummary:
+    def _pending(self, ids: list[str]) -> list[dict]:
+        return [_check_node(cid, "QUEUED", None) for cid in ids]
+
+    def _green(self, ids: list[str]) -> list[dict]:
+        return [_check_node(cid, "COMPLETED", "SUCCESS") for cid in ids]
+
+    def _failed(self, ids: list[str]) -> list[dict]:
+        return [_check_node(cid, "COMPLETED", "FAILURE") for cid in ids]
+
+    def test_storm_collapses_into_one_summary(self, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD", "3")
+        ids = ["C1", "C2", "C3", "C4", "C5"]
+        old = _checks_snapshot(self._pending(ids))
+        # four complete green at once; one is still running
+        new = _checks_snapshot(self._green(ids[:4]) + self._pending(ids[4:]))
+        events = pm.diff(old, new, "o/r#1")
+        summaries = [e for e in events if e["type"] == "pr_checks_summary"]
+        assert len(summaries) == 1
+        summary = summaries[0]
+        assert summary["meta"]["kind"] == "pr_checks_summary"
+        assert summary["meta"]["severity"] == "info"
+        assert "4 checks just passed" in summary["content"]
+        assert "1 still running" in summary["content"]
+        # none of the collapsed greens leak out as individual pr_check events
+        assert "pr_check" not in [e["type"] for e in events]
+
+    def test_below_threshold_stays_individual(self, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD", "3")
+        ids = ["C1", "C2", "C3"]
+        old = _checks_snapshot(self._pending(ids))
+        # two greens (below the threshold of 3), one still pending
+        new = _checks_snapshot(self._green(ids[:2]) + self._pending(ids[2:]))
+        events = pm.diff(old, new, "o/r#1")
+        checks = [e for e in events if e["type"] == "pr_check"]
+        assert len(checks) == 2  # per-check detail preserved for small PRs
+        assert all(e["meta"]["severity"] == "info" for e in checks)
+        assert "pr_checks_summary" not in [e["type"] for e in events]
+
+    def test_failures_never_collapse(self, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD", "3")
+        green_ids = ["G1", "G2", "G3", "G4"]
+        fail_ids = ["F1", "F2"]
+        old = _checks_snapshot(self._pending(green_ids + fail_ids))
+        new = _checks_snapshot(self._green(green_ids) + self._failed(fail_ids))
+        events = pm.diff(old, new, "o/r#1")
+        failures = [e for e in events if e["type"] == "pr_check"]
+        assert len(failures) == 2  # failures stay individual...
+        assert all(e["meta"]["severity"] == "high" for e in failures)
+        summaries = [e for e in events if e["type"] == "pr_checks_summary"]
+        assert len(summaries) == 1  # ...while the greens collapse into one summary
+        assert "4 checks just passed" in summaries[0]["content"]
+
+    def test_all_green_capstone_suppresses_summary(self, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD", "3")
+        ids = ["C1", "C2", "C3", "C4", "C5"]
+        old = _checks_snapshot(self._pending(ids))
+        new = _checks_snapshot(self._green(ids))  # the whole set goes green this poll
+        types = _types(old, new)
+        assert "pr_checks_green" in types  # the capstone fires
+        assert "pr_checks_summary" not in types  # and stands in for the summary
+
+    def test_summary_identity_distinct_and_idempotent(self, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD", "3")
+        ids1 = ["C1", "C2", "C3", "C4"]
+        old1 = _checks_snapshot(self._pending(ids1 + ["C9"]))
+        new1 = _checks_snapshot(self._green(ids1) + self._pending(["C9"]))
+        a = _only(old1, new1, "pr_checks_summary")[0]
+        a_again = _only(old1, new1, "pr_checks_summary")[0]
+        assert a["id"] == a_again["id"]  # re-diffing the same poll is idempotent
+
+        ids2 = ["D1", "D2", "D3", "D4"]
+        old2 = _checks_snapshot(self._pending(ids2 + ["D9"]))
+        new2 = _checks_snapshot(self._green(ids2) + self._pending(["D9"]))
+        b = _only(old2, new2, "pr_checks_summary")[0]
+        assert a["id"] != b["id"]  # a distinct storm -> a distinct id
+
+    def test_threshold_zero_disables_collapsing(self, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD", "0")
+        ids = [f"C{i}" for i in range(6)]
+        old = _checks_snapshot(self._pending(ids + ["C9"]))
+        new = _checks_snapshot(self._green(ids) + self._pending(["C9"]))
+        events = pm.diff(old, new, "o/r#1")
+        assert (
+            len([e for e in events if e["type"] == "pr_check"]) == 6
+        )  # all individual
+        assert "pr_checks_summary" not in [e["type"] for e in events]

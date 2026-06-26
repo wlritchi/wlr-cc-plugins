@@ -18,7 +18,9 @@ It provides two capabilities:
   inline-comment line ranges, links) for checks, reviews, conversation + inline
   comments, mergeability, labels, requested reviewers, draft toggles, review-thread
   resolution, all-checks-green recovery, and force-pushes (distinguished from
-  plain pushes).
+  plain pushes). When a large CI matrix lands many passing checks in one poll, they
+  collapse into a single summary event instead of one notification each (failures
+  always stay individual).
   Each poll is a single GraphQL query (few API calls); rate-limit headers are
   honoured (it throttles as the budget runs low) and failures are classified
   (auth / not-found / rate-limited / transient) so recovery is tailored to each.
@@ -44,6 +46,7 @@ It provides two capabilities:
 | `GITHUB_GRAPHQL_URL`          | `{GITHUB_API_URL}/graphql`| GraphQL endpoint (override for Enterprise)    |
 | `NOTIFICATIONS_PR_POLL_SECONDS` | —                       | Force a fixed PR poll cadence (override/testing) |
 | `NOTIFICATIONS_PR_WARM_TTL_SECONDS` | `1800`              | Keep an unsubscribed PR tracker warm this long before deleting (0 = delete immediately) |
+| `NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD` | `5`          | Collapse this many+ passing checks completing in one poll into a single summary event; 0 disables |
 
 The relay reads the same `NOTIFICATIONS_WS_HOST`/`PORT`, so if you change the
 port, set it for both (e.g. in your shell profile, so Claude Code's MCP servers

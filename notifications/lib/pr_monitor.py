@@ -26,6 +26,7 @@ from pathlib import Path
 SHORT_RANGE_LINES = 10  # inline comments at/under this many lines include the code
 SHORT_BODY_CHARS = 600  # comment/review bodies at/under this are included in full
 MAX_CACHED_EVENTS = 200
+CHECK_SUMMARY_THRESHOLD_DEFAULT = 5  # collapse this many+ green completions per poll
 
 _REVIEW_LABEL = {
     "APPROVED": "approved",
@@ -290,6 +291,19 @@ def _checks_all_green(snap: dict) -> bool:
     return all(s.get("state") == "success" for s in statuses.values())
 
 
+def _check_summary_threshold() -> int:
+    """How many green CheckRun completions in a single poll collapse into one summary
+    event instead of one `pr_check` each. <= 0 disables collapsing entirely (every
+    green stays an individual event). Garbage/missing falls back to the default."""
+    raw = os.environ.get("NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return CHECK_SUMMARY_THRESHOLD_DEFAULT
+
+
 def _head_change_is_force_push(old: dict, new: dict) -> bool:
     """True iff the new head sha is explained by a force-push timeline event that is
     new this poll. When so, the timeline loop emits the pr_force_push event and the
@@ -420,6 +434,14 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
     for cid, c in new["issue_comments"].items():
         if cid not in old["issue_comments"]:
             events.append(_comment_event(c, key, cid))
+    # The all-checks-green recovery capstone (below) also stands in for a storm of
+    # greens completing this poll, so when it fires the per-poll summary is suppressed
+    # to avoid double-notifying. Compute the condition once, before the check loop,
+    # and reuse it both here and in the capstone block.
+    becoming_all_green = not _checks_all_green(old) and _checks_all_green(new)
+    # Only CheckRuns are collapsed into a summary. StatusContexts (the statuses loop
+    # below) are typically few, so they always stay individual.
+    green_completions: list[tuple[str, dict]] = []
     for chid, ch in new["check_runs"].items():
         prev = old["check_runs"].get(chid)
         became_complete = ch["status"] == "completed" and (
@@ -431,6 +453,21 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             and prev.get("conclusion") != ch.get("conclusion")
         )
         if became_complete or conclusion_changed:
+            if ch.get("conclusion") in _FAILED_CONCLUSIONS:
+                events.append(_check_event(ch, key, chid))  # failures never collapse
+            elif ch.get("conclusion") in _GREEN_CONCLUSIONS:
+                green_completions.append((chid, ch))  # maybe collapsed below
+            else:
+                events.append(_check_event(ch, key, chid))  # completed, other/no concl.
+    # Collapse a storm of green completions into a single summary event, unless the
+    # all-green capstone below already covers this poll. Below the threshold (or with
+    # collapsing disabled) keep them individual so small PRs retain per-check detail.
+    threshold = _check_summary_threshold()
+    if threshold > 0 and len(green_completions) >= threshold:
+        if not becoming_all_green:
+            events.append(_checks_summary_event(green_completions, new, key))
+    else:
+        for chid, ch in green_completions:
             events.append(_check_event(ch, key, chid))
     for ctx, s in new["statuses"].items():
         prev = old["statuses"].get(ctx)
@@ -441,7 +478,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
     # The all-green recovery carries its own monotonic "green" counter so a check
     # re-run flapping green->fail->green on the *same* head emits each recovery as a
     # distinct event instead of colliding on one head-keyed id.
-    if not _checks_all_green(old) and _checks_all_green(new):
+    if becoming_all_green:
         epochs["green"] = epochs.get("green", 0) + 1
         head7 = (head or "")[:7]
         events.append(
@@ -675,6 +712,31 @@ def _check_event(ch: dict, key: str, check_id: str) -> dict:
     # landing a different conclusion) is its own event rather than colliding.
     identity = f"check:{check_id}:{ch.get('status')}:{ch.get('conclusion')}"
     return _event("pr_check", severity, "\n".join(parts), key, ch.get("url"), identity)
+
+
+def _checks_summary_event(green: list[tuple[str, dict]], new: dict, key: str) -> dict:
+    """One event standing in for a storm of green check completions in a single poll.
+    Identity is the set of collapsed check identities, so distinct storms are distinct
+    events and re-diffing the same poll is idempotent — no monotonic counter needed."""
+    passed = len(green)
+    running = sum(
+        1 for c in new["check_runs"].values() if c.get("status") != "completed"
+    )
+    url = new.get("url")
+    running_part = f"; {running} still running" if running else ""
+    content = f"{passed} checks just passed on {key}{running_part}.\n{url}"
+    identity = (
+        "checks_summary:"
+        + key
+        + ":"
+        + ",".join(
+            sorted(
+                f"{chid}:{ch.get('status')}:{ch.get('conclusion')}"
+                for chid, ch in green
+            )
+        )
+    )
+    return _event("pr_checks_summary", "info", content, key, url, identity)
 
 
 def _status_event(ctx: str, s: dict, key: str) -> dict:

@@ -25,6 +25,7 @@ Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
                NOTIFICATIONS_DATA_DIR (default ~/.claude/notifications)
                NOTIFICATIONS_TOKEN (default: auto-created <DATA_DIR>/token)
                NOTIFICATIONS_PR_WARM_TTL_SECONDS (default 1800)
+               NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD (default 5; 0 disables)
                GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com)
 """
 
