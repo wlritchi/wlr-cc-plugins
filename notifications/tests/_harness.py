@@ -7,6 +7,7 @@ import contextlib
 import http.server
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -63,13 +64,68 @@ def daemon_env(
     return env
 
 
-def relay_env(ws_port: int, data_dir: Path, xdg_dir: Path, session_id: str) -> dict:
+def relay_env(
+    ws_port: int,
+    data_dir: Path,
+    xdg_dir: Path,
+    session_id: str,
+    *,
+    cache_dir: Path | None = None,
+    project_dir: str | None = None,
+) -> dict:
     env = dict(os.environ)
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
     env["NOTIFICATIONS_DATA_DIR"] = str(data_dir)
     env["XDG_RUNTIME_DIR"] = str(xdg_dir)  # isolate the session-id state file lookup
     env["CLAUDE_CODE_SESSION_ID"] = session_id
+    if cache_dir is not None:
+        env["XDG_CACHE_HOME"] = str(
+            cache_dir
+        )  # where the relay looks for the channel log
+    if project_dir is not None:
+        env["CLAUDE_PROJECT_DIR"] = project_dir
     return env
+
+
+_FAKE_PROJECT = "/test/proj"
+
+
+def seed_channel_log(
+    cache_dir: Path, *, registered: bool, project_dir: str = _FAKE_PROJECT
+) -> None:
+    """Write a fake Claude Code MCP log so the relay detects push (registered) or pull mode."""
+    encoded = re.sub(r"[/.]", "-", project_dir)
+    directory = (
+        Path(cache_dir)
+        / "claude-cli-nodejs"
+        / encoded
+        / "mcp-logs-plugin-notifications-notifications"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    marker = (
+        "Channel notifications registered"
+        if registered
+        else "Channel notifications skipped: server not in --channels list for this session"
+    )
+    (directory / "2026-01-01T00-00-00-000Z.jsonl").write_text(
+        json.dumps({"message": marker}) + "\n"
+    )
+
+
+def push_relay_env(
+    tmp_path: Path, ws_port: int, data_dir: Path, xdg_dir: Path, session_id: str
+) -> dict:
+    """relay_env wired for channel (push) mode via a seeded 'registered' MCP log."""
+    cache = Path(tmp_path) / "cache"
+    seed_channel_log(cache, registered=True)
+    return relay_env(
+        ws_port,
+        data_dir,
+        xdg_dir,
+        session_id,
+        cache_dir=cache,
+        project_dir=_FAKE_PROJECT,
+    )
 
 
 @contextlib.contextmanager

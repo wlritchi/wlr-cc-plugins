@@ -10,17 +10,22 @@ This relay only knows how to:
   - find its own Claude Code session id and stay current on it (SessionStart hook
     + state file, see ../lib/session_state.py)
   - open a WebSocket to the daemon and register under that session id
-  - receive notifications from the daemon and deliver them to the agent as
-    Claude Code channel events (notifications/claude/channel)
+  - receive notifications from the daemon and deliver them to the agent
   - acknowledge delivered notifications back to the daemon
-  - forward the agent's schedule tool call to the daemon
+  - forward the agent's schedule/subscribe tool calls to the daemon
+
+Delivery is mode-aware. The relay reads Claude Code's per-server MCP log (see
+../lib/channel_detect.py) to learn whether it was loaded as a channel:
+  - loaded as a channel  -> push events as notifications/claude/channel (auto-ack)
+  - not a channel        -> buffer events (no auto-ack) and expose a `catch_up`
+                            tool the agent calls to pull and ack them
+Until detection resolves, events are buffered (never lost). The session is loaded
+as a channel when launched with e.g.
+`claude --dangerously-load-development-channels plugin:notifications@wlr-cc-plugins`.
 
 The daemon must be running (it is started manually or via systemd --user; this
 relay never spawns it). If it isn't reachable, the relay keeps retrying and the
-schedule/list tools report it as unavailable.
-
-To receive the channel events the session must be launched with the channel
-enabled, e.g. `claude --dangerously-load-development-channels plugin:notifications@wlr-cc-plugins`.
+tools report it as unavailable.
 
 Run directly: ./notifications-server.py
 """
@@ -31,6 +36,7 @@ Run directly: ./notifications-server.py
 # ///
 
 import json
+import os
 import random
 import re
 import sys
@@ -39,6 +45,7 @@ from pathlib import Path
 
 import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel.server import NotificationOptions
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
@@ -47,10 +54,16 @@ from websockets.exceptions import ConnectionClosed, InvalidURI, WebSocketExcepti
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
+import channel_detect  # noqa: E402
 import session_state  # noqa: E402
 import wsproto  # noqa: E402
 
 CHANNEL_METHOD = "notifications/claude/channel"
+TOOLS_CHANGED_METHOD = "notifications/tools/list_changed"
+SERVER_NAME = "notifications"  # used to locate this server's Claude Code MCP log
+# How long to wait for Claude Code to log whether we were loaded as a channel.
+CHANNEL_DETECT_TIMEOUT_SECONDS = 12.0
+CHANNEL_DETECT_POLL_SECONDS = 0.5
 SESSION_POLL_SECONDS = 5.0
 # Settle time before connecting, so a recovered (past-due) event isn't pushed
 # into the channel before the client has finished the MCP/channel handshake.
@@ -76,14 +89,18 @@ def _reconnect_delay(failures: int) -> float:
 
 
 INSTRUCTIONS = (
-    "This plugin delivers scheduled notifications through the Claude Code "
-    'channels feature. Events arrive as <channel source="notifications" ...> '
-    "with a body reporting the callback id and the session id it was scheduled "
-    "for. These are proof-of-concept demo notifications; when one arrives, "
-    "surface it to the user."
+    "This plugin delivers notifications (scheduled callbacks and GitHub PR updates) "
+    "through the Claude Code channels feature. Events normally arrive on their own as "
+    '<channel source="notifications" ...> messages; when one arrives, surface it to the '
+    "user. If a `catch_up` tool is available, this session was NOT loaded as a channel, "
+    "so notifications are not pushed automatically — call `catch_up` periodically (and "
+    "after long pauses) to retrieve pending updates."
 )
 
 mcp = FastMCP("notifications", instructions=INSTRUCTIONS)
+
+# Set once the relay learns it is not a channel and registers the catch_up tool.
+_catch_up_registered = False
 
 
 class DaemonClient:
@@ -96,6 +113,12 @@ class DaemonClient:
         self._pending: dict[int, object] = {}  # req_id -> memory send stream
         self._registered_session: str | None = None
         self._connected_once = False  # did the current attempt establish a connection?
+        self._mode: str | None = (
+            None  # None=detecting, "push" (channel), "pull" (catch_up)
+        )
+        self._buffer: dict[
+            str, dict
+        ] = {}  # notification id -> {content, meta}; held until acked
 
     def attach_write_stream(self, write_stream) -> None:
         self._write_stream = write_stream
@@ -103,6 +126,13 @@ class DaemonClient:
     @property
     def connected(self) -> bool:
         return self._ws is not None
+
+    @property
+    def channel_label(self) -> str:
+        return {
+            "push": "active (delivered as channel events)",
+            "pull": "inactive (not a channel) — call catch_up to pull updates",
+        }.get(self._mode or "", "detecting")
 
     async def wait_connected(self, timeout: float = 8.0) -> bool:
         """Wait briefly for the connection (covers startup grace / reconnects)."""
@@ -113,16 +143,72 @@ class DaemonClient:
                 await anyio.sleep(0.1)
         return self.connected
 
+    async def _send_raw(self, method: str, params: dict) -> None:
+        if self._write_stream is None:
+            return
+        notification = JSONRPCNotification(jsonrpc="2.0", method=method, params=params)
+        await self._write_stream.send(
+            SessionMessage(message=JSONRPCMessage(notification))
+        )
+
     async def _deliver_channel(self, content: str, meta: dict | None) -> None:
         params: dict[str, object] = {"content": content}
         if meta:
             params["meta"] = meta
-        notification = JSONRPCNotification(
-            jsonrpc="2.0", method=CHANNEL_METHOD, params=params
-        )
-        await self._write_stream.send(
-            SessionMessage(message=JSONRPCMessage(notification))
-        )
+        await self._send_raw(CHANNEL_METHOD, params)
+
+    async def _ack(self, notification_id) -> None:
+        ws = self._ws
+        if ws is None or not notification_id:
+            return
+        try:
+            await ws.send(json.dumps({"type": wsproto.ACK, "id": notification_id}))
+        except (ConnectionClosed, WebSocketException):
+            pass
+
+    async def apply_mode(self, detected: str) -> None:
+        """Switch out of buffering once we know whether we're a channel."""
+        if detected == channel_detect.REGISTERED:
+            self._mode = "push"
+            for notification_id, payload in list(
+                self._buffer.items()
+            ):  # flush what we held
+                await self._deliver_channel(payload["content"], payload["meta"])
+                await self._ack(notification_id)
+                self._buffer.pop(notification_id, None)
+        else:  # skipped or unknown: err toward no silent loss
+            self._mode = "pull"
+            global _catch_up_registered
+            if not _catch_up_registered:
+                _catch_up_registered = True
+                mcp.add_tool(catch_up)
+                await self._send_raw(TOOLS_CHANGED_METHOD, {})
+
+    async def detect_and_apply(self) -> None:
+        start = time.time()
+        project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        detected = channel_detect.UNKNOWN
+        while time.time() < start + CHANNEL_DETECT_TIMEOUT_SECONDS:
+            detected = channel_detect.detect_channel_mode(
+                SERVER_NAME, project_dir, newer_than=start - 5.0
+            )
+            if detected != channel_detect.UNKNOWN:
+                break
+            await anyio.sleep(CHANNEL_DETECT_POLL_SECONDS)
+        await self.apply_mode(detected)
+
+    async def drain_buffer(self) -> str:
+        if not self._buffer:
+            return "No pending notifications."
+        lines = [
+            "Pending notifications (this session is not a channel, so they weren't pushed automatically):",
+            "",
+        ]
+        for notification_id, payload in list(self._buffer.items()):
+            lines.append(payload.get("content", ""))
+            await self._ack(notification_id)
+            self._buffer.pop(notification_id, None)
+        return "\n\n".join(lines)
 
     async def request(self, payload: dict) -> dict:
         """Send a request to the daemon and await its correlated reply."""
@@ -188,10 +274,17 @@ class DaemonClient:
                 except (json.JSONDecodeError, ValueError):
                     continue
                 if msg.get("type") == wsproto.NOTIFY:
-                    await self._deliver_channel(msg.get("content", ""), msg.get("meta"))
-                    await ws.send(
-                        json.dumps({"type": wsproto.ACK, "id": msg.get("id")})
-                    )
+                    notification_id = msg.get("id")
+                    if self._mode == "push":
+                        await self._deliver_channel(
+                            msg.get("content", ""), msg.get("meta")
+                        )
+                        await self._ack(notification_id)
+                    elif notification_id:  # detecting or pull: hold without acking
+                        self._buffer[notification_id] = {
+                            "content": msg.get("content", ""),
+                            "meta": msg.get("meta"),
+                        }
                 else:
                     stream = self._pending.get(msg.get("req_id"))
                     if stream is not None:
@@ -226,6 +319,16 @@ def _daemon_unreachable_message() -> str:
     )
 
 
+async def catch_up() -> str:
+    """Retrieve pending notifications for this session.
+
+    This tool only exists because the session was NOT launched as a channel, so
+    notifications can't be pushed automatically — they're buffered here. Call it
+    periodically (and after long pauses) to pull and acknowledge pending updates.
+    """
+    return await DAEMON.drain_buffer()
+
+
 @mcp.tool()
 def get_session_id() -> str:
     """Report the Claude Code session ID this relay is attached to.
@@ -240,7 +343,7 @@ def get_session_id() -> str:
             "No session ID available: neither the SessionStart hook's state file "
             f"nor {session_state.SESSION_ID_ENV_VAR} is set. Daemon: {daemon}."
         )
-    return f"session_id={session_id} (source: {source}); daemon: {daemon}"
+    return f"session_id={session_id} (source: {source}); daemon: {daemon}; channel: {DAEMON.channel_label}"
 
 
 @mcp.tool()
@@ -392,12 +495,14 @@ async def list_github_pr_subscriptions() -> str:
 async def _serve() -> None:
     server = mcp._mcp_server
     init_options = server.create_initialization_options(
+        notification_options=NotificationOptions(tools_changed=True),
         experimental_capabilities={"claude/channel": {}},
     )
     async with stdio_server() as (read_stream, write_stream):
         DAEMON.attach_write_stream(write_stream)
         async with anyio.create_task_group() as tg:
             tg.start_soon(DAEMON.run)
+            tg.start_soon(DAEMON.detect_and_apply)  # decide push vs catch_up
             await server.run(read_stream, write_stream, init_options)
             tg.cancel_scope.cancel()  # transport closed: stop the daemon client
 

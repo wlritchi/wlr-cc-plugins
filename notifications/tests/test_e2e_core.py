@@ -33,7 +33,7 @@ def test_schedule_deliver_and_ack(tmp_path):
 
         async def scenario():
             async with h.stdio_client(
-                h.relay_params(h.relay_env(ws, store, xdg, "sid-A"))
+                h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-A"))
             ) as (read, write):
                 caps = await h.mcp_handshake(read, write)
                 assert caps.get("experimental", {}).get("claude/channel") == {}
@@ -64,7 +64,7 @@ def test_recovery_of_past_due_callback(tmp_path, monkeypatch):
 
         async def scenario():
             async with h.stdio_client(
-                h.relay_params(h.relay_env(ws, store, xdg, "sid-A"))
+                h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-A"))
             ) as (read, write):
                 await h.mcp_handshake(read, write)
                 event = await h.mcp_await_channel(
@@ -88,7 +88,7 @@ def test_reconnects_when_daemon_appears(tmp_path):
 
     async def scenario():
         async with h.stdio_client(
-            h.relay_params(h.relay_env(ws, store, xdg, "sid-A"))
+            h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-A"))
         ) as (read, write):
             await h.mcp_handshake(read, write)
             text, _ = await h.mcp_call(read, write, 2, "get_session_id")

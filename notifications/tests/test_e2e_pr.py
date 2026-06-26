@@ -50,7 +50,7 @@ def test_pr_monitoring_full_chain(tmp_path):
 
         async def scenario():
             async with h.stdio_client(
-                h.relay_params(h.relay_env(ws, store, xdg, "sid-A"))
+                h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-A"))
             ) as (read_a, write_a):
                 await h.mcp_handshake(read_a, write_a)
 
@@ -121,7 +121,7 @@ def test_pr_monitoring_full_chain(tmp_path):
 
                 # a second subscriber must NOT get the earlier events replayed
                 async with h.stdio_client(
-                    h.relay_params(h.relay_env(ws, store, xdg, "sid-B"))
+                    h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-B"))
                 ) as (read_b, write_b):
                     await h.mcp_handshake(read_b, write_b)
                     text, _ = await h.mcp_call(
