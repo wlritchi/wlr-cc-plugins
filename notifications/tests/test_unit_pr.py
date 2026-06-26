@@ -15,6 +15,7 @@ import anyio
 import httpx
 import pytest
 
+import _harness as h
 import github_client as gc
 import pr_monitor as pm
 import pr_schedule as ps
@@ -221,6 +222,216 @@ class TestFetchRetry:
         with pytest.raises(gc.GitHubNotFound):
             anyio.run(scenario)
         assert calls["n"] == 1  # auth/not-found/rate-limited propagate immediately
+
+
+# --------------------------------------------------------------------------- #
+# connection pagination (client follows pageInfo on very active PRs)
+# --------------------------------------------------------------------------- #
+
+_PAGE_NUMBER = 5
+
+
+def _raw_pr(**override) -> dict:
+    """A raw GraphQL pullRequest node (NOT a snapshot), with sensible defaults."""
+    pr = {
+        "title": "T",
+        "url": "https://gh/o/r/1",
+        "state": "OPEN",
+        "merged": False,
+        "isDraft": False,
+        "headRefOid": "a" * 40,
+        "mergedBy": None,
+        "mergeable": "MERGEABLE",
+        "labels": {"nodes": []},
+        "reviewRequests": {"nodes": []},
+        "reviews": {"nodes": []},
+        "reviewThreads": {"nodes": []},
+        "comments": {"nodes": []},
+        "commits": {
+            "nodes": [{"commit": {"oid": "a" * 40, "statusCheckRollup": None}}]
+        },
+        "timelineItems": {"nodes": []},
+    }
+    pr.update(override)
+    return pr
+
+
+def _fake_transport(fake: h.FakeGitHub) -> httpx.MockTransport:
+    """Drive the production client through FakeGitHub's slicing without a subprocess:
+    a MockTransport that hands each request body to the same cursor-aware fake the e2e
+    tests use (so the client and fake are verified to agree on the cursor protocol)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        variables = body.get("variables") or {}
+        if variables.get("number") != fake.number:
+            payload = {"data": {"repository": {"pullRequest": None}}}
+        elif variables.get("cursor") is None:
+            payload = {"data": {"repository": {"pullRequest": fake._first_page()}}}
+        else:
+            payload = fake._page_response(
+                body.get("query") or "", int(variables["cursor"])
+            )
+        return httpx.Response(
+            200, json=payload, headers={"X-RateLimit-Remaining": "4999"}
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def _check_run(i: int) -> dict:
+    return {
+        "__typename": "CheckRun",
+        "id": f"C{i}",
+        "name": f"job-{i}",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "u",
+    }
+
+
+class TestPagination:
+    def test_contexts_drained_across_three_pages(self):
+        # 250 CI contexts overflow the first:100 slice -> 3 pages (100/100/50).
+        contexts = [_check_run(i) for i in range(250)]
+        pr = _raw_pr(
+            commits={
+                "nodes": [
+                    {
+                        "commit": {
+                            "oid": "a" * 40,
+                            "statusCheckRollup": {
+                                "state": "SUCCESS",
+                                "contexts": {"nodes": contexts},
+                            },
+                        }
+                    }
+                ]
+            }
+        )
+        fake = h.FakeGitHub(_PAGE_NUMBER, pr, page_size=100)
+        client = gc.GitHubClient(token="x", transport=_fake_transport(fake))
+
+        async def scenario() -> dict:
+            return await client.fetch_pr("o", "r", _PAGE_NUMBER)
+
+        merged = anyio.run(scenario)
+        nested = merged["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+        assert len(nested["contexts"]["nodes"]) == 250  # all pages merged in place
+        snap = pm.snapshot_from_graphql(merged)
+        assert len(snap["check_runs"]) == 250  # and the snapshot reflects every one
+
+    def test_top_level_reviews_drained_across_pages(self):
+        # The top-level (non-nested) connection path: 230 reviews -> 3 pages.
+        reviews = [
+            {
+                "id": f"R{i}",
+                "state": "APPROVED",
+                "author": {"login": f"u{i}"},
+                "body": "",
+                "url": "u",
+            }
+            for i in range(230)
+        ]
+        fake = h.FakeGitHub(
+            _PAGE_NUMBER, _raw_pr(reviews={"nodes": reviews}), page_size=100
+        )
+        client = gc.GitHubClient(token="x", transport=_fake_transport(fake))
+
+        async def scenario() -> dict:
+            return await client.fetch_pr("o", "r", _PAGE_NUMBER)
+
+        merged = anyio.run(scenario)
+        assert len(merged["reviews"]["nodes"]) == 230
+        assert len(pm.snapshot_from_graphql(merged)["reviews"]) == 230
+
+    def test_single_page_makes_no_followup_requests(self):
+        # A PR that fits one page must NOT trigger any follow-up query.
+        calls = {"n": 0}
+        fake = h.FakeGitHub(
+            _PAGE_NUMBER,
+            _raw_pr(reviews={"nodes": [{"id": "R1", "state": "APPROVED", "url": "u"}]}),
+            page_size=100,
+        )
+        inner = _fake_transport(fake)
+
+        def counting(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return inner.handler(request)
+
+        client = gc.GitHubClient(token="x", transport=httpx.MockTransport(counting))
+
+        async def scenario() -> dict:
+            return await client.fetch_pr("o", "r", _PAGE_NUMBER)
+
+        anyio.run(scenario)
+        assert calls["n"] == 1  # one query, no pagination round-trips
+
+    def test_max_pages_cap_is_honored(self, capsys):
+        # A transport that ALWAYS claims hasNextPage must stop at the cap, not loop.
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            variables = json.loads(request.content).get("variables") or {}
+            contexts = {
+                "pageInfo": {"hasNextPage": True, "endCursor": str(calls["n"])},
+                "nodes": [_check_run(calls["n"])],
+            }
+            if variables.get("cursor") is None:
+                pr = _raw_pr(
+                    commits={
+                        "nodes": [
+                            {
+                                "commit": {
+                                    "oid": "a" * 40,
+                                    "statusCheckRollup": {
+                                        "state": "SUCCESS",
+                                        "contexts": contexts,
+                                    },
+                                }
+                            }
+                        ]
+                    }
+                )
+                payload = {"data": {"repository": {"pullRequest": pr}}}
+            else:
+                payload = {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "commits": {
+                                    "nodes": [
+                                        {
+                                            "commit": {
+                                                "statusCheckRollup": {
+                                                    "contexts": contexts
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            return httpx.Response(
+                200, json=payload, headers={"X-RateLimit-Remaining": "4999"}
+            )
+
+        client = gc.GitHubClient(token="x", transport=httpx.MockTransport(handler))
+
+        async def scenario() -> dict:
+            return await client.fetch_pr("o", "r", _PAGE_NUMBER)
+
+        merged = anyio.run(scenario)
+        # initial query + exactly _MAX_PAGES follow-ups, then it gives up (no infinite loop)
+        assert calls["n"] == 1 + gc._MAX_PAGES
+        nested = merged["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+        assert len(nested["contexts"]["nodes"]) == 1 + gc._MAX_PAGES
+        assert (
+            "_MAX_PAGES" in capsys.readouterr().err
+        )  # loud cap, not silent truncation
 
 
 # --------------------------------------------------------------------------- #

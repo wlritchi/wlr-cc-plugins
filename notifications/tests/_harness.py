@@ -172,14 +172,110 @@ def relay_params(env: dict) -> StdioServerParameters:
     return StdioServerParameters(command="uv", args=["run", "-qs", RELAY], env=env)
 
 
-class FakeGitHub:
-    """A tiny GraphQL endpoint. `pr` is the pullRequest node for `number`; mutate it
-    between polls. Any other number returns null (i.e. not found)."""
+def _slice_page(nodes: list, offset: int, page_size: int) -> dict:
+    """A connection {pageInfo, nodes} for nodes[offset:offset+page_size]. Cursors are
+    just stringified next-page indices, so a follow-up `after:<endCursor>` slices on."""
+    chunk = nodes[offset : offset + page_size]
+    nxt = offset + page_size
+    has_next = nxt < len(nodes)
+    return {
+        "pageInfo": {
+            "hasNextPage": has_next,
+            "endCursor": str(nxt) if has_next else None,
+        },
+        "nodes": chunk,
+    }
 
-    def __init__(self, number: int, pr: dict) -> None:
+
+def _rollup_contexts(pr: dict) -> dict | None:
+    """The head commit's check-rollup `contexts` connection on a pr node, or None."""
+    commits = (pr.get("commits") or {}).get("nodes") or []
+    if not commits:
+        return None
+    rollup = (commits[0].get("commit") or {}).get("statusCheckRollup")
+    if not rollup:
+        return None
+    return rollup.get("contexts")
+
+
+def _with_sliced_contexts(pr: dict, sliced: dict) -> dict:
+    """A copy of pr['commits'] with the rollup's contexts replaced by `sliced`, without
+    mutating the canonical pr node (tests mutate pr between polls)."""
+    commits = dict(pr.get("commits") or {})
+    nodes = [dict(n) for n in (commits.get("nodes") or [])]
+    if not nodes:
+        return commits
+    commit = dict(nodes[0].get("commit") or {})
+    rollup = dict(commit.get("statusCheckRollup") or {})
+    rollup["contexts"] = sliced
+    commit["statusCheckRollup"] = rollup
+    nodes[0]["commit"] = commit
+    commits["nodes"] = nodes
+    return commits
+
+
+def _target_connection(query: str) -> str | None:
+    """Which paginated connection a follow-up page query targets: the one whose arg
+    list carries `after` (the per-thread comments(first:100) sub-selection has no
+    `after`, so it never matches)."""
+    for name, args in re.findall(r"(\w+)\(([^)]*)\)", query):
+        if "after" in args and name in {
+            "reviews",
+            "comments",
+            "reviewThreads",
+            "contexts",
+        }:
+            return name
+    return None
+
+
+class FakeGitHub:
+    """A tiny cursor-aware GraphQL endpoint. `pr` is the pullRequest node for `number`;
+    mutate it between polls. Any other number returns null (i.e. not found).
+
+    The initial query returns each paginated connection sliced to `page_size` (default
+    large, so PRs that fit one page behave exactly as before) plus a pageInfo cursor;
+    a follow-up query carrying `variables.cursor` returns the next slice of whichever
+    connection it targets. Cursors are stringified node offsets."""
+
+    def __init__(self, number: int, pr: dict, *, page_size: int = 100) -> None:
         self.number = number
         self.pr = pr
+        self.page_size = page_size
         self._server: http.server.ThreadingHTTPServer | None = None
+
+    def _first_page(self) -> dict:
+        """The pr node with every paginated connection sliced to its first page."""
+        pr = dict(self.pr)
+        for conn in ("reviews", "comments", "reviewThreads"):
+            if conn in self.pr:
+                full = (self.pr.get(conn) or {}).get("nodes") or []
+                pr[conn] = _slice_page(full, 0, self.page_size)
+        contexts = _rollup_contexts(self.pr)
+        if contexts is not None:
+            full = contexts.get("nodes") or []
+            pr["commits"] = _with_sliced_contexts(
+                self.pr, _slice_page(full, 0, self.page_size)
+            )
+        return pr
+
+    def _page_response(self, query: str, offset: int) -> dict:
+        """The body for a follow-up page query: just its connection at the right path."""
+        name = _target_connection(query)
+        if name == "contexts":
+            contexts = _rollup_contexts(self.pr) or {}
+            full = contexts.get("nodes") or []
+            pr = {
+                "commits": _with_sliced_contexts(
+                    self.pr, _slice_page(full, offset, self.page_size)
+                )
+            }
+        elif name in ("reviews", "comments", "reviewThreads"):
+            full = (self.pr.get(name) or {}).get("nodes") or []
+            pr = {name: _slice_page(full, offset, self.page_size)}
+        else:
+            pr = {}
+        return {"data": {"repository": {"pullRequest": pr}}}
 
     @property
     def port(self) -> int:
@@ -200,11 +296,18 @@ class FakeGitHub:
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", 0))
                 req = json.loads(self.rfile.read(length) or b"{}")
-                number = (req.get("variables") or {}).get("number")
-                node = outer.pr if number == outer.number else None
-                body = json.dumps(
-                    {"data": {"repository": {"pullRequest": node}}}
-                ).encode()
+                variables = req.get("variables") or {}
+                number = variables.get("number")
+                cursor = variables.get("cursor")
+                if number != outer.number:
+                    payload = {"data": {"repository": {"pullRequest": None}}}
+                elif cursor is None:  # the main query -> first page of every connection
+                    payload = {
+                        "data": {"repository": {"pullRequest": outer._first_page()}}
+                    }
+                else:  # a follow-up query draining one connection from `cursor`
+                    payload = outer._page_response(req.get("query") or "", int(cursor))
+                body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
