@@ -37,6 +37,34 @@ def _read_proc(pid: int, name: str) -> bytes | None:
         return None
 
 
+def _proc_start_time(pid: int) -> int | None:
+    """Return the process start time (clock ticks since boot) for `pid`, or None
+    if unavailable (non-Linux, gone, unreadable, or unparseable).
+
+    Together with the pid this uniquely identifies a process, so it lets us detect
+    a recycled pid: a state file written by a now-dead process holding `pid` will
+    record a different start time than whatever process holds `pid` now.
+    """
+    stat = _read_proc(pid, "stat")
+    if stat is None:
+        return None
+    content = stat.decode(errors="replace")
+    # Field 2 (comm) is paren-wrapped and may itself contain spaces or parens, so
+    # split *after* the final ')'. starttime is overall field 22; with field 3 at
+    # index 0, that is index 19 (field N -> fields[N - 3]).
+    try:
+        rest = content[content.rindex(")") + 1 :]
+    except ValueError:
+        return None
+    fields = rest.split()
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
 def _parent_pid(pid: int) -> int | None:
     """Return the parent pid of `pid`, via /proc with a `ps` fallback."""
     status = _read_proc(pid, "status")
@@ -125,7 +153,11 @@ def write_session(claude_pid: int, session_id: str, source: str | None = None) -
         pass
 
     path = _state_path(claude_pid)
-    payload: dict[str, object] = {"session_id": session_id, "claude_pid": claude_pid}
+    payload: dict[str, object] = {
+        "session_id": session_id,
+        "claude_pid": claude_pid,
+        "start_time": _proc_start_time(claude_pid),
+    }
     if source:
         payload["source"] = source
 
@@ -136,11 +168,23 @@ def write_session(claude_pid: int, session_id: str, source: str | None = None) -
 
 
 def read_session(claude_pid: int) -> str | None:
-    """Read the recorded session id for the given Claude Code pid, if any."""
+    """Read the recorded session id for the given Claude Code pid, if any.
+
+    Guards against pid recycling: if the file records the process start time and
+    it no longer matches the process currently holding `claude_pid`, the file was
+    written by a *different* process that previously held this pid, so we ignore
+    it. A missing start time (older format) or an unreadable current start time
+    (non-Linux) means no guard is available, so we accept the file as before.
+    """
     try:
         data = json.loads(_state_path(claude_pid).read_text())
     except (OSError, ValueError):
         return None
+    recorded_start = data.get("start_time")
+    if recorded_start is not None:
+        current_start = _proc_start_time(claude_pid)
+        if current_start is not None and current_start != recorded_start:
+            return None  # stale: pid was recycled
     session_id = data.get("session_id")
     return session_id or None
 

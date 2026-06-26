@@ -49,6 +49,45 @@ def test_write_read_roundtrip_and_reap(tmp_path, monkeypatch):
     assert session_state.read_session(DEAD_PID) is None
 
 
+def test_read_session_accepts_matching_start_time(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 111)
+    session_state.write_session(4242, "sid")  # records start_time=111
+    assert session_state.read_session(4242) == "sid"  # still 111 -> match
+
+
+def test_read_session_rejects_recycled_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 111)
+    session_state.write_session(4242, "sid")  # records start_time=111
+    # A new process now holds pid 4242 with a different start time.
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 222)
+    assert session_state.read_session(4242) is None  # stale -> ignored
+
+
+def test_read_session_backward_compat_no_start_time(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    # Older-format file without a start_time key is still accepted.
+    path = session_state._state_path(4242)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"session_id": "old-sid", "claude_pid": 4242}')
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 999)
+    assert session_state.read_session(4242) == "old-sid"
+
+
+def test_effective_session_id_env_fallback_on_recycled_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv(session_state.SESSION_ID_ENV_VAR, "env-sid")
+    monkeypatch.setattr(session_state, "resolve_claude_pid", lambda: 4242)
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 111)
+    session_state.write_session(4242, "real-sid", "resume")  # records 111
+    # Pid recycled: the process now holding 4242 has a different start time.
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 222)
+    sid, source = session_state.effective_session_id()
+    assert sid == "env-sid"
+    assert source.startswith("env")
+
+
 # --------------------------------------------------------------------------- #
 # scheduler
 # --------------------------------------------------------------------------- #
