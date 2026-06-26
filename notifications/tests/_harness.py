@@ -90,6 +90,10 @@ def relay_env(
         env["XDG_CACHE_HOME"] = str(
             cache_dir
         )  # where the relay looks for the channel log
+        # The explicit override is what makes the seeded-log lookup
+        # platform-independent, so the e2e suite can pass on macOS, where
+        # _cache_root() would otherwise resolve to ~/Library/Caches and miss the seed.
+        env["NOTIFICATIONS_MCP_LOG_CACHE_DIR"] = str(cache_dir)
     if project_dir is not None:
         env["CLAUDE_PROJECT_DIR"] = project_dir
     return env

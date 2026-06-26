@@ -158,6 +158,41 @@ class TestChannelDetect:
         assert cd.encode_cwd("/home/u/wlr-cc-plugins") == "-home-u-wlr-cc-plugins"
         assert cd.encode_cwd("/home/u/.claude/x") == "-home-u--claude-x"
 
+    def test_cache_root_override_wins_over_darwin(self, tmp_path, monkeypatch):
+        # The explicit override must bypass the platform branch entirely, so even on
+        # macOS (simulated) detection points at the given cache root, not ~/Library/Caches.
+        monkeypatch.setattr(cd.sys, "platform", "darwin")
+        monkeypatch.setenv("NOTIFICATIONS_MCP_LOG_CACHE_DIR", str(tmp_path))
+        assert cd._cache_root() == tmp_path
+
+    def test_cache_root_without_override_honors_xdg(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("NOTIFICATIONS_MCP_LOG_CACHE_DIR", raising=False)
+        monkeypatch.setattr(cd.sys, "platform", "linux")
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        assert cd._cache_root() == tmp_path
+
+    def test_cache_root_without_override_falls_back_to_dot_cache(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("NOTIFICATIONS_MCP_LOG_CACHE_DIR", raising=False)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setattr(cd.sys, "platform", "linux")
+        assert cd._cache_root() == Path.home() / ".cache"
+
+    def test_override_makes_detection_work_on_darwin(self, tmp_path, monkeypatch):
+        # Full round-trip proving the seam works on macOS: a seeded "registered" log
+        # under the override cache root is found even on a simulated darwin platform.
+        monkeypatch.setattr(cd.sys, "platform", "darwin")
+        monkeypatch.setenv("NOTIFICATIONS_MCP_LOG_CACHE_DIR", str(tmp_path))
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"message":"Channel notifications registered"}\n',
+        )
+        assert cd.detect_channel_mode("notifications", self.PROJECT) == cd.REGISTERED
+
     def test_registered(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
         _write_log(

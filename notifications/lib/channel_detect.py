@@ -10,7 +10,9 @@ under its cache and records exactly one of:
 The log lives at:
     <cache>/claude-cli-nodejs/<cwd with every '/' and '.' replaced by '-'>/
         mcp-logs-<server>/<timestamp>.jsonl
-where <cache> is ~/Library/Caches on macOS, else $XDG_CACHE_HOME or ~/.cache, and
+where <cache> is ~/Library/Caches on macOS, else $XDG_CACHE_HOME or ~/.cache (or
+the explicit NOTIFICATIONS_MCP_LOG_CACHE_DIR override, which wins regardless of
+platform — used by the tests to make detection platform-independent), and
 <server> is the (possibly plugin-namespaced) server name with separators turned
 into dashes, e.g. plugin:notifications:notifications ->
 mcp-logs-plugin-notifications-notifications.
@@ -34,6 +36,14 @@ _SKIPPED_MARK = "Channel notifications skipped"
 
 
 def _cache_root() -> Path:
+    # NOTIFICATIONS_MCP_LOG_CACHE_DIR is an explicit override that wins ahead of the
+    # platform branch, so tests (and unusual setups) can point channel detection at a
+    # specific cache root regardless of platform — e.g. the e2e suite seeds a fake log
+    # under a tmp dir and needs detection to find it even on macOS, where this would
+    # otherwise resolve to ~/Library/Caches.
+    override = os.environ.get("NOTIFICATIONS_MCP_LOG_CACHE_DIR")
+    if override:
+        return Path(override)
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Caches"
     xdg = os.environ.get("XDG_CACHE_HOME")
