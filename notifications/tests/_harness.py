@@ -53,11 +53,14 @@ def daemon_env(
     *,
     graphql_url: str | None = None,
     poll_seconds: str = "1",
+    warm_ttl: str | None = None,
 ) -> dict:
     env = dict(os.environ)
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
     env["NOTIFICATIONS_DATA_DIR"] = str(data_dir)
     env["NOTIFICATIONS_PR_POLL_SECONDS"] = poll_seconds
+    if warm_ttl is not None:
+        env["NOTIFICATIONS_PR_WARM_TTL_SECONDS"] = warm_ttl
     if graphql_url:
         env["GITHUB_GRAPHQL_URL"] = graphql_url
         env["GITHUB_TOKEN"] = "test-token"

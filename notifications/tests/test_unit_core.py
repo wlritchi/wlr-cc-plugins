@@ -11,6 +11,7 @@ import anyio
 import pytest
 
 import channel_detect as cd
+import pr_monitor
 import scheduler
 import session_state
 import wsproto
@@ -374,3 +375,94 @@ def test_debounce_loop_flushes_quiet_burst(relay, monkeypatch):
     assert content == "alpha\n\nbeta"
     assert meta["kind"] == "batch" and meta["count"] == "2"
     assert acked == ["a", "b"]
+
+
+# --------------------------------------------------------------------------- #
+# daemon warm-retention TTL + reaper
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def daemon():
+    path = Path(__file__).resolve().parent.parent / "daemon" / "notifications-daemon.py"
+    spec = importlib.util.spec_from_file_location("notifications_daemon", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _make_tracker(
+    daemon, key="o/r#1", *, subscribers=(), terminal=False, idle_since=None
+):
+    t = pr_monitor.PRTracker("o", "r", 1, None)
+    t.key = key
+    t.subscribers = set(subscribers)
+    t.terminal = terminal
+    t.idle_since = idle_since
+    return t
+
+
+def test_warm_ttl_seconds_default_and_overrides(daemon, monkeypatch):
+    monkeypatch.delenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", raising=False)
+    assert daemon._warm_ttl_seconds() == 1800.0
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "0")
+    assert daemon._warm_ttl_seconds() == 0.0
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "5")
+    assert daemon._warm_ttl_seconds() == 5.0
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "garbage")
+    assert daemon._warm_ttl_seconds() == 1800.0
+
+
+def test_reaper_removes_expired_tracker(daemon, tmp_path, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "10")
+    now = time.time()
+    t = _make_tracker(daemon, idle_since=now - 100)
+    monkeypatch.setattr(daemon, "TRACKERS", {t.key: t})
+    removed = daemon._reap_idle_trackers(now)
+    assert removed == [t.key]
+    assert t.key not in daemon.TRACKERS
+
+
+def test_reaper_keeps_recently_idle_tracker(daemon, tmp_path, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "10")
+    now = time.time()
+    t = _make_tracker(daemon, idle_since=now - 1)
+    monkeypatch.setattr(daemon, "TRACKERS", {t.key: t})
+    assert daemon._reap_idle_trackers(now) == []
+    assert t.key in daemon.TRACKERS
+
+
+def test_reaper_skips_subscribed_and_terminal(daemon, tmp_path, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "10")
+    now = time.time()
+    subbed = _make_tracker(
+        daemon, key="o/r#1", subscribers=("sid",), idle_since=now - 100
+    )
+    term = _make_tracker(daemon, key="o/r#2", terminal=True, idle_since=now - 100)
+    monkeypatch.setattr(daemon, "TRACKERS", {subbed.key: subbed, term.key: term})
+    assert daemon._reap_idle_trackers(now) == []
+    assert subbed.key in daemon.TRACKERS
+    assert term.key in daemon.TRACKERS
+
+
+def test_reaper_self_heals_missing_idle_marker(daemon, tmp_path, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "10")
+    now = time.time()
+    t = _make_tracker(daemon, idle_since=None)
+    monkeypatch.setattr(daemon, "TRACKERS", {t.key: t})
+    assert daemon._reap_idle_trackers(now) == []  # clock just started, not removed
+    assert t.key in daemon.TRACKERS
+    assert t.idle_since == pytest.approx(now)
+
+
+def test_reaper_disabled_keeps_everything(daemon, tmp_path, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOTIFICATIONS_PR_WARM_TTL_SECONDS", "0")
+    t = _make_tracker(daemon, idle_since=time.time() - 10_000)
+    monkeypatch.setattr(daemon, "TRACKERS", {t.key: t})
+    assert daemon._reap_idle_trackers(time.time()) == []
+    assert t.key in daemon.TRACKERS

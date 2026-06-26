@@ -8,6 +8,7 @@ import anyio
 import pytest
 
 import _harness as h
+import pr_monitor
 
 pytestmark = pytest.mark.slow
 
@@ -166,5 +167,45 @@ def test_pr_monitoring_full_chain(tmp_path):
                     read_a, write_a, 5, "list_github_pr_subscriptions"
                 )
                 assert "No active" in text
+
+        anyio.run(scenario)
+
+
+def test_pr_warm_retention_then_reaped(tmp_path):
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+    tracker_dir = store / "pr" / pr_monitor._safe(KEY)
+
+    with (
+        h.FakeGitHub(NUMBER, base_pr()) as gh,
+        h.daemon_process(
+            h.daemon_env(ws, store, graphql_url=gh.graphql_url, warm_ttl="3")
+        ),
+    ):
+
+        async def scenario():
+            async with h.stdio_client(
+                h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-A"))
+            ) as (read_a, write_a):
+                await h.mcp_handshake(read_a, write_a)
+
+                text, _ = await h.mcp_call(
+                    read_a, write_a, 2, "subscribe_github_pr", {"pr": KEY}
+                )
+                assert f"Subscribed to {KEY}" in text
+                assert (tracker_dir / "state.json").exists()
+
+                text, _ = await h.mcp_call(
+                    read_a, write_a, 3, "unsubscribe_github_pr", {"pr": KEY}
+                )
+                assert "Unsubscribed" in text
+                # Warm-retained: the tracker dir survives the unsubscribe-to-zero.
+                assert (tracker_dir / "state.json").exists()
+
+                # Past the 3s TTL the reaper (interval ~ttl/2 ≈ 1.5s) deletes it.
+                await anyio.sleep(7)
+                assert not (tracker_dir / "state.json").exists()
 
         anyio.run(scenario)

@@ -24,6 +24,7 @@ Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
                NOTIFICATIONS_WS_PORT (default 8137)
                NOTIFICATIONS_DATA_DIR (default ~/.claude/notifications)
                NOTIFICATIONS_TOKEN (default: auto-created <DATA_DIR>/token)
+               NOTIFICATIONS_PR_WARM_TTL_SECONDS (default 1800)
                GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com)
 """
 
@@ -56,6 +57,20 @@ import wsproto  # noqa: E402
 RECOVERED_THRESHOLD_SECONDS = 30
 # consecutive-no-update level that forces ~max (8h) backoff after an auth failure.
 AUTH_BACKOFF_LEVEL = 14
+# How long an unsubscribed (subscriber-less, non-terminal) tracker is kept warm
+# before the reaper deletes it, so a quick re-subscribe reuses its cached state.
+WARM_TTL_DEFAULT_SECONDS = 1800.0
+
+
+def _warm_ttl_seconds() -> float:
+    raw = os.environ.get("NOTIFICATIONS_PR_WARM_TTL_SECONDS")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return WARM_TTL_DEFAULT_SECONDS
+
 
 # session id -> its current connection
 CONNECTIONS: dict[str, "Connection"] = {}
@@ -398,6 +413,10 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
         return
 
     tracker.subscribers.add(session_id)
+    tracker.idle_since = None  # reactivated; clear any warm marker
+    pr_monitor.save_state(
+        tracker
+    )  # persist so a restart in the gap can't re-idle/reap it
     tracker.acked[session_id] = set(
         tracker.event_ids
     )  # join without replaying old events
@@ -426,7 +445,15 @@ def _handle_unsubscribe(conn: Connection, msg: dict) -> None:
         tracker.missed.pop(session_id, None)
         pr_monitor.delete_subscriber(tracker, session_id)
         if not tracker.subscribers:
-            _remove_tracker(key)
+            # Keep a non-terminal tracker warm (polling auto-suspends with no
+            # subscribers) so a quick re-subscribe reuses its cached snapshot; the
+            # reaper deletes it after the TTL. A terminal tracker, or warm retention
+            # disabled, is removed immediately as before.
+            if _warm_ttl_seconds() > 0 and not tracker.terminal:
+                tracker.idle_since = time.time()
+                pr_monitor.save_state(tracker)
+            else:
+                _remove_tracker(key)
 
 
 async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> None:
@@ -476,6 +503,36 @@ def _remove_tracker(key: str) -> None:
     if tracker is not None and tracker.task is not None:
         tracker.task.cancel()
     pr_monitor.delete_tracker(key)
+
+
+def _reap_idle_trackers(now: float) -> list[str]:
+    """Remove warm (subscriber-less, non-terminal) trackers idle past the TTL.
+    Self-heals: a subscriber-less non-terminal tracker with no idle marker
+    (e.g. loaded from older on-disk state) gets its clock started here.
+    Returns the keys removed. No-op when warm retention is disabled."""
+    ttl = _warm_ttl_seconds()
+    if ttl <= 0:
+        return []
+    removed: list[str] = []
+    for key, tracker in list(TRACKERS.items()):
+        if tracker.subscribers or tracker.terminal:
+            continue
+        if tracker.idle_since is None:
+            tracker.idle_since = now
+            pr_monitor.save_state(tracker)
+            continue
+        if now - tracker.idle_since >= ttl:
+            _remove_tracker(key)
+            removed.append(key)
+    return removed
+
+
+async def _reaper_loop() -> None:
+    while True:
+        ttl = _warm_ttl_seconds()
+        interval = max(1.0, min(ttl / 2.0, 300.0)) if ttl > 0 else 300.0
+        await asyncio.sleep(interval)
+        _reap_idle_trackers(time.time())
 
 
 def _emit(tracker: pr_monitor.PRTracker, event: dict) -> None:
@@ -593,6 +650,7 @@ async def main() -> None:
     for tracker in pr_monitor.load_trackers(GH):
         TRACKERS[tracker.key] = tracker
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
+    asyncio.create_task(_reaper_loop())
 
     host, port = wsproto.host(), wsproto.port()
     try:

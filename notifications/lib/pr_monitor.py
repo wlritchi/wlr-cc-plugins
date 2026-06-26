@@ -705,6 +705,10 @@ class PRTracker:
         self.merged = False
         self.terminal = False  # merged or gone: stop polling, unsubscribe on ack
         self.terminal_id: str | None = None
+        # Wall-clock epoch the tracker last went subscriber-less; None while active.
+        # The daemon keeps a subscriber-less non-terminal tracker "warm" for a TTL so a
+        # quick re-subscribe reuses the cached snapshot instead of re-baselining.
+        self.idle_since: float | None = None
         self.auth_notified = False  # the one-time auth-failure event was emitted
         self.task = None
         self.wake = asyncio.Event()
@@ -790,6 +794,7 @@ def save_state(t: PRTracker) -> None:
                 "terminal": t.terminal,
                 "terminal_id": t.terminal_id,
                 "auth_notified": t.auth_notified,
+                "idle_since": t.idle_since,
             }
         ),
     )
@@ -874,6 +879,7 @@ def load_trackers(client) -> list[PRTracker]:
         t.terminal = bool(state.get("terminal"))
         t.terminal_id = state.get("terminal_id")
         t.auth_notified = bool(state.get("auth_notified"))
+        t.idle_since = state.get("idle_since")  # absent -> None (backward compatible)
 
         events_path = directory / "events.jsonl"
         if events_path.exists():
@@ -902,5 +908,9 @@ def load_trackers(client) -> list[PRTracker]:
                 t.subscribers.add(session_id)
                 t.acked[session_id] = set(sub.get("acked", []))
                 t.missed[session_id] = int(sub.get("missed", 0))  # absent -> 0 (compat)
+        # An active tracker is never warm; the reaper self-heals a zero-subscriber
+        # tracker whose idle_since is still None (e.g. older on-disk state).
+        if t.subscribers:
+            t.idle_since = None
         trackers.append(t)
     return trackers

@@ -26,8 +26,10 @@ It provides two capabilities:
   capped to ~1 h during business hours (8am ET–8pm PT, Mon–Fri). Events have
   content-addressed ids and each subscriber tracks the ids it has acked; new
   subscribers join without replay; polling suspends when no subscribed session is
-  connected; a merged PR auto-unsubscribes everyone. Requires `GITHUB_TOKEN` in
-  the daemon's environment.
+  connected; a merged PR auto-unsubscribes everyone. When the last subscriber
+  unsubscribes, the tracker is kept warm for `NOTIFICATIONS_PR_WARM_TTL_SECONDS`
+  so a quick re-subscribe reuses its cached state instead of re-fetching a baseline.
+  Requires `GITHUB_TOKEN` in the daemon's environment.
 
 ## Configuration (environment)
 
@@ -41,6 +43,7 @@ It provides two capabilities:
 | `GITHUB_API_URL`              | `https://api.github.com`  | API base (set for GitHub Enterprise / tests)  |
 | `GITHUB_GRAPHQL_URL`          | `{GITHUB_API_URL}/graphql`| GraphQL endpoint (override for Enterprise)    |
 | `NOTIFICATIONS_PR_POLL_SECONDS` | —                       | Force a fixed PR poll cadence (override/testing) |
+| `NOTIFICATIONS_PR_WARM_TTL_SECONDS` | `1800`              | Keep an unsubscribed PR tracker warm this long before deleting (0 = delete immediately) |
 
 The relay reads the same `NOTIFICATIONS_WS_HOST`/`PORT`, so if you change the
 port, set it for both (e.g. in your shell profile, so Claude Code's MCP servers
