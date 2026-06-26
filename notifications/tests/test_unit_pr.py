@@ -616,6 +616,119 @@ class TestFacets:
 
 
 # --------------------------------------------------------------------------- #
+# monotonic per-facet transition epochs (same-head flaps stay distinct)
+# --------------------------------------------------------------------------- #
+
+
+def _green_checks(conclusion: str, head: str = "a" * 40) -> dict:
+    """A snapshot whose single CheckRun lands `conclusion` on `head`."""
+    return gql(
+        headRefOid=head,
+        commits={
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": head,
+                        "statusCheckRollup": {
+                            "state": conclusion,
+                            "contexts": {
+                                "nodes": [
+                                    {
+                                        "__typename": "CheckRun",
+                                        "id": "C1",
+                                        "name": "build",
+                                        "status": "COMPLETED",
+                                        "conclusion": conclusion,
+                                        "detailsUrl": "u",
+                                    }
+                                ]
+                            },
+                        },
+                    }
+                }
+            ]
+        },
+    )
+
+
+class TestTransitionEpochs:
+    def test_same_head_conflict_flap_stays_distinct(self):
+        """Core fix: a mergeability flap on ONE head — clean -> dirty (A) -> clean
+        (resolved) -> dirty (B) — yields two pr_conflict events with DISTINCT ids,
+        so the re-conflict isn't deduped away. Snapshots are threaded like real
+        polling (each `new` becomes the next `old`, carrying the epoch)."""
+        head = "a" * 40
+        clean0 = gql(headRefOid=head, mergeable="MERGEABLE")
+        dirty1 = gql(headRefOid=head, mergeable="CONFLICTING")
+        clean2 = gql(headRefOid=head, mergeable="MERGEABLE")
+        dirty3 = gql(headRefOid=head, mergeable="CONFLICTING")
+
+        a = _only(clean0, dirty1, "pr_conflict")[0]
+        _only(dirty1, clean2, "pr_conflict_resolved")  # thread the resolve
+        b = _only(clean2, dirty3, "pr_conflict")[0]
+
+        assert a["type"] == b["type"] == "pr_conflict"
+        assert a["id"] != b["id"]  # the documented same-head collision is gone
+        # The shared "mergeable" counter advanced on every transition: A is epoch 1,
+        # the resolve is epoch 2, B is epoch 3 — folded into the head-keyed identity.
+        assert (
+            a["id"]
+            == pm._event(
+                "pr_conflict", "high", "x", "o/r#1", "u", f"conflict:o/r#1:{head}:1"
+            )["id"]
+        )
+        assert (
+            b["id"]
+            == pm._event(
+                "pr_conflict", "high", "x", "o/r#1", "u", f"conflict:o/r#1:{head}:3"
+            )["id"]
+        )
+        # record() keeps both rather than collapsing the repeat.
+        added = pm.PRTracker("o", "r", 1, None).record([a, b])
+        assert len(added) == 2
+
+    def test_diff_is_idempotent_for_conflict(self):
+        """diff(old, new, key) twice on the same pair yields the same conflict id:
+        the epoch is seeded from `old` each call, so the in-place write to
+        new['transition_epochs'] is overwritten, not accumulated."""
+        clean = gql(mergeable="MERGEABLE")
+        dirty = gql(mergeable="CONFLICTING")
+        first = _only(clean, dirty, "pr_conflict")[0]
+        second = _only(clean, dirty, "pr_conflict")[0]
+        assert first["id"] == second["id"]
+
+    def test_backward_compat_old_snapshot_without_epochs(self):
+        """An `old` snapshot predating the epoch dict diffs without error and the
+        first post-upgrade flap is epoch 1 (no key -> {} -> counter starts at 0)."""
+        old = gql(mergeable="MERGEABLE")
+        assert "transition_epochs" not in old  # current-format snapshot lacks it
+        dirty = gql(mergeable="CONFLICTING")
+        event = _only(old, dirty, "pr_conflict")[0]
+        assert (
+            event["id"]
+            == pm._event(
+                "pr_conflict", "high", "x", "o/r#1", "u", f"conflict:o/r#1:{'a' * 40}:1"
+            )["id"]
+        )
+        assert dirty["transition_epochs"] == {"mergeable": 1}
+
+    def test_same_head_checks_green_flap_stays_distinct(self):
+        """A check re-run flapping green -> fail -> green on ONE head emits two
+        distinct pr_checks_green ids instead of colliding on the head-keyed id."""
+        fail0 = _green_checks("FAILURE")
+        green1 = _green_checks("SUCCESS")
+        fail2 = _green_checks("FAILURE")
+        green3 = _green_checks("SUCCESS")
+
+        a = _only(fail0, green1, "pr_checks_green")[0]
+        _types(green1, fail2)  # thread the regression (carries the epoch)
+        b = _only(fail2, green3, "pr_checks_green")[0]
+
+        assert a["type"] == b["type"] == "pr_checks_green"
+        assert a["id"] != b["id"]
+
+
+# --------------------------------------------------------------------------- #
 # identity-addressed ids + storage (Phase 3)
 # --------------------------------------------------------------------------- #
 

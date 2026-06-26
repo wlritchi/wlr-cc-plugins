@@ -313,7 +313,16 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
 
     events: list[dict] = []
     head = new.get("head_sha")
+    # Monotonic per-facet transition counters, carried forward from the previous
+    # snapshot and persisted in state.json. Folding the counter into a state-transition
+    # identity keeps a recurring SAME-HEAD flap (e.g. base-branch churn flipping
+    # mergeability dirty->clean->dirty, or a check re-run going green->fail->green)
+    # as distinct events instead of colliding on one head-keyed id. Seed from `old`
+    # so diffing the same pair twice is idempotent.
+    epochs = dict((old or {}).get("transition_epochs") or {})
+    new["transition_epochs"] = epochs
     if old["state"] == "open" and new["state"] == "closed" and not new["merged"]:
+        epochs["closed"] = epochs.get("closed", 0) + 1
         events.append(
             _event(
                 "pr_closed",
@@ -321,10 +330,11 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 f"{key} was closed without merging.\n{new['url']}",
                 key,
                 new["url"],
-                f"closed:{key}:{head}",
+                f"closed:{key}:{head}:{epochs['closed']}",
             )
         )
     if new["mergeable_state"] == "dirty" and old["mergeable_state"] != "dirty":
+        epochs["mergeable"] = epochs.get("mergeable", 0) + 1
         events.append(
             _event(
                 "pr_conflict",
@@ -333,13 +343,15 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 f"rebase/merge the base branch and resolve them.\n{new['url']}",
                 key,
                 new["url"],
-                f"conflict:{key}:{head}",
+                f"conflict:{key}:{head}:{epochs['mergeable']}",
             )
         )
-    # Inverse of pr_conflict: the dirty -> clean transition. Like pr_conflict, the
-    # identity carries the head sha, so a re-resolve on the *same* head can collapse
-    # (the documented residual case for state-transition events).
+    # Inverse of pr_conflict: the dirty -> clean transition. It shares pr_conflict's
+    # monotonic "mergeable" counter (bumped on every mergeability transition) and folds
+    # it into the identity, so a re-resolve — or a re-conflict — on the *same* head is a
+    # distinct event rather than collapsing onto an earlier head-keyed id.
     if new["mergeable_state"] == "clean" and old["mergeable_state"] == "dirty":
+        epochs["mergeable"] = epochs.get("mergeable", 0) + 1
         events.append(
             _event(
                 "pr_conflict_resolved",
@@ -347,7 +359,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 f"{key}: merge conflicts resolved — it can be merged cleanly again.\n{new['url']}",
                 key,
                 new["url"],
-                f"conflict_resolved:{key}:{head}",
+                f"conflict_resolved:{key}:{head}:{epochs['mergeable']}",
             )
         )
     # Recurring facets (labels, reviewers, draft, force-push) come from new timeline
@@ -426,7 +438,11 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             prev is None or prev.get("state") != s["state"]
         ):
             events.append(_status_event(ctx, s, key))
+    # The all-green recovery carries its own monotonic "green" counter so a check
+    # re-run flapping green->fail->green on the *same* head emits each recovery as a
+    # distinct event instead of colliding on one head-keyed id.
     if not _checks_all_green(old) and _checks_all_green(new):
+        epochs["green"] = epochs.get("green", 0) + 1
         head7 = (head or "")[:7]
         events.append(
             _event(
@@ -435,7 +451,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 f"All checks are now passing on {key} (head {head7}).\n{new['url']}",
                 key,
                 new["url"],
-                f"green:{key}:{head}",
+                f"green:{key}:{head}:{epochs['green']}",
             )
         )
     return events
