@@ -7,6 +7,7 @@ import os
 import time
 from pathlib import Path
 
+import anyio
 import pytest
 
 import channel_detect as cd
@@ -268,3 +269,108 @@ def test_backoff_steady_state_is_about_30_min(relay):
     samples = [relay._reconnect_delay(20) for _ in range(2000)]
     assert 24 * 60 <= min(samples)
     assert max(samples) <= 36 * 60
+
+
+# --------------------------------------------------------------------------- #
+# relay push-mode debounce / coalescing
+# --------------------------------------------------------------------------- #
+
+
+def _push_client(relay):
+    """A push-mode DaemonClient with _deliver_channel/_ack replaced by recorders."""
+    client = relay.DaemonClient()
+    client._mode = "push"
+    delivered: list[tuple[str, dict | None]] = []
+    acked: list = []
+
+    async def fake_deliver(content, meta):
+        delivered.append((content, meta))
+
+    async def fake_ack(notification_id):
+        acked.append(notification_id)
+
+    client._deliver_channel = fake_deliver
+    client._ack = fake_ack
+    return client, delivered, acked
+
+
+def test_flush_coalesces_multiple_into_one_event(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DEBOUNCE_SECONDS", "1")
+    client, delivered, acked = _push_client(relay)
+
+    async def scenario():
+        await client._enqueue_push(
+            "id1", "first", {"severity": "info", "kind": "pr_check"}
+        )
+        await client._enqueue_push(
+            "id2", "second", {"severity": "high", "kind": "pr_review"}
+        )
+        await client._enqueue_push(
+            "id3", "third", {"severity": "info", "kind": "pr_comment"}
+        )
+        assert delivered == []  # buffered, nothing pushed yet
+        await client._flush_debounce()
+
+    anyio.run(scenario)
+
+    assert len(delivered) == 1  # one coalesced channel event
+    content, meta = delivered[0]
+    assert content == "first\n\nsecond\n\nthird"  # blank line between each
+    assert meta == {"severity": "high", "kind": "batch", "count": "3"}
+    assert acked == ["id1", "id2", "id3"]  # every underlying id acked
+    assert client._pending_debounce == []
+
+
+def test_flush_single_item_keeps_its_kind(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DEBOUNCE_SECONDS", "1")
+    client, delivered, acked = _push_client(relay)
+
+    async def scenario():
+        await client._enqueue_push(
+            "only", "solo", {"severity": "info", "kind": "pr_comment"}
+        )
+        await client._flush_debounce()
+
+    anyio.run(scenario)
+    assert delivered == [
+        ("solo", {"severity": "info", "kind": "pr_comment", "count": "1"})
+    ]
+    assert acked == ["only"]
+
+
+def test_debounce_disabled_delivers_immediately(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DEBOUNCE_SECONDS", "0")
+    client, delivered, acked = _push_client(relay)
+
+    async def scenario():
+        await client._enqueue_push(
+            "id1", "now", {"severity": "info", "kind": "pr_check"}
+        )
+        # delivered immediately with the original meta passed straight through
+        assert delivered == [("now", {"severity": "info", "kind": "pr_check"})]
+        assert acked == ["id1"]
+        assert client._pending_debounce == []
+
+    anyio.run(scenario)
+
+
+def test_debounce_loop_flushes_quiet_burst(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DEBOUNCE_SECONDS", "0.2")
+    client, delivered, acked = _push_client(relay)
+
+    async def scenario():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.debounce_loop)
+            await client._enqueue_push("a", "alpha", {"severity": "info", "kind": "x"})
+            await client._enqueue_push("b", "beta", {"severity": "info", "kind": "y"})
+            with anyio.move_on_after(3):  # let the quiet window elapse and flush
+                while not delivered:
+                    await anyio.sleep(0.05)
+            tg.cancel_scope.cancel()
+
+    anyio.run(scenario)
+    assert len(delivered) == 1
+    content, meta = delivered[0]
+    assert content == "alpha\n\nbeta"
+    assert meta["kind"] == "batch" and meta["count"] == "2"
+    assert acked == ["a", "b"]

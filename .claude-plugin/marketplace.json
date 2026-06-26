@@ -44,7 +44,7 @@
       "name": "notifications",
       "source": "./notifications",
       "description": "Session-aware notification framework for Claude Code (groundwork)",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "author": {
         "name": "wlritchi"
       }

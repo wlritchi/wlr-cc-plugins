@@ -103,15 +103,17 @@ def test_pr_monitoring_full_chain(tmp_path):
                         }
                     ]
                 }
-                got = await h.mcp_collect_channels(
-                    read_a, {"pr_check", "pr_review", "pr_conflict"}, 25
-                )
-                assert {"pr_check", "pr_review", "pr_conflict"} <= set(got)
-                assert (
-                    "test_a" in got["pr_check"]["content"]
-                    and got["pr_check"]["meta"]["severity"] == "high"
-                )
-                assert "alice" in got["pr_review"]["content"]
+                # check + review + conflict land in one poll -> ONE coalesced event
+                event = await h.mcp_await_channel(read_a, timeout=25)
+                assert event is not None
+                content = event.params["content"]
+                assert "test_a" in content  # the failing check
+                assert "alice" in content  # the changes-requested review
+                assert "merge conflicts" in content  # the conflict
+                meta = event.params["meta"]
+                assert meta["kind"] == "batch"  # coalesced, not a single kind
+                assert meta["severity"] == "high"  # highest among the batch
+                assert meta["count"] == "3"  # all three carried by one event
 
                 await anyio.sleep(3)  # let acks land
                 text, _ = await h.mcp_call(
@@ -138,23 +140,26 @@ def test_pr_monitoring_full_chain(tmp_path):
                             }
                         ]
                     }
-                    got_b = await h.mcp_collect_channels(read_b, {"pr_comment"}, 25)
-                    assert (
-                        "pr_comment" in got_b
-                        and "dave" in got_b["pr_comment"]["content"]
-                    )
-                    assert (
-                        "pr_conflict" not in got_b and "pr_check" not in got_b
-                    )  # no replay
+                    # one coalesced event with only the new comment (no replay)
+                    event_b = await h.mcp_await_channel(read_b, timeout=25)
+                    assert event_b is not None
+                    content_b = event_b.params["content"]
+                    assert "dave" in content_b  # the new comment
+                    assert "merge conflicts" not in content_b  # earlier conflict
+                    assert "test_a" not in content_b  # earlier check
+                    assert "alice" not in content_b  # earlier review
 
                 # merge -> terminal event + auto-unsubscribe
                 gh.pr.update(
                     {"state": "MERGED", "merged": True, "mergedBy": {"login": "carol"}}
                 )
-                merged = await h.mcp_collect_channels(read_a, {"pr_merged"}, 25)
+                # subscriber A also receives the earlier 'dave' comment, so read
+                # past it to the merge (terminal) event + auto-unsubscribe.
+                merged = await h.mcp_await_channel_with(read_a, "carol", 25)
+                assert merged is not None
                 assert (
-                    "carol" in merged["pr_merged"]["content"]
-                    and "unsubscrib" in merged["pr_merged"]["content"]
+                    "carol" in merged.params["content"]
+                    and "unsubscrib" in merged.params["content"]
                 )
                 await anyio.sleep(3)
                 text, _ = await h.mcp_call(

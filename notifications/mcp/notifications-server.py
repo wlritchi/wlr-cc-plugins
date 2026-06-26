@@ -70,6 +70,30 @@ SESSION_POLL_SECONDS = 5.0
 STARTUP_GRACE_SECONDS = 3.0
 REQUEST_TIMEOUT_SECONDS = 10.0
 
+# Debounce/coalesce window for push (channel) delivery. A burst of notifications
+# (e.g. several PR check/review/comment events landing in one poll) is coalesced
+# into ONE channel event instead of several separate interruptions. The window is
+# a quiet period, reset on each new arrival, capped so a continuous stream still
+# flushes periodically. NOTIFICATIONS_DEBOUNCE_SECONDS overrides the quiet window
+# (a float; <= 0 disables debounce and delivers each notification immediately).
+DEBOUNCE_DEFAULT_SECONDS = 2.0
+
+
+def _debounce_window() -> float:
+    raw = os.environ.get("NOTIFICATIONS_DEBOUNCE_SECONDS")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return DEBOUNCE_DEFAULT_SECONDS
+
+
+def _debounce_max(window: float) -> float:
+    """Max hold since the first pending item, so a steady stream still flushes."""
+    return max(window * 5, 10.0)
+
+
 # Reconnect backoff: binary (exponential) growth with +/- jitter, capped at a
 # jittered 30 minutes, after which it retries roughly every half hour forever.
 # The counter resets only after a connection that stayed up at least
@@ -119,6 +143,12 @@ class DaemonClient:
         self._buffer: dict[
             str, dict
         ] = {}  # notification id -> {content, meta}; held until acked
+        # Push-mode debounce: a burst of notifications is coalesced into one
+        # channel event. Items wait here until the burst goes quiet (or caps out).
+        self._pending_debounce: list[dict] = []  # [{id, content, meta}]
+        self._debounce_event = anyio.Event()  # signalled on each push-mode arrival
+        self._debounce_first: float | None = None  # monotonic ts of first pending item
+        self._debounce_last: float | None = None  # monotonic ts of most recent arrival
 
     def attach_write_stream(self, write_stream) -> None:
         self._write_stream = write_stream
@@ -166,16 +196,93 @@ class DaemonClient:
         except (ConnectionClosed, WebSocketException):
             pass
 
+    async def _enqueue_push(
+        self, notification_id, content: str, meta: dict | None
+    ) -> None:
+        """Deliver a push-mode notification, coalescing bursts via the debounce buffer.
+
+        With debounce disabled (window <= 0) it is delivered (and acked) immediately;
+        otherwise it is buffered and the debounce loop flushes the burst as one event.
+        """
+        if _debounce_window() <= 0:
+            await self._deliver_channel(content, meta)
+            await self._ack(notification_id)
+            return
+        now = time.monotonic()
+        if self._debounce_first is None:
+            self._debounce_first = now
+        self._debounce_last = now
+        self._pending_debounce.append(
+            {"id": notification_id, "content": content, "meta": meta}
+        )
+        self._debounce_event.set()
+
+    async def _flush_debounce(self) -> None:
+        """Coalesce the pending push notifications into ONE channel event, then ack each.
+
+        Content is the individual messages joined by a blank line; the coalesced meta
+        carries the highest severity, kind="batch" when >1 item (else the lone item's
+        kind), and count. The daemon's per-id acked-set is unchanged: every id is acked.
+        """
+        pending = self._pending_debounce
+        self._pending_debounce = []
+        self._debounce_first = None
+        self._debounce_last = None
+        if not pending:
+            return
+        content = "\n\n".join(item["content"] for item in pending)
+        severity = (
+            "high"
+            if any((item["meta"] or {}).get("severity") == "high" for item in pending)
+            else "info"
+        )
+        if len(pending) > 1:
+            kind = "batch"
+        else:
+            kind = str((pending[0]["meta"] or {}).get("kind") or "notification")
+        meta = {"severity": severity, "kind": kind, "count": str(len(pending))}
+        await self._deliver_channel(content, meta)
+        for item in pending:
+            await self._ack(item["id"])
+
+    async def debounce_loop(self) -> None:
+        """Flush coalesced push notifications once a burst goes quiet (or hits the cap).
+
+        Sleeps on an event each arrival signals, recomputing the flush deadline from the
+        last arrival (quiet window) and the first pending item (max hold). No busy loop.
+        """
+        while True:
+            await self._debounce_event.wait()
+            self._debounce_event = anyio.Event()
+            while self._pending_debounce:
+                window = _debounce_window()
+                deadline = min(
+                    (self._debounce_last or 0.0) + window,
+                    (self._debounce_first or 0.0) + _debounce_max(window),
+                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                fired = False
+                with anyio.move_on_after(remaining):
+                    await self._debounce_event.wait()
+                    self._debounce_event = anyio.Event()
+                    fired = True
+                if not fired:  # quiet/max window elapsed with no new arrival
+                    break
+            await self._flush_debounce()
+
     async def apply_mode(self, detected: str) -> None:
         """Switch out of buffering once we know whether we're a channel."""
         if detected == channel_detect.REGISTERED:
             self._mode = "push"
             for notification_id, payload in list(
                 self._buffer.items()
-            ):  # flush what we held
-                await self._deliver_channel(payload["content"], payload["meta"])
-                await self._ack(notification_id)
+            ):  # flush what we held, coalesced through the debounce path
                 self._buffer.pop(notification_id, None)
+                await self._enqueue_push(
+                    notification_id, payload["content"], payload["meta"]
+                )
         else:  # skipped or unknown: err toward no silent loss
             self._mode = "pull"
             global _catch_up_registered
@@ -245,6 +352,11 @@ class DaemonClient:
             finally:
                 self._ws = None
                 self._registered_session = None
+                # Drop un-acked pending items: the daemon resends unacked on
+                # reconnect and they'll re-buffer, so don't deliver without acking.
+                self._pending_debounce = []
+                self._debounce_first = None
+                self._debounce_last = None
             stable = (
                 self._connected_once
                 and (time.monotonic() - started) >= RECONNECT_STABLE_SECONDS
@@ -279,10 +391,9 @@ class DaemonClient:
                 if msg.get("type") == wsproto.NOTIFY:
                     notification_id = msg.get("id")
                     if self._mode == "push":
-                        await self._deliver_channel(
-                            msg.get("content", ""), msg.get("meta")
+                        await self._enqueue_push(
+                            notification_id, msg.get("content", ""), msg.get("meta")
                         )
-                        await self._ack(notification_id)
                     elif notification_id:  # detecting or pull: hold without acking
                         self._buffer[notification_id] = {
                             "content": msg.get("content", ""),
@@ -506,6 +617,7 @@ async def _serve() -> None:
         async with anyio.create_task_group() as tg:
             tg.start_soon(DAEMON.run)
             tg.start_soon(DAEMON.detect_and_apply)  # decide push vs catch_up
+            tg.start_soon(DAEMON.debounce_loop)  # coalesce push-mode bursts
             await server.run(read_stream, write_stream, init_options)
             tg.cancel_scope.cancel()  # transport closed: stop the daemon client
 

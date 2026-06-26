@@ -72,12 +72,17 @@ def relay_env(
     *,
     cache_dir: Path | None = None,
     project_dir: str | None = None,
+    debounce_seconds: str = "0.5",
 ) -> dict:
     env = dict(os.environ)
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
     env["NOTIFICATIONS_DATA_DIR"] = str(data_dir)
     env["XDG_RUNTIME_DIR"] = str(xdg_dir)  # isolate the session-id state file lookup
     env["CLAUDE_CODE_SESSION_ID"] = session_id
+    # Small push-mode debounce window: a same-pass burst still coalesces (items
+    # arrive within ms), but a lone notification is delayed only briefly so tests
+    # stay within their timeouts.
+    env["NOTIFICATIONS_DEBOUNCE_SECONDS"] = debounce_seconds
     if cache_dir is not None:
         env["XDG_CACHE_HOME"] = str(
             cache_dir
@@ -233,6 +238,17 @@ async def mcp_await_channel(read, timeout: float = 20.0):
     return None
 
 
+async def mcp_await_channel_with(read, needle: str, timeout: float = 20.0):
+    """Await the next channel event whose content contains `needle`, skipping others."""
+    with anyio.move_on_after(timeout):
+        async for message in read:
+            root = message.message.root
+            if isinstance(root, JSONRPCNotification) and root.method == CHANNEL_METHOD:
+                if needle in (root.params.get("content") or ""):
+                    return root
+    return None
+
+
 async def mcp_collect_channels(read, kinds: set[str], timeout: float = 20.0) -> dict:
     got: dict = {}
     with anyio.move_on_after(timeout):
@@ -303,6 +319,7 @@ __all__ = [
     "daemon_process",
     "free_port",
     "mcp_await_channel",
+    "mcp_await_channel_with",
     "mcp_await_response",
     "mcp_call",
     "mcp_collect_channels",
