@@ -2,9 +2,10 @@
 """Async GitHub client for PR monitoring, using a single GraphQL query per poll.
 
 One query fetches PR core, reviews, review threads (inline comments + resolution),
-conversation comments, the head commit's check rollup, and recent force-push
-timeline events — far fewer API calls than the REST equivalent, which keeps us
-well under rate limits. Rate-limit headers are parsed so the daemon can throttle,
+conversation comments, the head commit's check rollup, and recent timeline events
+(label add/remove, reviewer requested/removed, draft toggled, force-push) whose
+globally-unique node ids give recurring transitions a stable identity — far fewer
+API calls than the REST equivalent, which keeps us well under rate limits. Rate-limit headers are parsed so the daemon can throttle,
 and failures are classified (auth / not-found / rate-limited / transient) so the
 daemon can tailor its recovery.
 
@@ -67,9 +68,21 @@ query($owner:String!, $repo:String!, $number:Int!) {
         ... on CheckRun { id name status conclusion detailsUrl title summary }
         ... on StatusContext { id context state targetUrl description }
       } } } } } }
-      timelineItems(last:20, itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]) { nodes {
-        __typename ... on HeadRefForcePushedEvent { createdAt
-          beforeCommit { oid } afterCommit { oid } } } }
+      timelineItems(
+        last:50
+        itemTypes:[LABELED_EVENT, UNLABELED_EVENT, REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT, READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, HEAD_REF_FORCE_PUSHED_EVENT]
+      ) { nodes {
+        __typename
+        ... on LabeledEvent { id label { name } }
+        ... on UnlabeledEvent { id label { name } }
+        ... on ReviewRequestedEvent { id requestedReviewer {
+          __typename ... on User { login } ... on Bot { login } ... on Mannequin { login } ... on Team { name } ... on EnterpriseTeam { name } } }
+        ... on ReviewRequestRemovedEvent { id requestedReviewer {
+          __typename ... on User { login } ... on Bot { login } ... on Mannequin { login } ... on Team { name } ... on EnterpriseTeam { name } } }
+        ... on ReadyForReviewEvent { id actor { login } }
+        ... on ConvertToDraftEvent { id actor { login } }
+        ... on HeadRefForcePushedEvent { id beforeCommit { oid } afterCommit { oid } }
+      } }
     }
   }
 }

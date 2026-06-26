@@ -433,6 +433,7 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
                     f"{tracker.key} could not be fetched ({exc} — deleted, or the token lost "
                     "access). Polling stopped and you've been unsubscribed.",
                     tracker.key,
+                    f"gone:{tracker.key}",
                 ),
             )
             pr_monitor.save_state(tracker)
@@ -454,6 +455,7 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
                         f"GitHub access to {tracker.key} failed ({exc}). Polling is paused until "
                         "the daemon's GITHUB_TOKEN is fixed (restart the daemon with a valid token).",
                         tracker.key,
+                        f"auth_error:{tracker.key}",
                     ),
                 )
                 tracker.auth_notified = True

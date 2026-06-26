@@ -4,8 +4,11 @@ a per-PR tracker with on-disk persistence.
 
 The pure functions (snapshot_from_api, diff, summarize and the formatters) carry
 the "enough information to act without opening GitHub" requirement and are
-unit-tested directly. Events have content-addressed ids (a hash of their content)
-so dedup is idempotent across restarts. PRTracker holds the mutable per-PR state
+unit-tested directly. Each event's id is a hash of a stable source identity (a
+timeline node id, an object id, or a synthesized state key) rather than its
+rendered text, so dedup is idempotent across restarts yet recurring transitions
+that render identically (e.g. a label removed then re-added) stay distinct.
+PRTracker holds the mutable per-PR state
 (subscribers, per-subscriber acked id sets, cached events, last snapshot); the
 daemon drives its polling. Persistence is split (state / append-only event log /
 per-subscriber files) to keep write amplification low.
@@ -137,8 +140,9 @@ def snapshot_from_graphql(pr: dict) -> dict:
     """Normalize a GraphQL pullRequest node into the same snapshot shape as REST.
 
     Enums are lowercased and CONFLICTING -> "dirty" so the transport-agnostic
-    diff() is unchanged. Extra facet fields (draft, labels, requested reviewers,
-    review-thread resolution, force pushes) are stashed for later diff rules.
+    diff() is unchanged. Current-state facets (draft, labels, requested reviewers)
+    feed summarize(); review-thread resolution and the timeline (an ordered map of
+    node id -> recurring transition) feed later diff rules.
     """
     snap: dict = {
         "state": "open" if pr.get("state") == "OPEN" else "closed",
@@ -163,7 +167,7 @@ def snapshot_from_graphql(pr: dict) -> dict:
         "check_runs": {},
         "statuses": {},
         "review_threads": {},
-        "force_pushes": [],
+        "timeline": {},
     }
     for r in _nodes(pr.get("reviews")):
         if r.get("state") == "PENDING":
@@ -221,14 +225,50 @@ def snapshot_from_graphql(pr: dict) -> dict:
                 "url": ctx.get("targetUrl"),
                 "desc": ctx.get("description"),
             }
+    # Recurring transitions, keyed by their globally-unique timeline node id (in
+    # chronological order — timelineItems is fetched with `last:N`). Each becomes
+    # one diff event whose identity is that node id, so a label removed then
+    # re-added yields two distinct events rather than colliding on identical text.
     for ev in _nodes(pr.get("timelineItems")):
-        if ev.get("__typename") == "HeadRefForcePushedEvent":
-            snap["force_pushes"].append(
-                {
+        node_id = ev.get("id")
+        if not node_id:
+            continue
+        typename = ev.get("__typename")
+        if typename == "LabeledEvent":
+            item = {
+                "type": "label_added",
+                "detail": (ev.get("label") or {}).get("name"),
+            }
+        elif typename == "UnlabeledEvent":
+            item = {
+                "type": "label_removed",
+                "detail": (ev.get("label") or {}).get("name"),
+            }
+        elif typename == "ReviewRequestedEvent":
+            item = {
+                "type": "reviewer_requested",
+                "detail": _reviewer_name(ev.get("requestedReviewer")),
+            }
+        elif typename == "ReviewRequestRemovedEvent":
+            item = {
+                "type": "reviewer_removed",
+                "detail": _reviewer_name(ev.get("requestedReviewer")),
+            }
+        elif typename == "ReadyForReviewEvent":
+            item = {"type": "ready", "detail": None}
+        elif typename == "ConvertToDraftEvent":
+            item = {"type": "draft", "detail": None}
+        elif typename == "HeadRefForcePushedEvent":
+            item = {
+                "type": "force_push",
+                "detail": {
                     "before": (ev.get("beforeCommit") or {}).get("oid"),
                     "after": (ev.get("afterCommit") or {}).get("oid"),
-                }
-            )
+                },
+            }
+        else:
+            continue
+        snap["timeline"][str(node_id)] = item
     return snap
 
 
@@ -250,14 +290,18 @@ def _checks_all_green(snap: dict) -> bool:
     return all(s.get("state") == "success" for s in statuses.values())
 
 
-def _force_push_for(old: dict, new: dict) -> dict | None:
-    """A new force-push timeline event landing on the new head, if this head change
-    was a force-push (history rewrite) rather than fresh commits."""
-    old_fps = old.get("force_pushes") or []
-    for fp in new.get("force_pushes") or []:
-        if fp.get("after") == new.get("head_sha") and fp not in old_fps:
-            return fp
-    return None
+def _head_change_is_force_push(old: dict, new: dict) -> bool:
+    """True iff the new head sha is explained by a force-push timeline event that is
+    new this poll. When so, the timeline loop emits the pr_force_push event and the
+    head change must NOT also fire a "new commits pushed" event."""
+    old_timeline = old.get("timeline") or {}
+    new_head = new.get("head_sha")
+    for node_id, item in (new.get("timeline") or {}).items():
+        if node_id in old_timeline or item.get("type") != "force_push":
+            continue
+        if (item.get("detail") or {}).get("after") == new_head:
+            return True
+    return False
 
 
 def diff(old: dict | None, new: dict, key: str) -> list[dict]:
@@ -268,6 +312,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
         return [_merged_event(new, key)]  # terminal; nothing else matters
 
     events: list[dict] = []
+    head = new.get("head_sha")
     if old["state"] == "open" and new["state"] == "closed" and not new["merged"]:
         events.append(
             _event(
@@ -276,6 +321,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 f"{key} was closed without merging.\n{new['url']}",
                 key,
                 new["url"],
+                f"closed:{key}:{head}",
             )
         )
     if new["mergeable_state"] == "dirty" and old["mergeable_state"] != "dirty":
@@ -287,97 +333,44 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 f"rebase/merge the base branch and resolve them.\n{new['url']}",
                 key,
                 new["url"],
+                f"conflict:{key}:{head}",
             )
         )
-    if old["head_sha"] and new["head_sha"] and old["head_sha"] != new["head_sha"]:
-        force_push = _force_push_for(old, new)
-        if force_push:
-            before = (force_push.get("before") or old["head_sha"])[:7]
-            after = (force_push.get("after") or new["head_sha"])[:7]
-            events.append(
-                _event(
-                    "pr_force_push",
-                    "info",
-                    f"{key} was force-pushed (history rewritten — rebase/amend/squash); "
-                    f"head {before} → {after}.\n{new['url']}",
-                    key,
-                    new["url"],
-                )
-            )
-        else:
-            events.append(
-                _event(
-                    "pr_commits",
-                    "info",
-                    f"New commits pushed to {key} (head is now {new['head_sha'][:7]}).\n{new['url']}",
-                    key,
-                    new["url"],
-                )
-            )
-    if old.get("draft") != new.get("draft"):
-        action = (
-            "converted to a draft" if new.get("draft") else "marked ready for review"
-        )
+    # Recurring facets (labels, reviewers, draft, force-push) come from new timeline
+    # nodes: each carries a globally-unique id, so identical-looking transitions stay
+    # distinct. A head-sha change not backed by a new force-push node is fresh commits.
+    if (
+        old["head_sha"]
+        and new["head_sha"]
+        and old["head_sha"] != new["head_sha"]
+        and not _head_change_is_force_push(old, new)
+    ):
         events.append(
             _event(
-                "pr_draft",
+                "pr_commits",
                 "info",
-                f"{key} was {action}.\n{new['url']}",
+                f"New commits pushed to {key} (head is now {new['head_sha'][:7]}).\n{new['url']}",
                 key,
                 new["url"],
+                f"commits:{key}:{new['head_sha']}",
             )
         )
-    old_labels, new_labels = set(old.get("labels") or []), set(new.get("labels") or [])
-    for name in sorted(new_labels - old_labels):
-        events.append(
-            _event(
-                "pr_label",
-                "info",
-                f"Label '{name}' added to {key}.\n{new['url']}",
-                key,
-                new["url"],
-            )
-        )
-    for name in sorted(old_labels - new_labels):
-        events.append(
-            _event(
-                "pr_label",
-                "info",
-                f"Label '{name}' removed from {key}.\n{new['url']}",
-                key,
-                new["url"],
-            )
-        )
-    old_revs, new_revs = (
-        set(old.get("requested_reviewers") or []),
-        set(new.get("requested_reviewers") or []),
-    )
-    for name in sorted(new_revs - old_revs):
-        events.append(
-            _event(
-                "pr_review_request",
-                "info",
-                f"Review requested from {name} on {key}.\n{new['url']}",
-                key,
-                new["url"],
-            )
-        )
-    for name in sorted(old_revs - new_revs):
-        events.append(
-            _event(
-                "pr_review_request",
-                "info",
-                f"Review request for {name} was removed on {key}.\n{new['url']}",
-                key,
-                new["url"],
-            )
-        )
+    old_timeline = old.get("timeline") or {}
+    for node_id, item in (new.get("timeline") or {}).items():
+        if node_id in old_timeline:
+            continue
+        event = _timeline_event(item, key, new["url"], node_id)
+        if event is not None:
+            events.append(event)
     for rid, r in new["reviews"].items():
         if rid not in old["reviews"]:
-            events.append(_review_event(r, key))
+            events.append(_review_event(r, key, rid))
     for cid, c in new["review_comments"].items():
         if cid not in old["review_comments"]:
-            events.append(_inline_comment_event(c, key))
+            events.append(_inline_comment_event(c, key, cid))
+    # Thread resolve/unresolve has no timeline event, so it stays a set-diff with a
+    # resolved-state-encoded identity. Recurring resolve/unresolve of the *same*
+    # thread back to a prior state can still collapse — acceptable, and rare.
     for tid, th in (new.get("review_threads") or {}).items():
         prev = (old.get("review_threads") or {}).get(tid)
         if prev is not None and prev.get("resolved") != th.get("resolved"):
@@ -386,7 +379,8 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 if th.get("line")
                 else (th.get("path") or "a file")
             )
-            state = "resolved" if th.get("resolved") else "reopened (unresolved)"
+            resolved = bool(th.get("resolved"))
+            state = "resolved" if resolved else "reopened (unresolved)"
             events.append(
                 _event(
                     "pr_thread",
@@ -394,11 +388,12 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                     f"A review thread on {key} ({loc}) was {state}.\n{new['url']}",
                     key,
                     new["url"],
+                    f"thread:{tid}:{resolved}",
                 )
             )
     for cid, c in new["issue_comments"].items():
         if cid not in old["issue_comments"]:
-            events.append(_comment_event(c, key))
+            events.append(_comment_event(c, key, cid))
     for chid, ch in new["check_runs"].items():
         prev = old["check_runs"].get(chid)
         became_complete = ch["status"] == "completed" and (
@@ -410,7 +405,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             and prev.get("conclusion") != ch.get("conclusion")
         )
         if became_complete or conclusion_changed:
-            events.append(_check_event(ch, key))
+            events.append(_check_event(ch, key, chid))
     for ctx, s in new["statuses"].items():
         prev = old["statuses"].get(ctx)
         if s["state"] in ("success", "failure", "error") and (
@@ -418,14 +413,15 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
         ):
             events.append(_status_event(ctx, s, key))
     if not _checks_all_green(old) and _checks_all_green(new):
-        head = (new.get("head_sha") or "")[:7]
+        head7 = (head or "")[:7]
         events.append(
             _event(
                 "pr_checks_green",
                 "info",
-                f"All checks are now passing on {key} (head {head}).\n{new['url']}",
+                f"All checks are now passing on {key} (head {head7}).\n{new['url']}",
                 key,
                 new["url"],
+                f"green:{key}:{head}",
             )
         )
     return events
@@ -469,15 +465,23 @@ def _hunk_tail(hunk: str | None, n: int) -> str:
     return "\n".join(ln[1:] if ln[:1] in " +-" else ln for ln in tail)
 
 
-def _event(kind: str, severity: str, content: str, key: str, url: str | None) -> dict:
+def _event(
+    kind: str,
+    severity: str,
+    content: str,
+    key: str,
+    url: str | None,
+    identity: str,
+) -> dict:
     meta = {"severity": severity, "kind": kind, "pr": key}
     if url:
         meta["url"] = url
-    # Content-addressed id: a hash of (kind, content). The content is deterministic
-    # from the snapshot (it embeds the unique discriminators — review/comment urls,
-    # head shas, label names, conclusions), so the same underlying event always gets
-    # the same id, which makes dedup idempotent and reproducible across restarts.
-    event_id = hashlib.sha256(f"{kind}\n{content}".encode()).hexdigest()[:16]
+    # Identity-addressed id: a hash of a stable source identity (a timeline node id,
+    # an object id like a review/comment/check id, or a synthesized state key such as
+    # f"conflict:{key}:{head}"), NOT the rendered content. This keeps dedup idempotent
+    # and reproducible across restarts while letting recurring transitions that render
+    # to identical text (e.g. a label removed then re-added) stay distinct events.
+    event_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
     return {
         "id": event_id,
         "type": kind,
@@ -488,10 +492,89 @@ def _event(kind: str, severity: str, content: str, key: str, url: str | None) ->
 
 
 def synthetic_event(
-    kind: str, severity: str, content: str, key: str, url: str | None = None
+    kind: str,
+    severity: str,
+    content: str,
+    key: str,
+    identity: str,
+    url: str | None = None,
 ) -> dict:
     """Event the daemon emits itself (e.g. a fetch failure), not from a diff."""
-    return _event(kind, severity, content, key, url)
+    return _event(kind, severity, content, key, url, identity)
+
+
+def _timeline_event(item: dict, key: str, url: str | None, node_id: str) -> dict | None:
+    """Render a recurring transition (label/reviewer/draft/force-push) parsed from a
+    timeline node; identity is the node id so identical-looking repeats stay distinct."""
+    kind = item.get("type")
+    detail = item.get("detail")
+    if kind == "label_added":
+        return _event(
+            "pr_label",
+            "info",
+            f"Label '{detail}' added to {key}.\n{url}",
+            key,
+            url,
+            node_id,
+        )
+    if kind == "label_removed":
+        return _event(
+            "pr_label",
+            "info",
+            f"Label '{detail}' removed from {key}.\n{url}",
+            key,
+            url,
+            node_id,
+        )
+    if kind == "reviewer_requested":
+        return _event(
+            "pr_review_request",
+            "info",
+            f"Review requested from {detail} on {key}.\n{url}",
+            key,
+            url,
+            node_id,
+        )
+    if kind == "reviewer_removed":
+        return _event(
+            "pr_review_request",
+            "info",
+            f"Review request for {detail} was removed on {key}.\n{url}",
+            key,
+            url,
+            node_id,
+        )
+    if kind == "draft":
+        return _event(
+            "pr_draft",
+            "info",
+            f"{key} was converted to a draft.\n{url}",
+            key,
+            url,
+            node_id,
+        )
+    if kind == "ready":
+        return _event(
+            "pr_draft",
+            "info",
+            f"{key} was marked ready for review.\n{url}",
+            key,
+            url,
+            node_id,
+        )
+    if kind == "force_push":
+        before = ((detail or {}).get("before") or "")[:7]
+        after = ((detail or {}).get("after") or "")[:7]
+        return _event(
+            "pr_force_push",
+            "info",
+            f"{key} was force-pushed (history rewritten — rebase/amend/squash); "
+            f"head {before} → {after}.\n{url}",
+            key,
+            url,
+            node_id,
+        )
+    return None
 
 
 def _merged_event(new: dict, key: str) -> dict:
@@ -500,24 +583,24 @@ def _merged_event(new: dict, key: str) -> dict:
         f"{key} was merged by {who}. All subscribers have been unsubscribed and "
         f"polling has stopped.\n{new['url']}"
     )
-    return _event("pr_merged", "high", content, key, new["url"])
+    return _event("pr_merged", "high", content, key, new["url"], f"merged:{key}")
 
 
-def _review_event(r: dict, key: str) -> dict:
+def _review_event(r: dict, key: str, review_id: str) -> dict:
     label = _REVIEW_LABEL.get(r["state"], (r["state"] or "reviewed").lower())
     severity = "high" if r["state"] == "CHANGES_REQUESTED" else "info"
     body = _short(r.get("body"))
     body_part = f"\n{body}" if body else ""
     content = f"Review on {key}: {r['user']} {label}.{body_part}\n{r['url']}"
-    return _event("pr_review", severity, content, key, r["url"])
+    return _event("pr_review", severity, content, key, r["url"], f"review:{review_id}")
 
 
-def _comment_event(c: dict, key: str) -> dict:
+def _comment_event(c: dict, key: str, comment_id: str) -> dict:
     content = f"New comment on {key} by {c['user']}:\n{_short(c['body'])}\n{c['url']}"
-    return _event("pr_comment", "info", content, key, c["url"])
+    return _event("pr_comment", "info", content, key, c["url"], f"comment:{comment_id}")
 
 
-def _inline_comment_event(c: dict, key: str) -> dict:
+def _inline_comment_event(c: dict, key: str, comment_id: str) -> dict:
     path = c.get("path")
     end = c.get("line") or c.get("original_line")
     start = c.get("start_line") or c.get("original_start_line") or end
@@ -538,10 +621,17 @@ def _inline_comment_event(c: dict, key: str) -> dict:
         f"Inline comment on {key} by {c.get('user')} at {loc}:{snippet}\n"
         f"> {_short(c.get('body'))}\n{c.get('url')}"
     )
-    return _event("pr_inline_comment", "info", content, key, c.get("url"))
+    return _event(
+        "pr_inline_comment",
+        "info",
+        content,
+        key,
+        c.get("url"),
+        f"inline_comment:{comment_id}",
+    )
 
 
-def _check_event(ch: dict, key: str) -> dict:
+def _check_event(ch: dict, key: str, check_id: str) -> dict:
     outcome = ch.get("conclusion") or ch.get("status")
     severity = "high" if ch.get("conclusion") in _FAILED_CONCLUSIONS else "info"
     parts = [f"Check '{ch.get('name')}' on {key}: {outcome}."]
@@ -551,7 +641,10 @@ def _check_event(ch: dict, key: str) -> dict:
         parts.append(_short(ch.get("summary"), 600))
     if ch.get("url"):
         parts.append(ch["url"])
-    return _event("pr_check", severity, "\n".join(parts), key, ch.get("url"))
+    # status:conclusion in the identity so each completed transition (and a re-run
+    # landing a different conclusion) is its own event rather than colliding.
+    identity = f"check:{check_id}:{ch.get('status')}:{ch.get('conclusion')}"
+    return _event("pr_check", severity, "\n".join(parts), key, ch.get("url"), identity)
 
 
 def _status_event(ctx: str, s: dict, key: str) -> dict:
@@ -561,7 +654,14 @@ def _status_event(ctx: str, s: dict, key: str) -> dict:
         parts.append(_short(s.get("desc"), 200))
     if s.get("url"):
         parts.append(s["url"])
-    return _event("pr_status", severity, "\n".join(parts), key, s.get("url"))
+    return _event(
+        "pr_status",
+        severity,
+        "\n".join(parts),
+        key,
+        s.get("url"),
+        f"status:{ctx}:{s['state']}",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -599,7 +699,7 @@ class PRTracker:
         return [e for e in self.events if e["id"] not in acked]
 
     def record(self, events: list[dict]) -> list[dict]:
-        """Add not-yet-seen events to memory (content-addressed dedup); return the new ones."""
+        """Add not-yet-seen events to memory (dedup by identity-addressed id); return the new ones."""
         added: list[dict] = []
         for e in events:
             event_id = e.get("id")
@@ -735,9 +835,10 @@ def load_trackers(client) -> list[PRTracker]:
             continue
         t = PRTracker(state["owner"], state["repo"], int(state["number"]), client)
         snapshot = state.get("snapshot")
-        # A snapshot from before the GraphQL switch has a different shape/ID space;
-        # drop it so the next poll re-baselines silently instead of emitting noise.
-        if snapshot is not None and "labels" not in snapshot:
+        # A snapshot from before the timeline-identity switch has a different
+        # shape/ID space; drop it so the next poll re-baselines silently instead of
+        # emitting noise (a burst of timeline facets, or differently-hashed ids).
+        if snapshot is not None and "timeline" not in snapshot:
             snapshot = None
         t.snapshot = snapshot
         t.consecutive_no_update = int(state.get("consecutive_no_update", 0))

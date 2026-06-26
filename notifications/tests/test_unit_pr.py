@@ -1,7 +1,7 @@
 # vim: filetype=python
 """Unit tests for PR monitoring: polling schedule, GitHub error classification,
-GraphQL snapshot + diff, the facet diff rules, content-addressed ids, and the
-split on-disk storage."""
+GraphQL snapshot + diff, the timeline-driven facet diff rules, identity-addressed
+ids, and the split on-disk storage."""
 
 import random
 import time
@@ -360,33 +360,109 @@ class TestSnapshotAndDiff:
 # --------------------------------------------------------------------------- #
 
 
+def _tl(*nodes) -> dict:
+    """A timelineItems connection from positional node dicts."""
+    return {"nodes": list(nodes)}
+
+
+def _labeled(node_id: str, name: str, *, added: bool = True) -> dict:
+    return {
+        "__typename": "LabeledEvent" if added else "UnlabeledEvent",
+        "id": node_id,
+        "label": {"name": name},
+    }
+
+
+def _review_req(node_id: str, login: str, *, requested: bool = True) -> dict:
+    typename = "ReviewRequestedEvent" if requested else "ReviewRequestRemovedEvent"
+    return {
+        "__typename": typename,
+        "id": node_id,
+        "requestedReviewer": {"__typename": "User", "login": login},
+    }
+
+
+def _force_push(node_id: str, before: str, after: str) -> dict:
+    return {
+        "__typename": "HeadRefForcePushedEvent",
+        "id": node_id,
+        "beforeCommit": {"oid": before},
+        "afterCommit": {"oid": after},
+    }
+
+
 class TestFacets:
     def test_labels_added_and_removed(self):
-        base, lbl = gql(), gql(labels={"nodes": [{"name": "bug"}, {"name": "urgent"}]})
-        added = _only(base, lbl, "pr_label")
-        assert len(added) == 2 and all("added" in e["content"] for e in added)
-        removed = _only(lbl, base, "pr_label")
-        assert len(removed) == 2 and all("removed" in e["content"] for e in removed)
+        base = gql()
+        added = gql(timelineItems=_tl(_labeled("L1", "bug"), _labeled("L2", "urgent")))
+        events = _only(base, added, "pr_label")
+        assert len(events) == 2 and all("added" in e["content"] for e in events)
+        # the timeline accumulates: removals are new nodes appended after the adds
+        removed = gql(
+            timelineItems=_tl(
+                _labeled("L1", "bug"),
+                _labeled("L2", "urgent"),
+                _labeled("U1", "bug", added=False),
+                _labeled("U2", "urgent", added=False),
+            )
+        )
+        events = _only(added, removed, "pr_label")
+        assert len(events) == 2 and all("removed" in e["content"] for e in events)
+
+    def test_label_re_add_is_three_distinct_events(self):
+        """Regression: a label added -> removed -> added renders the 1st and 3rd
+        identically, but distinct timeline node ids keep all three as separate,
+        non-deduped events (the bug the identity scheme fixes)."""
+        base = gql()
+        final = gql(
+            timelineItems=_tl(
+                _labeled("L1", "bug"),
+                _labeled("U1", "bug", added=False),
+                _labeled("L2", "bug"),
+            )
+        )
+        events = _only(base, final, "pr_label")
+        assert len(events) == 3
+        assert len({e["id"] for e in events}) == 3  # third add not collapsed onto first
+        assert events[0]["content"] == events[2]["content"]  # identity != content
+        # and record() keeps all three rather than deduping the repeat away
+        added = pm.PRTracker("o", "r", 1, None).record(events)
+        assert len(added) == 3
 
     def test_reviewers_requested_and_removed(self):
         base = gql()
-        rr = gql(
-            reviewRequests={
-                "nodes": [
-                    {"requestedReviewer": {"__typename": "User", "login": "alice"}}
-                ]
-            }
-        )
+        rr = gql(timelineItems=_tl(_review_req("RR1", "alice")))
         assert (
             "requested from alice"
             in _only(base, rr, "pr_review_request")[0]["content"].lower()
         )
-        assert "removed" in _only(rr, base, "pr_review_request")[0]["content"].lower()
+        rrr = gql(
+            timelineItems=_tl(
+                _review_req("RR1", "alice"),
+                _review_req("RRR1", "alice", requested=False),
+            )
+        )
+        assert "removed" in _only(rr, rrr, "pr_review_request")[0]["content"].lower()
 
     def test_draft_toggle_both_ways(self):
-        base, draft = gql(), gql(isDraft=True)
-        assert "draft" in _only(base, draft, "pr_draft")[0]["content"]
-        assert "ready for review" in _only(draft, base, "pr_draft")[0]["content"]
+        base = gql()
+        drafted = gql(
+            timelineItems=_tl(
+                {"__typename": "ConvertToDraftEvent", "id": "D1", "actor": None}
+            )
+        )
+        assert "draft" in _only(base, drafted, "pr_draft")[0]["content"]
+        readied = gql(
+            timelineItems=_tl(
+                {"__typename": "ConvertToDraftEvent", "id": "D1", "actor": None},
+                {
+                    "__typename": "ReadyForReviewEvent",
+                    "id": "RDY1",
+                    "actor": {"login": "alice"},
+                },
+            )
+        )
+        assert "ready for review" in _only(drafted, readied, "pr_draft")[0]["content"]
 
     def test_thread_resolved_and_reopened(self):
         def thread(resolved):
@@ -451,46 +527,48 @@ class TestFacets:
         base = gql()
         forced = gql(
             headRefOid="b" * 40,
-            timelineItems={
-                "nodes": [
-                    {
-                        "__typename": "HeadRefForcePushedEvent",
-                        "createdAt": "t",
-                        "beforeCommit": {"oid": "a" * 40},
-                        "afterCommit": {"oid": "b" * 40},
-                    }
-                ]
-            },
+            timelineItems=_tl(_force_push("FP1", "a" * 40, "b" * 40)),
         )
+        forced_types = _types(base, forced)
         assert "force-pushed" in _only(base, forced, "pr_force_push")[0]["content"]
+        assert (
+            "pr_commits" not in forced_types
+        )  # the force-push subsumes the head change
         pushed = gql(headRefOid="b" * 40)
         assert "New commits pushed" in _only(base, pushed, "pr_commits")[0]["content"]
         assert "pr_force_push" not in _types(base, pushed)
 
 
 # --------------------------------------------------------------------------- #
-# content-addressed ids + storage (Phase 3)
+# identity-addressed ids + storage (Phase 3)
 # --------------------------------------------------------------------------- #
 
 
 class TestContentIdsAndStorage:
-    def test_content_addressed_ids(self):
+    def test_identity_addressed_ids(self):
+        # id tracks the explicit identity, NOT the rendered content:
         a = pm._event(
-            "pr_review", "info", "Review on o/r#1: alice approved.\nu", "o/r#1", "u"
+            "pr_review", "info", "alice approved.\nu", "o/r#1", "u", "review:R1"
         )
         b = pm._event(
-            "pr_review", "info", "Review on o/r#1: alice approved.\nu", "o/r#1", "u"
+            "pr_review", "info", "alice approved.\nu", "o/r#1", "u", "review:R1"
         )
+        # different content, same identity -> same id
         c = pm._event(
-            "pr_review", "info", "Review on o/r#1: bob approved.\nu", "o/r#1", "u"
+            "pr_review", "info", "bob approved.\nu", "o/r#1", "u", "review:R1"
         )
-        assert a["id"] == b["id"] and a["id"] != c["id"] and len(a["id"]) == 16
+        # same content, different identity -> different id
+        d = pm._event(
+            "pr_review", "info", "alice approved.\nu", "o/r#1", "u", "review:R2"
+        )
+        assert a["id"] == b["id"] == c["id"]
+        assert a["id"] != d["id"] and len(a["id"]) == 16
 
     def test_record_dedups_by_id(self):
         tracker = pm.PRTracker("o", "r", 1, None)
-        a = pm._event("pr_review", "info", "same", "o/r#1", "u")
-        b = pm._event("pr_review", "info", "same", "o/r#1", "u")
-        c = pm._event("pr_review", "info", "other", "o/r#1", "u")
+        a = pm._event("pr_review", "info", "same", "o/r#1", "u", "review:R1")
+        b = pm._event("pr_review", "info", "same", "o/r#1", "u", "review:R1")
+        c = pm._event("pr_review", "info", "other", "o/r#1", "u", "review:R2")
         added = tracker.record([a, b, c])
         assert [e["id"] for e in added] == [a["id"], c["id"]]
         assert len(tracker.events) == 2
@@ -498,12 +576,12 @@ class TestContentIdsAndStorage:
     def test_split_storage_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
         tracker = pm.PRTracker("o", "r", 1, None)
-        tracker.snapshot = {"labels": [], "state": "open"}
+        tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
         tracker.consecutive_no_update = 3
         events = tracker.record(
             [
-                pm._event("pr_review", "info", "one", "o/r#1", "u"),
-                pm._event("pr_review", "info", "two", "o/r#1", "u"),
+                pm._event("pr_review", "info", "one", "o/r#1", "u", "review:R1"),
+                pm._event("pr_review", "info", "two", "o/r#1", "u", "review:R2"),
             ]
         )
         pm.save_state(tracker)
@@ -530,19 +608,23 @@ class TestContentIdsAndStorage:
         log = pm._tracker_dir("o/r#1") / "events.jsonl"
         pm.append_events(
             tracker,
-            tracker.record([pm._event("pr_review", "info", "one", "o/r#1", "u")]),
+            tracker.record(
+                [pm._event("pr_review", "info", "one", "o/r#1", "u", "review:R1")]
+            ),
         )
         before = len(log.read_text().splitlines())
         pm.append_events(
             tracker,
-            tracker.record([pm._event("pr_review", "info", "two", "o/r#1", "u")]),
+            tracker.record(
+                [pm._event("pr_review", "info", "two", "o/r#1", "u", "review:R2")]
+            ),
         )
         assert len(log.read_text().splitlines()) == before + 1
 
     def test_next_poll_at_persists(self, tmp_path, monkeypatch):
         monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
         tracker = pm.PRTracker("o", "r", 1, None)
-        tracker.snapshot = {"labels": [], "state": "open"}
+        tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
         tracker.next_poll_at = 1_900_000_000.0  # far future, so a reload won't poll now
         pm.save_state(tracker)
         loaded = {t.key: t for t in pm.load_trackers(None)}["o/r#1"]
