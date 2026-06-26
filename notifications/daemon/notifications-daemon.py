@@ -52,8 +52,6 @@ import pr_schedule  # noqa: E402
 import scheduler  # noqa: E402
 import wsproto  # noqa: E402
 
-# How often each connection re-checks for newly-deliverable notifications.
-DISPATCH_POLL_SECONDS = 2.0
 # A scheduled callback this far past due was held while nothing was connected.
 RECOVERED_THRESHOLD_SECONDS = 30
 # consecutive-no-update level that forces ~max (8h) backoff after an auth failure.
@@ -114,6 +112,7 @@ class Connection:
         self.ws = websocket
         self.session_id: str | None = None
         self.inflight: set[str] = set()  # notification ids sent, awaiting ack
+        self.wake = asyncio.Event()  # set to nudge the dispatch loop to deliver now
 
 
 async def _safe_send(conn: Connection, payload: dict) -> bool:
@@ -124,10 +123,41 @@ async def _safe_send(conn: Connection, payload: dict) -> bool:
         return False
 
 
+def _wake(session_id: str | None) -> None:
+    """Nudge a session's dispatch loop to deliver newly-available notifications.
+    Setting an asyncio.Event is sync and safe to call from anywhere in the loop."""
+    if not session_id:
+        return
+    conn = CONNECTIONS.get(session_id)
+    if conn is not None:
+        conn.wake.set()
+
+
+def _wake_subscribers(tracker: pr_monitor.PRTracker) -> None:
+    """Wake every connected subscriber of a tracker after new events are appended."""
+    for sid in tracker.subscribers:
+        _wake(sid)
+
+
+def _next_callback_timeout(session_id: str, now: float) -> float | None:
+    """Seconds until this session's soonest not-yet-due scheduled callback, so the
+    loop can sleep until it comes due; None if none are pending (wait for a wake)."""
+    upcoming = [
+        float(e.get("due_at", 0.0)) - now for e in scheduler.pending(session_id)
+    ]
+    future = [d for d in upcoming if d > 0]
+    return min(future) if future else None
+
+
 async def _dispatch_loop(conn: Connection) -> None:
-    """Deliver any undelivered notifications (callbacks + PR events) for this session."""
+    """Deliver undelivered notifications (callbacks + PR events) for this session.
+
+    Event-driven: each pass delivers everything currently deliverable, then blocks
+    on the wake event until either new content arrives (_wake) or the soonest
+    not-yet-due scheduled callback comes due. Idle with nothing pending costs zero CPU."""
     while True:
         session_id = conn.session_id
+        timeout: float | None = None
         if session_id:
             now = time.time()
             for entry in scheduler.due_callbacks(session_id, now):
@@ -165,7 +195,12 @@ async def _dispatch_loop(conn: Connection) -> None:
                     if not await _safe_send(conn, payload):
                         return
                     conn.inflight.add(nid)
-        await asyncio.sleep(DISPATCH_POLL_SECONDS)
+            timeout = _next_callback_timeout(session_id, now)
+        try:
+            await asyncio.wait_for(conn.wake.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        conn.wake.clear()
 
 
 async def _handle(websocket) -> None:
@@ -250,6 +285,7 @@ async def _handle_schedule(websocket, conn: Connection, msg: dict) -> None:
     callback_id = scheduler.schedule(
         session_id, time.time() + delay, kind=str(msg.get("kind", "scheduled"))
     )
+    _wake(session_id)  # let the dispatch loop schedule its wake for the new due time
     await _send(
         websocket, wsproto.SCHEDULED, msg, id=callback_id, due_at=time.time() + delay
     )
@@ -328,7 +364,8 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
         tracker.event_ids
     )  # join without replaying old events
     pr_monitor.save_subscriber(tracker, session_id)
-    tracker.wake.set()
+    tracker.wake.set()  # resume polling for this PR
+    _wake(session_id)  # deliver any catch-up / future events immediately
     await _send(
         websocket,
         wsproto.SUBSCRIBED,
@@ -403,6 +440,7 @@ def _remove_tracker(key: str) -> None:
 def _emit(tracker: pr_monitor.PRTracker, event: dict) -> None:
     """Record a daemon-originated event (e.g. gone/auth) and append it to the log."""
     pr_monitor.append_events(tracker, tracker.record([event]))
+    _wake_subscribers(tracker)  # deliver the gone/auth event without waiting
 
 
 async def _wait_or_wake(tracker: pr_monitor.PRTracker, seconds: float) -> None:
@@ -430,6 +468,8 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
         try:
             added = tracker.record(await tracker.poll_once())
             pr_monitor.append_events(tracker, added)
+            if added:
+                _wake_subscribers(tracker)  # deliver new PR events immediately
             tracker.consecutive_no_update = (
                 0 if added else tracker.consecutive_no_update + 1
             )
