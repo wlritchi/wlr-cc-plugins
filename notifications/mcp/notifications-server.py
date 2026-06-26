@@ -253,7 +253,10 @@ class DaemonClient:
             await anyio.sleep(_reconnect_delay(failures))
 
     async def _connect_once(self) -> None:
-        async with connect(wsproto.uri(), open_timeout=5) as ws:
+        headers = {"Authorization": f"Bearer {wsproto.token()}"}
+        async with connect(
+            wsproto.uri(), additional_headers=headers, open_timeout=5
+        ) as ws:
             self._ws = ws
             self._connected_once = True
             await self._register(ws)

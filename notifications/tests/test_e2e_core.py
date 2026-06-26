@@ -8,6 +8,8 @@ import time
 
 import anyio
 import pytest
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 import _harness as h
 import scheduler
@@ -121,6 +123,24 @@ def test_reconnects_when_daemon_appears(tmp_path):
                 assert event is not None and "sid-A" in event.params["content"]
 
     anyio.run(scenario)
+
+
+def test_rejects_unauthenticated_connection(tmp_path):
+    """A raw client with a missing/wrong token is closed immediately (1008)."""
+    store = tmp_path / "store"
+    store.mkdir()
+    ws = h.free_port()
+    uri = f"ws://127.0.0.1:{ws}"
+    with h.daemon_process(h.daemon_env(ws, store)):
+
+        async def scenario():
+            for headers in ({"Authorization": "Bearer wrong"}, None):
+                async with connect(uri, additional_headers=headers) as client:
+                    with pytest.raises(ConnectionClosed):
+                        await client.recv()
+                    assert client.close_code == 1008
+
+        anyio.run(scenario)
 
 
 def scheduler_pending(store, session_id) -> int:

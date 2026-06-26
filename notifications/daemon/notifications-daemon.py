@@ -23,6 +23,7 @@ Run manually or via systemd --user (see ./README.md). The relay never spawns it.
 Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
                NOTIFICATIONS_WS_PORT (default 8137)
                NOTIFICATIONS_DATA_DIR (default ~/.claude/notifications)
+               NOTIFICATIONS_TOKEN (default: auto-created <DATA_DIR>/token)
                GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com)
 """
 
@@ -63,6 +64,9 @@ CONNECTIONS: dict[str, "Connection"] = {}
 # "owner/repo#number" -> PRTracker
 TRACKERS: dict[str, pr_monitor.PRTracker] = {}
 GH: github_client.GitHubClient | None = None
+# Shared secret each relay must present (Authorization: Bearer <token>) to connect.
+# Computed once at startup; relays compute the same value from NOTIFICATIONS_DATA_DIR.
+TOKEN = ""
 
 
 def _now_utc() -> datetime:
@@ -165,6 +169,11 @@ async def _dispatch_loop(conn: Connection) -> None:
 
 
 async def _handle(websocket) -> None:
+    # Auth gate: validate the shared token once, at connect. The connection is
+    # trusted for its lifetime afterwards (we never re-check per message).
+    if websocket.request.headers.get("Authorization") != f"Bearer {TOKEN}":
+        await websocket.close(code=1008, reason="unauthorized")
+        return
     conn = Connection(websocket)
     dispatch_task: asyncio.Task | None = None
     try:
@@ -497,7 +506,8 @@ async def _send(websocket, msg_type: str, request: dict, **fields: object) -> No
 
 
 async def main() -> None:
-    global GH
+    global GH, TOKEN
+    TOKEN = wsproto.token()  # auto-creates <NOTIFICATIONS_DATA_DIR>/token if needed
     GH = github_client.GitHubClient()
     for tracker in pr_monitor.load_trackers(GH):
         TRACKERS[tracker.key] = tracker

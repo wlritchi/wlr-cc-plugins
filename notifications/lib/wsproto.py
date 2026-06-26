@@ -9,6 +9,9 @@ stdlib only (imported by both the asyncio daemon and the anyio MCP server).
 """
 
 import os
+import secrets
+import time
+from pathlib import Path
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8137
@@ -48,3 +51,48 @@ def port() -> int:
 
 def uri() -> str:
     return f"ws://{host()}:{port()}"
+
+
+def _data_dir() -> Path:
+    base = os.environ.get("NOTIFICATIONS_DATA_DIR")
+    return Path(base) if base else Path.home() / ".claude" / "notifications"
+
+
+def token() -> str:
+    """Shared secret authenticating relay->daemon WebSocket connections.
+
+    Returns NOTIFICATIONS_TOKEN if set; otherwise reads (or atomically creates) a
+    token file at <NOTIFICATIONS_DATA_DIR>/token, mode 0600. The daemon and relay
+    compute the same path from NOTIFICATIONS_DATA_DIR, so a local setup agrees with
+    zero configuration. Creation is racy-safe: whoever wins the O_EXCL create writes
+    the secret, the other reads it (retrying briefly while the file is still empty).
+    """
+    env = os.environ.get("NOTIFICATIONS_TOKEN")
+    if env:
+        return env
+    path = _data_dir() / "token"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return _read_token(path)
+    try:
+        value = secrets.token_urlsafe(32)
+        os.write(fd, value.encode())
+    finally:
+        os.close(fd)
+    return value
+
+
+def _read_token(path: Path) -> str:
+    # The O_EXCL create winner may not have written the secret yet; the file exists
+    # but is momentarily empty. Retry briefly rather than return a blank token.
+    for _ in range(100):
+        try:
+            value = path.read_text().strip()
+        except OSError:
+            value = ""
+        if value:
+            return value
+        time.sleep(0.01)
+    return path.read_text().strip()

@@ -12,6 +12,7 @@ import pytest
 import channel_detect as cd
 import scheduler
 import session_state
+import wsproto
 
 DEAD_PID = 2147483647  # never a live pid
 
@@ -68,6 +69,29 @@ def test_scheduler_not_yet_due(tmp_path, monkeypatch):
     scheduler.schedule("sid", time.time() + 1000)
     assert scheduler.due_callbacks("sid", time.time()) == []
     assert len(scheduler.pending("sid")) == 1
+
+
+# --------------------------------------------------------------------------- #
+# wsproto shared token
+# --------------------------------------------------------------------------- #
+
+
+def test_token_autocreates_stable_and_0600(tmp_path, monkeypatch):
+    monkeypatch.delenv("NOTIFICATIONS_TOKEN", raising=False)
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    first = wsproto.token()
+    assert first
+    token_file = tmp_path / "token"
+    assert token_file.read_text().strip() == first
+    assert (token_file.stat().st_mode & 0o777) == 0o600
+    assert wsproto.token() == first  # stable on repeated calls
+
+
+def test_token_env_overrides_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NOTIFICATIONS_TOKEN", "explicit-secret")
+    assert wsproto.token() == "explicit-secret"
+    assert not (tmp_path / "token").exists()  # env path never touches the file
 
 
 # --------------------------------------------------------------------------- #

@@ -36,6 +36,7 @@ It provides two capabilities:
 | `NOTIFICATIONS_WS_HOST`       | `127.0.0.1`               | WebSocket bind/connect host                   |
 | `NOTIFICATIONS_WS_PORT`       | `8137`                    | WebSocket port                                |
 | `NOTIFICATIONS_DATA_DIR`      | `~/.claude/notifications` | Where callbacks and PR state are persisted    |
+| `NOTIFICATIONS_TOKEN`         | auto (`<DATA_DIR>/token`) | Shared secret authenticating relay→daemon     |
 | `GITHUB_TOKEN`                | —                         | Token for PR polling (`gh auth token`)        |
 | `GITHUB_API_URL`              | `https://api.github.com`  | API base (set for GitHub Enterprise / tests)  |
 | `GITHUB_GRAPHQL_URL`          | `{GITHUB_API_URL}/graphql`| GraphQL endpoint (override for Enterprise)    |
@@ -44,6 +45,14 @@ It provides two capabilities:
 The relay reads the same `NOTIFICATIONS_WS_HOST`/`PORT`, so if you change the
 port, set it for both (e.g. in your shell profile, so Claude Code's MCP servers
 inherit it). `GITHUB_TOKEN` only needs to be set for the daemon.
+
+The WebSocket is authenticated with a shared token. By default it is auto-created
+at `<NOTIFICATIONS_DATA_DIR>/token` (mode `0600`) on first use: the daemon and the
+relays both derive the same path from `NOTIFICATIONS_DATA_DIR`, so they share it
+automatically and connections from other local processes are rejected. A systemd
+`--user` daemon plus relays that share `NOTIFICATIONS_DATA_DIR` (the default) need
+no configuration. Set `NOTIFICATIONS_TOKEN` to override the file (it must then be
+set for both the daemon and the relays).
 
 ## Run manually
 
