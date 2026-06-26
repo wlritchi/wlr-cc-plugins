@@ -374,6 +374,23 @@ def test_flush_single_item_keeps_its_kind(relay, monkeypatch):
     assert acked == ["only"]
 
 
+def test_delivery_hint_is_mode_aware(relay):
+    client = relay.DaemonClient()
+
+    client._mode = "push"
+    push_hint = client.delivery_hint()
+    assert "<channel>" in push_hint and "catch_up" not in push_hint
+
+    client._mode = "pull"
+    pull_hint = client.delivery_hint()
+    assert "catch_up" in pull_hint  # pull mode must point the agent at catch_up
+    assert "<channel>" not in pull_hint  # and must not promise channel events
+
+    client._mode = None  # detection unresolved: cover both outcomes
+    detecting_hint = client.delivery_hint()
+    assert "<channel>" in detecting_hint and "catch_up" in detecting_hint
+
+
 def test_debounce_disabled_delivers_immediately(relay, monkeypatch):
     monkeypatch.setenv("NOTIFICATIONS_DEBOUNCE_SECONDS", "0")
     client, delivered, acked = _push_client(relay)

@@ -164,6 +164,22 @@ class DaemonClient:
             "pull": "inactive (not a channel) — call catch_up to pull updates",
         }.get(self._mode or "", "detecting")
 
+    def delivery_hint(self) -> str:
+        """How updates reach the agent, phrased for the current channel mode — so a
+        subscribe confirmation doesn't promise <channel> events to a pull-mode session."""
+        if self._mode == "pull":
+            return (
+                "This session was not loaded as a channel, so updates won't arrive "
+                "automatically — call catch_up to retrieve them."
+            )
+        if self._mode == "push":
+            return "Updates will arrive as <channel> events."
+        # Detection not resolved yet (usually resolves to push); cover both.
+        return (
+            "Updates will arrive as <channel> events, or via the catch_up tool if "
+            "this session turns out not to be a channel."
+        )
+
     async def wait_connected(self, timeout: float = 8.0) -> bool:
         """Wait briefly for the connection (covers startup grace / reconnects)."""
         if self.connected:
@@ -558,7 +574,7 @@ async def subscribe_github_pr(pr: str) -> str:
         return f"Could not subscribe to {owner}/{repo}#{number}: {reply.get('error')}"
     if reply.get("closed"):
         return f"{reply.get('pr')} is already closed/merged ({reply.get('summary')}); not subscribing."
-    return f"Subscribed to {reply.get('pr')}. Current status: {reply.get('summary')}. Updates will arrive as <channel> events."
+    return f"Subscribed to {reply.get('pr')}. Current status: {reply.get('summary')}. {DAEMON.delivery_hint()}"
 
 
 @mcp.tool()
