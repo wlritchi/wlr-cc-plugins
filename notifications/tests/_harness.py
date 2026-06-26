@@ -238,40 +238,84 @@ class FakeGitHub:
     a follow-up query carrying `variables.cursor` returns the next slice of whichever
     connection it targets. Cursors are stringified node offsets."""
 
-    def __init__(self, number: int, pr: dict, *, page_size: int = 100) -> None:
+    def __init__(
+        self,
+        number: int,
+        pr: dict,
+        *,
+        page_size: int = 100,
+        extra: dict[int, dict] | None = None,
+    ) -> None:
         self.number = number
         self.pr = pr
+        # Optional additional PR nodes keyed by number, so one fake (one GraphQL URL)
+        # can serve several PRs at once — the daemon has a single GITHUB_GRAPHQL_URL,
+        # so a session subscribed to two PRs needs them behind the same endpoint.
+        self.extra: dict[int, dict] = dict(extra or {})
         self.page_size = page_size
         self._server: http.server.ThreadingHTTPServer | None = None
+        # Optional fault injection (driven cross-thread from a test). When
+        # fault_status is set, do_POST returns that HTTP status (with any extra
+        # headers, e.g. Retry-After) instead of the normal 200, so tests can exercise
+        # the daemon's error taxonomy (auth / rate-limited / transient). fault_count
+        # None means "until cleared"; an int auto-recovers after that many requests.
+        self.fault_status: int | None = None
+        self.fault_headers: dict[str, str] = {}
+        self.fault_count: int | None = None
 
-    def _first_page(self) -> dict:
+    def set_fault(
+        self,
+        status: int,
+        *,
+        headers: dict[str, str] | None = None,
+        count: int | None = None,
+    ) -> None:
+        """Make the next request(s) fail with `status` (and optional extra `headers`).
+        count=None faults until clear_fault(); an int faults that many requests then
+        auto-recovers."""
+        self.fault_status = status
+        self.fault_headers = dict(headers or {})
+        self.fault_count = count
+
+    def clear_fault(self) -> None:
+        self.fault_status = None
+        self.fault_headers = {}
+        self.fault_count = None
+
+    def _pr_for(self, number: object) -> dict | None:
+        """The live pr node for `number` (primary or one of `extra`), or None."""
+        if number == self.number:
+            return self.pr
+        return self.extra.get(number)  # type: ignore[arg-type]
+
+    def _first_page(self, source: dict) -> dict:
         """The pr node with every paginated connection sliced to its first page."""
-        pr = dict(self.pr)
+        pr = dict(source)
         for conn in ("reviews", "comments", "reviewThreads"):
-            if conn in self.pr:
-                full = (self.pr.get(conn) or {}).get("nodes") or []
+            if conn in source:
+                full = (source.get(conn) or {}).get("nodes") or []
                 pr[conn] = _slice_page(full, 0, self.page_size)
-        contexts = _rollup_contexts(self.pr)
+        contexts = _rollup_contexts(source)
         if contexts is not None:
             full = contexts.get("nodes") or []
             pr["commits"] = _with_sliced_contexts(
-                self.pr, _slice_page(full, 0, self.page_size)
+                source, _slice_page(full, 0, self.page_size)
             )
         return pr
 
-    def _page_response(self, query: str, offset: int) -> dict:
+    def _page_response(self, query: str, offset: int, source: dict) -> dict:
         """The body for a follow-up page query: just its connection at the right path."""
         name = _target_connection(query)
         if name == "contexts":
-            contexts = _rollup_contexts(self.pr) or {}
+            contexts = _rollup_contexts(source) or {}
             full = contexts.get("nodes") or []
             pr = {
                 "commits": _with_sliced_contexts(
-                    self.pr, _slice_page(full, offset, self.page_size)
+                    source, _slice_page(full, offset, self.page_size)
                 )
             }
         elif name in ("reviews", "comments", "reviewThreads"):
-            full = (self.pr.get(name) or {}).get("nodes") or []
+            full = (source.get(name) or {}).get("nodes") or []
             pr = {name: _slice_page(full, offset, self.page_size)}
         else:
             pr = {}
@@ -299,14 +343,35 @@ class FakeGitHub:
                 variables = req.get("variables") or {}
                 number = variables.get("number")
                 cursor = variables.get("cursor")
-                if number != outer.number:
+                if outer.fault_status is not None:
+                    status = outer.fault_status
+                    headers = dict(outer.fault_headers)
+                    if outer.fault_count is not None:
+                        outer.fault_count -= 1
+                        if outer.fault_count <= 0:
+                            outer.clear_fault()  # auto-recover after the burst
+                    body = json.dumps({"message": "fault"}).encode()
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    for name, value in headers.items():
+                        self.send_header(name, value)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                source = outer._pr_for(number)
+                if source is None:
                     payload = {"data": {"repository": {"pullRequest": None}}}
                 elif cursor is None:  # the main query -> first page of every connection
                     payload = {
-                        "data": {"repository": {"pullRequest": outer._first_page()}}
+                        "data": {
+                            "repository": {"pullRequest": outer._first_page(source)}
+                        }
                     }
                 else:  # a follow-up query draining one connection from `cursor`
-                    payload = outer._page_response(req.get("query") or "", int(cursor))
+                    payload = outer._page_response(
+                        req.get("query") or "", int(cursor), source
+                    )
                 body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -365,6 +430,21 @@ async def mcp_await_channel_with(read, needle: str, timeout: float = 20.0):
                 if needle in (root.params.get("content") or ""):
                     return root
     return None
+
+
+async def mcp_await_channel_with_kinds(read, needle: str, timeout: float = 20.0):
+    """Like mcp_await_channel_with, but also return every channel meta `kind` seen while
+    waiting, so a test can assert no unwanted (e.g. terminal) event slipped in first.
+    Returns (event_or_None, [kinds...])."""
+    kinds: list = []
+    with anyio.move_on_after(timeout):
+        async for message in read:
+            root = message.message.root
+            if isinstance(root, JSONRPCNotification) and root.method == CHANNEL_METHOD:
+                kinds.append((root.params.get("meta") or {}).get("kind"))
+                if needle in (root.params.get("content") or ""):
+                    return root, kinds
+    return None, kinds
 
 
 async def mcp_collect_channels(read, kinds: set[str], timeout: float = 20.0) -> dict:
@@ -438,6 +518,7 @@ __all__ = [
     "free_port",
     "mcp_await_channel",
     "mcp_await_channel_with",
+    "mcp_await_channel_with_kinds",
     "mcp_await_response",
     "mcp_call",
     "mcp_collect_channels",

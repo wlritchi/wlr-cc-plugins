@@ -6,10 +6,10 @@ on:
     branches: [main]
 
 jobs:
-  notifications:
-    name: notifications (lint + tests)
+  lint:
+    name: notifications (lint)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,6 +21,26 @@ jobs:
         run: |
           uvx ruff format --check notifications
           uvx ruff check notifications
+
+  test:
+    name: notifications (tests, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    env:
+      # Pin every `uv run` in this job — the test runner AND the daemon/relay
+      # subprocesses it spawns (which inherit the env) — to the matrix interpreter,
+      # so the e2e tests actually exercise this Python version end to end.
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
 
       - name: Run notifications test suite
         run: uv run -qs notifications/tests/run.py -q

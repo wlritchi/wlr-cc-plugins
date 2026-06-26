@@ -264,13 +264,16 @@ def _fake_transport(fake: h.FakeGitHub) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         variables = body.get("variables") or {}
-        if variables.get("number") != fake.number:
+        source = fake._pr_for(variables.get("number"))
+        if source is None:
             payload = {"data": {"repository": {"pullRequest": None}}}
         elif variables.get("cursor") is None:
-            payload = {"data": {"repository": {"pullRequest": fake._first_page()}}}
+            payload = {
+                "data": {"repository": {"pullRequest": fake._first_page(source)}}
+            }
         else:
             payload = fake._page_response(
-                body.get("query") or "", int(variables["cursor"])
+                body.get("query") or "", int(variables["cursor"]), source
             )
         return httpx.Response(
             200, json=payload, headers={"X-RateLimit-Remaining": "4999"}
