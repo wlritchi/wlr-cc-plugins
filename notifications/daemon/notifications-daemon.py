@@ -34,6 +34,7 @@ Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
 # ///
 
 import asyncio
+import hmac
 import json
 import os
 import random
@@ -248,8 +249,10 @@ async def _dispatch_loop(conn: Connection) -> None:
 
 async def _handle(websocket) -> None:
     # Auth gate: validate the shared token once, at connect. The connection is
-    # trusted for its lifetime afterwards (we never re-check per message).
-    if websocket.request.headers.get("Authorization") != f"Bearer {TOKEN}":
+    # trusted for its lifetime afterwards (we never re-check per message). Use a
+    # constant-time compare so a rejected connection's timing can't leak the token.
+    provided = websocket.request.headers.get("Authorization") or ""
+    if not hmac.compare_digest(provided, f"Bearer {TOKEN}"):
         await websocket.close(code=1008, reason="unauthorized")
         return
     conn = Connection(websocket)
