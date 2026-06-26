@@ -14,12 +14,22 @@ Reads GITHUB_TOKEN. The GraphQL endpoint is GITHUB_GRAPHQL_URL (default
 works against GitHub Enterprise and a local fake in tests.
 """
 
+import asyncio
 import os
 import time
+from collections.abc import Awaitable, Callable
 
 import httpx
 
 _USER_AGENT = "wlr-notifications-daemon"
+
+# A brief GitHub blip (5xx / network) shouldn't cost a whole poll interval, so a
+# single fetch is retried in-poll on GitHubTransient only, with exponential backoff
+# (delays of _FETCH_BASE_DELAY * 2**attempt: ~1s, then ~2s for 3 attempts). Auth,
+# not-found, and rate-limited errors are NOT retried — they won't clear in seconds
+# and rate-limiting has its own reset handling in the daemon.
+_FETCH_ATTEMPTS = 3
+_FETCH_BASE_DELAY = 1.0
 
 
 class GitHubError(Exception):
@@ -95,6 +105,31 @@ def api_base() -> str:
 
 def graphql_url() -> str:
     return os.environ.get("GITHUB_GRAPHQL_URL", f"{api_base()}/graphql")
+
+
+async def _retry_transient(
+    fetch: Callable[[], Awaitable[dict]],
+    *,
+    attempts: int = _FETCH_ATTEMPTS,
+    base_delay: float = _FETCH_BASE_DELAY,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> dict:
+    """Call `fetch` up to `attempts` times, retrying ONLY on GitHubTransient with
+    exponential backoff. Any other exception (GitHubAuthError / GitHubNotFound /
+    GitHubRateLimited, ...) propagates immediately. After the final failed attempt
+    the last GitHubTransient is re-raised. `sleep` is injectable so the retry loop
+    is testable without httpx or real delays."""
+    last: GitHubTransient | None = None
+    for attempt in range(attempts):
+        try:
+            return await fetch()
+        except GitHubTransient as exc:
+            last = exc
+            if attempt + 1 >= attempts:
+                break
+            await sleep(base_delay * 2**attempt)
+    assert last is not None  # only reachable after a GitHubTransient was caught
+    raise last
 
 
 class GitHubClient:
@@ -174,7 +209,14 @@ class GitHubClient:
         raise GitHubTransient(message or "graphql error")
 
     async def fetch_pr(self, owner: str, repo: str, number: int) -> dict:
-        """Return the GraphQL pullRequest node, or raise a classified GitHubError."""
+        """Return the GraphQL pullRequest node, or raise a classified GitHubError.
+
+        A single fetch (_fetch_pr_once) is retried in-poll on GitHubTransient only;
+        other classified errors propagate immediately."""
+        return await _retry_transient(lambda: self._fetch_pr_once(owner, repo, number))
+
+    async def _fetch_pr_once(self, owner: str, repo: str, number: int) -> dict:
+        """One fetch + classify attempt. Raises a classified GitHubError on failure."""
         payload = {
             "query": _PR_QUERY,
             "variables": {"owner": owner, "repo": repo, "number": number},

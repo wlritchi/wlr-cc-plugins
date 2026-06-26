@@ -336,6 +336,20 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                 f"conflict:{key}:{head}",
             )
         )
+    # Inverse of pr_conflict: the dirty -> clean transition. Like pr_conflict, the
+    # identity carries the head sha, so a re-resolve on the *same* head can collapse
+    # (the documented residual case for state-transition events).
+    if new["mergeable_state"] == "clean" and old["mergeable_state"] == "dirty":
+        events.append(
+            _event(
+                "pr_conflict_resolved",
+                "info",
+                f"{key}: merge conflicts resolved — it can be merged cleanly again.\n{new['url']}",
+                key,
+                new["url"],
+                f"conflict_resolved:{key}:{head}",
+            )
+        )
     # Recurring facets (labels, reviewers, draft, force-push) come from new timeline
     # nodes: each carries a globally-unique id, so identical-looking transitions stay
     # distinct. A head-sha change not backed by a new force-push node is fresh commits.

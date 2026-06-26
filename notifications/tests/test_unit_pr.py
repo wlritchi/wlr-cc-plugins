@@ -7,6 +7,7 @@ import random
 import time
 from datetime import datetime, timezone
 
+import anyio
 import httpx
 import pytest
 
@@ -159,6 +160,65 @@ class TestErrorClassification:
         assert client.should_throttle(threshold=50) is None
 
 
+class TestFetchRetry:
+    """The in-poll retry wrapper (gc._retry_transient) in isolation from httpx: a
+    fake fetch coroutine we control and an injected no-op sleep keep it instant."""
+
+    def test_retries_transient_then_succeeds(self):
+        calls = {"n": 0}
+        sleeps: list[float] = []
+
+        async def fetch():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise gc.GitHubTransient("blip")
+            return {"ok": calls["n"]}
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        async def scenario():
+            return await gc._retry_transient(fetch, sleep=fake_sleep)
+
+        assert anyio.run(scenario) == {"ok": 3}
+        assert calls["n"] == 3  # two transient failures, then success
+        assert sleeps == [1.0, 2.0]  # exponential backoff between attempts
+
+    def test_persistent_transient_exhausts_and_raises(self):
+        calls = {"n": 0}
+
+        async def fetch():
+            calls["n"] += 1
+            raise gc.GitHubTransient(f"blip {calls['n']}")
+
+        async def fake_sleep(delay):
+            pass
+
+        async def scenario():
+            return await gc._retry_transient(fetch, sleep=fake_sleep)
+
+        with pytest.raises(gc.GitHubTransient):
+            anyio.run(scenario)
+        assert calls["n"] == gc._FETCH_ATTEMPTS  # gave up after the configured attempts
+
+    def test_non_transient_is_not_retried(self):
+        calls = {"n": 0}
+
+        async def fetch():
+            calls["n"] += 1
+            raise gc.GitHubNotFound("gone")
+
+        async def fake_sleep(delay):
+            pass
+
+        async def scenario():
+            return await gc._retry_transient(fetch, sleep=fake_sleep)
+
+        with pytest.raises(gc.GitHubNotFound):
+            anyio.run(scenario)
+        assert calls["n"] == 1  # auth/not-found/rate-limited propagate immediately
+
+
 # --------------------------------------------------------------------------- #
 # snapshot + diff
 # --------------------------------------------------------------------------- #
@@ -294,6 +354,18 @@ class TestSnapshotAndDiff:
     def test_merge_conflict_high(self):
         event = _only(gql(), gql(mergeable="CONFLICTING"), "pr_conflict")[0]
         assert event["meta"]["severity"] == "high"
+
+    def test_conflict_resolved_on_dirty_to_clean(self):
+        dirty = gql(mergeable="CONFLICTING")
+        clean = gql(mergeable="MERGEABLE")
+        # dirty -> clean fires the (info) inverse of pr_conflict ...
+        event = _only(dirty, clean, "pr_conflict_resolved")[0]
+        assert event["meta"]["severity"] == "info"
+        assert "resolved" in event["content"]
+        # ... while clean -> clean and dirty -> dirty stay silent. (Like pr_conflict,
+        # a re-resolve on the same head can collapse — documented residual case.)
+        assert "pr_conflict_resolved" not in _types(clean, clean)
+        assert "pr_conflict_resolved" not in _types(dirty, dirty)
 
     def test_merged_is_terminal(self):
         merged = gql(
