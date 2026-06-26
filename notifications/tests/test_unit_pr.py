@@ -3,9 +3,13 @@
 GraphQL snapshot + diff, the timeline-driven facet diff rules, identity-addressed
 ids, and the split on-disk storage."""
 
+import asyncio
+import importlib.util
+import json
 import random
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import anyio
 import httpx
@@ -710,3 +714,141 @@ class TestContentIdsAndStorage:
         assert directory.exists()
         pm.delete_tracker("o/r#1")
         assert not directory.exists()
+
+
+# --------------------------------------------------------------------------- #
+# truncation accounting: per-subscriber "missed while away" count (Phase 4)
+# --------------------------------------------------------------------------- #
+
+
+class TestMissedOnCompaction:
+    def _events(self, n: int) -> list[dict]:
+        return [
+            pm._event("pr_comment", "info", f"c{i}", "o/r#1", "u", f"comment:{i}")
+            for i in range(n)
+        ]
+
+    def test_missed_counts_only_unacked_dropped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(pm, "MAX_CACHED_EVENTS", 3)
+        tracker = pm.PRTracker("o", "r", 1, None)
+        events = self._events(6)  # cap 3 -> events 0,1,2 are the ones dropped
+        added = tracker.record(events)
+        # subA acked the two oldest (both dropped); subB acked everything.
+        tracker.subscribers.update({"subA", "subB"})
+        tracker.acked["subA"] = {events[0]["id"], events[1]["id"]}
+        tracker.acked["subB"] = {e["id"] for e in events}
+        pm.append_events(tracker, added)  # crosses the cap -> compaction
+        assert len(tracker.events) == 3
+        # subA missed only event 2 (the one dropped that it had not acked)
+        assert tracker.missed["subA"] == 1
+        # subB had acked all dropped events -> nothing genuinely missed
+        assert tracker.missed["subB"] == 0
+        # a subscriber that wasn't around for the drop has no missed count
+        assert tracker.missed.get("subLater", 0) == 0
+
+    def test_missed_accumulates_across_compactions(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(pm, "MAX_CACHED_EVENTS", 3)
+        tracker = pm.PRTracker("o", "r", 1, None)
+        tracker.subscribers.add("subA")
+        tracker.acked["subA"] = set()  # never acks anything
+        for batch in range(2):
+            batch_events = [
+                pm._event("pr_comment", "info", "x", "o/r#1", "u", f"b{batch}:{i}")
+                for i in range(4)
+            ]
+            pm.append_events(tracker, tracker.record(batch_events))
+        # 8 events total, cap 3 -> 5 dropped, none acked -> missed 5
+        assert tracker.missed["subA"] == 5
+
+    def test_subscriber_missed_persist_and_backward_compat(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        tracker = pm.PRTracker("o", "r", 1, None)
+        tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
+        pm.save_state(tracker)
+        event = pm._event("pr_comment", "info", "c", "o/r#1", "u", "comment:1")
+        pm.append_events(tracker, tracker.record([event]))
+        tracker.subscribers.add("sidA")
+        tracker.acked["sidA"] = {event["id"]}
+        tracker.missed["sidA"] = 4
+        pm.save_subscriber(tracker, "sidA")
+        # a subscriber file written before `missed` existed must still load (as 0)
+        (pm._tracker_dir("o/r#1") / "sub-sidB.json").write_text(
+            json.dumps({"session_id": "sidB", "acked": [event["id"]]})
+        )
+
+        loaded = {t.key: t for t in pm.load_trackers(None)}["o/r#1"]
+        assert loaded.missed["sidA"] == 4 and loaded.acked["sidA"] == {event["id"]}
+        assert loaded.missed["sidB"] == 0  # absent in the legacy file -> default
+
+
+# --------------------------------------------------------------------------- #
+# daemon-level: truncation notice delivery + ack routing (Phase 4)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def daemon():
+    path = Path(__file__).resolve().parent.parent / "daemon" / "notifications-daemon.py"
+    spec = importlib.util.spec_from_file_location("notifications_daemon", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeWS:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, data: str) -> None:
+        self.sent.append(json.loads(data))
+
+
+def test_truncation_notice_delivered_once_then_ack_resets(
+    daemon, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+    key, sid = "o/r#1", "sidA"
+    trunc_id = f"trunc:{key}:{sid}"
+    tracker = pm.PRTracker("o", "r", 1, None)
+    tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
+    tracker.subscribers.add(sid)
+    tracker.acked[sid] = set()
+    tracker.missed[sid] = 3
+    pm.save_state(tracker)
+    pm.save_subscriber(tracker, sid)  # on-disk subscriber file for the reload check
+    monkeypatch.setitem(daemon.TRACKERS, key, tracker)
+
+    async def scenario():
+        ws = _FakeWS()
+        conn = daemon.Connection(ws)
+        conn.session_id = sid
+        task = asyncio.create_task(daemon._dispatch_loop(conn))
+        for _ in range(200):  # let one delivery pass run, then it blocks on its wake
+            if ws.sent:
+                break
+            await asyncio.sleep(0.01)
+        conn.wake.set()  # nudge a second pass: the inflight guard must dedup it
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return ws, conn
+
+    ws, conn = anyio.run(scenario)
+    trunc = [m for m in ws.sent if m["id"] == trunc_id]
+    assert len(trunc) == 1  # delivered exactly once despite the second pass
+    assert trunc[0]["meta"]["kind"] == "pr_truncated"
+    assert trunc[0]["meta"]["severity"] == "high"
+    assert "3 earlier update" in trunc[0]["content"]
+    assert trunc_id in conn.inflight
+
+    daemon._handle_ack(conn, {"id": trunc_id})  # ack clears counter + inflight
+    assert tracker.missed[sid] == 0
+    assert trunc_id not in conn.inflight
+    # persisted reset survives a reload
+    loaded = {t.key: t for t in pm.load_trackers(None)}[key]
+    assert loaded.missed[sid] == 0

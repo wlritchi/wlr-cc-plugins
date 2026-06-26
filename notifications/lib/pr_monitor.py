@@ -694,6 +694,7 @@ class PRTracker:
         self.client = client
         self.subscribers: set[str] = set()
         self.acked: dict[str, set[str]] = {}  # session id -> set of acked event ids
+        self.missed: dict[str, int] = {}  # session id -> count of dropped-while-unacked
         self.events: list[dict] = []
         self.event_ids: set[str] = set()
         self.snapshot: dict | None = None
@@ -804,6 +805,14 @@ def append_events(t: PRTracker, events: list[dict]) -> None:
         for e in events:
             f.write(json.dumps(e) + "\n")
     if len(t.events) > MAX_CACHED_EVENTS:
+        # Before trimming, record per-subscriber how many of the events about to be
+        # dropped were never acked by that subscriber — those are genuinely lost, so
+        # the daemon can surface a "history truncated" notice on (re)connect.
+        dropped_ids = {e["id"] for e in t.events[:-MAX_CACHED_EVENTS]}
+        for sid in list(t.acked):
+            t.missed[sid] = t.missed.get(sid, 0) + len(
+                dropped_ids - t.acked.get(sid, set())
+            )
         t.events = t.events[-MAX_CACHED_EVENTS:]
         t.event_ids = {e["id"] for e in t.events}
         _atomic_write(
@@ -811,14 +820,18 @@ def append_events(t: PRTracker, events: list[dict]) -> None:
         )
         for sid in list(t.acked):  # drop acked ids for events that fell out of the log
             t.acked[sid] &= t.event_ids
-            save_subscriber(t, sid)
+            save_subscriber(t, sid)  # persists the bumped missed count too
 
 
 def save_subscriber(t: PRTracker, session_id: str) -> None:
     _atomic_write(
         _tracker_dir(t.key) / f"sub-{_safe(session_id)}.json",
         json.dumps(
-            {"session_id": session_id, "acked": sorted(t.acked.get(session_id, set()))}
+            {
+                "session_id": session_id,
+                "acked": sorted(t.acked.get(session_id, set())),
+                "missed": t.missed.get(session_id, 0),
+            }
         ),
     )
 
@@ -888,5 +901,6 @@ def load_trackers(client) -> list[PRTracker]:
             if session_id:
                 t.subscribers.add(session_id)
                 t.acked[session_id] = set(sub.get("acked", []))
+                t.missed[session_id] = int(sub.get("missed", 0))  # absent -> 0 (compat)
         trackers.append(t)
     return trackers

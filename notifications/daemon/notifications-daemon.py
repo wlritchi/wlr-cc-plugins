@@ -178,6 +178,34 @@ async def _dispatch_loop(conn: Connection) -> None:
             for tracker in list(TRACKERS.values()):
                 if session_id not in tracker.subscribers:
                     continue
+                # If events were dropped from the cache while this subscriber was
+                # away, surface a one-time "history truncated" notice ahead of the
+                # surviving events, so they know to check the PR for what was lost.
+                missed = tracker.missed.get(session_id, 0)
+                trunc_id = f"trunc:{tracker.key}:{session_id}"
+                if missed > 0 and trunc_id not in conn.inflight:
+                    content = (
+                        f"⚠️ {tracker.key}: {missed} earlier update(s) were dropped "
+                        "from the cache before they reached you (the PR was very "
+                        "active while this session was away). Check the PR directly "
+                        "for anything important."
+                    )
+                    meta = {
+                        "severity": "high",
+                        "kind": "pr_truncated",
+                        "pr": tracker.key,
+                    }
+                    if not await _safe_send(
+                        conn,
+                        {
+                            "type": wsproto.NOTIFY,
+                            "id": trunc_id,
+                            "content": content,
+                            "meta": meta,
+                        },
+                    ):
+                        return
+                    conn.inflight.add(trunc_id)
                 acked = tracker.acked.get(session_id, set())
                 for event in tracker.events:
                     event_id = event["id"]
@@ -295,7 +323,17 @@ def _handle_ack(conn: Connection, msg: dict) -> None:
     nid = msg.get("id")
     if not nid:
         return
-    if isinstance(nid, str) and nid.startswith("pr:"):
+    if isinstance(nid, str) and nid.startswith("trunc:"):
+        # trunc:{key}:{sid} — key holds '/' and '#' but never ':', so rpartition on
+        # ':' cleanly splits the trailing session id off the key. Acking the notice
+        # clears the missed counter until the next truncation drops more events.
+        key, _, session_id = nid[len("trunc:") :].rpartition(":")
+        tracker = TRACKERS.get(key)
+        if tracker is not None and session_id in tracker.subscribers:
+            tracker.missed[session_id] = 0
+            pr_monitor.save_subscriber(tracker, session_id)
+        conn.inflight.discard(nid)
+    elif isinstance(nid, str) and nid.startswith("pr:"):
         key, _, event_id = nid[3:].rpartition(":")
         tracker = TRACKERS.get(key)
         if tracker is not None and conn.session_id and conn.session_id in tracker.acked:
@@ -363,6 +401,7 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
     tracker.acked[session_id] = set(
         tracker.event_ids
     )  # join without replaying old events
+    tracker.missed[session_id] = 0  # caught up by definition; no truncation to report
     pr_monitor.save_subscriber(tracker, session_id)
     tracker.wake.set()  # resume polling for this PR
     _wake(session_id)  # deliver any catch-up / future events immediately
@@ -384,6 +423,7 @@ def _handle_unsubscribe(conn: Connection, msg: dict) -> None:
     if tracker is not None and session_id in tracker.subscribers:
         tracker.subscribers.discard(session_id)
         tracker.acked.pop(session_id, None)
+        tracker.missed.pop(session_id, None)
         pr_monitor.delete_subscriber(tracker, session_id)
         if not tracker.subscribers:
             _remove_tracker(key)
@@ -412,6 +452,7 @@ def _finalize_terminal(tracker: pr_monitor.PRTracker, session_id: str) -> None:
     ):
         tracker.subscribers.discard(session_id)
         tracker.acked.pop(session_id, None)
+        tracker.missed.pop(session_id, None)
         pr_monitor.delete_subscriber(tracker, session_id)
         if not tracker.subscribers:
             _remove_tracker(tracker.key)
