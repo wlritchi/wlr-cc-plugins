@@ -539,6 +539,15 @@ class TestContentIdsAndStorage:
         )
         assert len(log.read_text().splitlines()) == before + 1
 
+    def test_next_poll_at_persists(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        tracker = pm.PRTracker("o", "r", 1, None)
+        tracker.snapshot = {"labels": [], "state": "open"}
+        tracker.next_poll_at = 1_900_000_000.0  # far future, so a reload won't poll now
+        pm.save_state(tracker)
+        loaded = {t.key: t for t in pm.load_trackers(None)}["o/r#1"]
+        assert loaded.next_poll_at == 1_900_000_000.0
+
     def test_delete_tracker_removes_dir(self, tmp_path, monkeypatch):
         monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
         tracker = pm.PRTracker("o", "r", 1, None)

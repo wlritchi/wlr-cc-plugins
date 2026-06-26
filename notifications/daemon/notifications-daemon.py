@@ -294,6 +294,9 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
             )
             return
         TRACKERS[key] = tracker
+        tracker.next_poll_at = time.time() + _poll_delay(
+            tracker
+        )  # baseline done; schedule first real poll
         pr_monitor.save_state(tracker)
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
     else:
@@ -393,12 +396,26 @@ def _emit(tracker: pr_monitor.PRTracker, event: dict) -> None:
     pr_monitor.append_events(tracker, tracker.record([event]))
 
 
+async def _wait_or_wake(tracker: pr_monitor.PRTracker, seconds: float) -> None:
+    try:
+        await asyncio.wait_for(tracker.wake.wait(), timeout=max(0.2, seconds))
+        tracker.wake.clear()
+    except asyncio.TimeoutError:
+        pass
+
+
 async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
     """Poll a PR while at least one subscriber is connected; suspend otherwise."""
     while True:
         if not any(s in CONNECTIONS for s in tracker.subscribers):
             tracker.wake.clear()
             await tracker.wake.wait()  # resumed when a subscribed session reconnects
+            continue
+        # Honor the persisted next-poll time, so a daemon restart or flap doesn't
+        # stampede GitHub: each tracker waits out the remainder of its backoff.
+        due_in = (tracker.next_poll_at or 0) - time.time()
+        if due_in > 0:
+            await _wait_or_wake(tracker, due_in)
             continue
         delay: float | None = None
         try:
@@ -454,10 +471,6 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             )
             tracker.consecutive_no_update += 1
 
-        pr_monitor.save_state(tracker)
-        if tracker.terminal:  # merged: deliver the final event, then stop polling
-            return
-
         if delay is None:
             delay = _poll_delay(tracker)
             throttle_until = GH.should_throttle() if GH is not None else None
@@ -465,11 +478,10 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
                 delay = max(
                     delay, throttle_until - time.time() + random.uniform(1.0, 15.0)
                 )
-        try:
-            await asyncio.wait_for(tracker.wake.wait(), timeout=max(0.2, delay))
-            tracker.wake.clear()
-        except asyncio.TimeoutError:
-            pass
+        tracker.next_poll_at = time.time() + delay
+        pr_monitor.save_state(tracker)
+        if tracker.terminal:  # merged: deliver the final event, then stop polling
+            return
 
 
 async def _send(websocket, msg_type: str, request: dict, **fields: object) -> None:

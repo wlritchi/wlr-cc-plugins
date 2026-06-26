@@ -584,6 +584,9 @@ class PRTracker:
         self.event_ids: set[str] = set()
         self.snapshot: dict | None = None
         self.consecutive_no_update = 0
+        self.next_poll_at: float | None = (
+            None  # persisted, so a restart doesn't stampede
+        )
         self.merged = False
         self.terminal = False  # merged or gone: stop polling, unsubscribe on ack
         self.terminal_id: str | None = None
@@ -667,6 +670,7 @@ def save_state(t: PRTracker) -> None:
                 "number": t.number,
                 "snapshot": t.snapshot,
                 "consecutive_no_update": t.consecutive_no_update,
+                "next_poll_at": t.next_poll_at,
                 "merged": t.merged,
                 "terminal": t.terminal,
                 "terminal_id": t.terminal_id,
@@ -737,6 +741,7 @@ def load_trackers(client) -> list[PRTracker]:
             snapshot = None
         t.snapshot = snapshot
         t.consecutive_no_update = int(state.get("consecutive_no_update", 0))
+        t.next_poll_at = state.get("next_poll_at")
         t.merged = bool(state.get("merged"))
         t.terminal = bool(state.get("terminal"))
         t.terminal_id = state.get("terminal_id")
