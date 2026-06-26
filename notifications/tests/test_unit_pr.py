@@ -865,6 +865,37 @@ def _green_checks(conclusion: str, head: str = "a" * 40) -> dict:
     )
 
 
+def _status_ctx(state: str, head: str = "a" * 40) -> dict:
+    """A snapshot whose single legacy StatusContext lands `state` on `head`."""
+    return gql(
+        headRefOid=head,
+        commits={
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": head,
+                        "statusCheckRollup": {
+                            "state": state,
+                            "contexts": {
+                                "nodes": [
+                                    {
+                                        "__typename": "StatusContext",
+                                        "id": "S1",
+                                        "context": "ci/legacy",
+                                        "state": state,
+                                        "targetUrl": "u",
+                                        "description": "d",
+                                    }
+                                ]
+                            },
+                        },
+                    }
+                }
+            ]
+        },
+    )
+
+
 class TestTransitionEpochs:
     def test_same_head_conflict_flap_stays_distinct(self):
         """Core fix: a mergeability flap on ONE head — clean -> dirty (A) -> clean
@@ -940,6 +971,59 @@ class TestTransitionEpochs:
 
         assert a["type"] == b["type"] == "pr_checks_green"
         assert a["id"] != b["id"]
+
+    def test_same_thread_resolve_flap_stays_distinct(self):
+        """A review thread resolved -> reopened -> resolved on the SAME thread id
+        emits two distinct pr_thread events instead of colliding on
+        thread:tid:resolved (the thread id is reused, so it needs the epoch)."""
+
+        def thread(resolved):
+            return gql(
+                reviewThreads={
+                    "nodes": [
+                        {
+                            "id": "T1",
+                            "isResolved": resolved,
+                            "path": "x.py",
+                            "line": 12,
+                            "startLine": None,
+                            "comments": {"nodes": []},
+                        }
+                    ]
+                }
+            )
+
+        open0, resolved1, open2, resolved3 = (
+            thread(False),
+            thread(True),
+            thread(False),
+            thread(True),
+        )
+        a = _only(open0, resolved1, "pr_thread")[0]
+        _only(resolved1, open2, "pr_thread")  # thread the reopen (carries the epoch)
+        b = _only(open2, resolved3, "pr_thread")[0]
+
+        assert "resolved" in a["content"] and "resolved" in b["content"]
+        assert a["id"] != b["id"]  # the two same-thread resolves are now distinct
+        assert len(pm.PRTracker("o", "r", 1, None).record([a, b])) == 2
+
+    def test_same_context_status_flap_stays_distinct(self):
+        """A legacy StatusContext flapping success -> failure -> success on the same
+        context name emits two distinct pr_status success events rather than colliding
+        on status:ctx:state (the context name is reused)."""
+        bad0, ok1, bad2, ok3 = (
+            _status_ctx("FAILURE"),
+            _status_ctx("SUCCESS"),
+            _status_ctx("FAILURE"),
+            _status_ctx("SUCCESS"),
+        )
+        a = _only(bad0, ok1, "pr_status")[0]  # failure -> success (A)
+        _only(ok1, bad2, "pr_status")  # success -> failure (carries the epoch)
+        b = _only(bad2, ok3, "pr_status")[0]  # failure -> success (B)
+
+        assert "success" in a["content"] and "success" in b["content"]
+        assert a["id"] != b["id"]  # same ctx+state, distinct via the epoch
+        assert len(pm.PRTracker("o", "r", 1, None).record([a, b])) == 2
 
 
 # --------------------------------------------------------------------------- #

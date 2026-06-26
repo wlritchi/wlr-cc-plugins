@@ -408,9 +408,10 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
     for cid, c in new["review_comments"].items():
         if cid not in old["review_comments"]:
             events.append(_inline_comment_event(c, key, cid))
-    # Thread resolve/unresolve has no timeline event, so it stays a set-diff with a
-    # resolved-state-encoded identity. Recurring resolve/unresolve of the *same*
-    # thread back to a prior state can still collapse — acceptable, and rare.
+    # Thread resolve/unresolve has no timeline event, so it stays a set-diff keyed on
+    # the (reused) thread id. The monotonic "thread" counter folded into the identity
+    # keeps a same-thread resolve->reopen->resolve flap distinct instead of collapsing
+    # the second resolve onto the first (rare, but it happens).
     for tid, th in (new.get("review_threads") or {}).items():
         prev = (old.get("review_threads") or {}).get(tid)
         if prev is not None and prev.get("resolved") != th.get("resolved"):
@@ -421,6 +422,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             )
             resolved = bool(th.get("resolved"))
             state = "resolved" if resolved else "reopened (unresolved)"
+            epochs["thread"] = epochs.get("thread", 0) + 1
             events.append(
                 _event(
                     "pr_thread",
@@ -428,7 +430,7 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
                     f"A review thread on {key} ({loc}) was {state}.\n{new['url']}",
                     key,
                     new["url"],
-                    f"thread:{tid}:{resolved}",
+                    f"thread:{tid}:{resolved}:{epochs['thread']}",
                 )
             )
     for cid, c in new["issue_comments"].items():
@@ -469,12 +471,15 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
     else:
         for chid, ch in green_completions:
             events.append(_check_event(ch, key, chid))
+    # Legacy StatusContexts are keyed on the (reused) context name, so the monotonic
+    # "status" counter keeps a same-context success->failure->success flap distinct.
     for ctx, s in new["statuses"].items():
         prev = old["statuses"].get(ctx)
         if s["state"] in ("success", "failure", "error") and (
             prev is None or prev.get("state") != s["state"]
         ):
-            events.append(_status_event(ctx, s, key))
+            epochs["status"] = epochs.get("status", 0) + 1
+            events.append(_status_event(ctx, s, key, epochs["status"]))
     # The all-green recovery carries its own monotonic "green" counter so a check
     # re-run flapping green->fail->green on the *same* head emits each recovery as a
     # distinct event instead of colliding on one head-keyed id.
@@ -739,20 +744,22 @@ def _checks_summary_event(green: list[tuple[str, dict]], new: dict, key: str) ->
     return _event("pr_checks_summary", "info", content, key, url, identity)
 
 
-def _status_event(ctx: str, s: dict, key: str) -> dict:
+def _status_event(ctx: str, s: dict, key: str, epoch: int) -> dict:
     severity = "high" if s["state"] in ("failure", "error") else "info"
     parts = [f"Status '{ctx}' on {key}: {s['state']}."]
     if s.get("desc"):
         parts.append(_short(s.get("desc"), 200))
     if s.get("url"):
         parts.append(s["url"])
+    # epoch (a monotonic per-poll counter from diff()) makes a same-context
+    # success->failure->success flap distinct rather than colliding on ctx+state.
     return _event(
         "pr_status",
         severity,
         "\n".join(parts),
         key,
         s.get("url"),
-        f"status:{ctx}:{s['state']}",
+        f"status:{ctx}:{s['state']}:{epoch}",
     )
 
 
