@@ -115,9 +115,17 @@ def seed_channel_log(
         if registered
         else "Channel notifications skipped: server not in --channels list for this session"
     )
-    (directory / "2026-01-01T00-00-00-000Z.jsonl").write_text(
-        json.dumps({"message": marker}) + "\n"
-    )
+    log = directory / "2026-01-01T00-00-00-000Z.jsonl"
+    log.write_text(json.dumps({"message": marker}) + "\n")
+    # The relay only trusts a channel-detection log whose mtime is within a few
+    # seconds of its own startup (mirroring how Claude Code writes this log just
+    # *after* spawning the MCP server). We seed it *before* spawning the relay, so
+    # under heavy load a slow `uv run` boot could otherwise push the relay's detect
+    # clock far enough past the seed time to make the log look stale — flipping it
+    # to pull mode and dropping the pushed event the e2e tests await. Stamp the mtime
+    # forward so the log stays fresh regardless of how long the relay takes to boot.
+    future = time.time() + 3600
+    os.utime(log, (future, future))
 
 
 def push_relay_env(
