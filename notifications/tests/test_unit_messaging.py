@@ -1,0 +1,345 @@
+# vim: filetype=python
+"""Unit tests for the Phase B message core: the attention-model helpers
+(``messaging``) and the topic primitive plus persistence (``message_topic``).
+
+The clock is injected via explicit ``now`` values and storage goes through
+``tmp_path``; nothing here spawns a daemon, touches wall-clock time, or mocks.
+"""
+
+from pathlib import Path
+
+import pytest
+
+import message_topic as mt
+import messaging as m
+from message_topic import Message, MessageTopic
+
+# --------------------------------------------------------------------------- #
+# messaging: levels / thresholds / surfacing
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "severity, addressed, expected",
+    [
+        ("high", True, "urgent"),  # @here always wins
+        ("high", False, "urgent"),
+        ("normal", True, "direct"),  # addressed but not loud
+        ("normal", False, "ambient"),  # neither
+        ("low", True, "direct"),  # only "high" is urgent
+        ("low", False, "ambient"),
+    ],
+)
+def test_compute_level_matrix(severity: str, addressed: bool, expected: str) -> None:
+    assert m.compute_level(severity=severity, addressed=addressed) == expected
+
+
+def test_should_surface_full_matrix() -> None:
+    levels = {"ambient": 0, "direct": 1, "urgent": 2}
+    thresholds = {"all": 0, "direct": 1, "urgent": 2}
+    for level, lo in levels.items():
+        for threshold, to in thresholds.items():
+            assert m.should_surface(level, threshold) is (lo >= to), (
+                level,
+                threshold,
+            )
+
+
+def test_should_surface_edges() -> None:
+    # `all` admits everything; `urgent` admits only an urgent message.
+    assert all(m.should_surface(lv, "all") for lv in ("ambient", "direct", "urgent"))
+    assert m.should_surface("urgent", "urgent") is True
+    assert m.should_surface("direct", "urgent") is False
+    assert m.should_surface("ambient", "urgent") is False
+
+
+@pytest.mark.parametrize(
+    "override, default, expected",
+    [
+        (None, "direct", "direct"),
+        ("urgent", "direct", "urgent"),
+        ("all", "urgent", "all"),
+        ("", "direct", "direct"),  # empty override falls through to default
+    ],
+)
+def test_effective_threshold(override: str | None, default: str, expected: str) -> None:
+    assert m.effective_threshold(override, default) == expected
+
+
+def test_intents_set() -> None:
+    assert m.INTENTS == frozenset({"fyi", "question", "request", "reply"})
+    assert "reaction" not in m.INTENTS  # Phase C
+
+
+# --------------------------------------------------------------------------- #
+# messaging: keys + validation
+# --------------------------------------------------------------------------- #
+
+
+def test_dm_key_sorts_dedups_and_is_order_independent() -> None:
+    assert m.dm_key(["b", "a"]) == "dm:a,b"
+    assert m.dm_key(["a", "b", "a"]) == "dm:a,b"  # dedupe
+    assert m.dm_key(["b", "a"]) == m.dm_key(["a", "b"])  # order independent
+    assert m.dm_key(["solo"]) == "dm:solo"
+
+
+def test_channel_key() -> None:
+    assert m.channel_key("general") == "chan:general"
+    with pytest.raises(m.InvalidChannelName):
+        m.channel_key("Bad Name")
+
+
+@pytest.mark.parametrize("good", ["ab", "a1", "my-chan", "a-b-c", "x" * 64])
+def test_valid_channel_names(good: str) -> None:
+    m.validate_channel_name(good)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "a", "-x", "x-", "UP", "has space", "naïve", "x" * 65, "a_b"],
+)
+def test_invalid_channel_names(bad: str) -> None:
+    with pytest.raises(m.InvalidChannelName):
+        m.validate_channel_name(bad)
+
+
+@pytest.mark.parametrize("good", ["all", "direct", "urgent"])
+def test_valid_thresholds(good: str) -> None:
+    m.validate_threshold(good)  # must not raise
+
+
+@pytest.mark.parametrize("bad", ["loud", "ALL", "", "high", "ambient"])
+def test_invalid_thresholds(bad: str) -> None:
+    with pytest.raises(m.InvalidThreshold):
+        m.validate_threshold(bad)
+
+
+def test_exception_hierarchy() -> None:
+    for exc in (m.InvalidChannelName, m.InvalidThreshold):
+        assert issubclass(exc, m.MessagingError)
+    assert issubclass(m.MessagingError, ValueError)
+
+
+# --------------------------------------------------------------------------- #
+# Message dataclass
+# --------------------------------------------------------------------------- #
+
+
+def test_message_round_trip_and_mentions_as_list() -> None:
+    msg = Message(
+        id="msg:chan:x:0",
+        seq=0,
+        sender="s1",
+        body="hi",
+        intent="question",
+        severity="high",
+        mentions=("a", "b"),
+        created_at=12.5,
+    )
+    d = msg.to_dict()
+    assert isinstance(d["mentions"], list) and d["mentions"] == ["a", "b"]
+    back = Message.from_dict(d)
+    assert back == msg
+    assert isinstance(back.mentions, tuple)  # tuple in memory
+
+
+def test_message_defaults() -> None:
+    msg = Message(id="i", seq=3, sender="s", body="b")
+    assert msg.intent == "fyi"
+    assert msg.severity == "normal"
+    assert msg.mentions == ()
+    assert msg.created_at == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# MessageTopic: membership / posting / history / reaping
+# --------------------------------------------------------------------------- #
+
+
+def _post(topic: MessageTopic, sender: str, now: float, body: str = "x") -> Message:
+    return topic.post(
+        sender, now=now, body=body, intent="fyi", severity="normal", mentions=()
+    )
+
+
+def test_join_seeds_acked_to_all_current_ids_no_replay() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    a = _post(topic, "s1", now=1.0)
+    b = _post(topic, "s1", now=2.0)
+    topic.join("reader", now=3.0)
+    # Everything that existed at join time is pre-acked: no replay, no wake.
+    assert topic.acked["reader"] == {a.id, b.id}
+    assert "reader" in topic.members
+    assert topic.missed["reader"] == 0
+
+    # A message posted *after* the join is genuinely unacked for the joiner.
+    c = _post(topic, "s1", now=4.0)
+    unacked = [msg for msg in topic.messages if msg.id not in topic.acked["reader"]]
+    assert unacked == [c]
+
+
+def test_join_records_threshold_override() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    topic.join("s1", now=1.0, threshold="urgent")
+    topic.join("s2", now=1.0)
+    assert topic.thresholds == {"s1": "urgent"}
+
+
+def test_leave_drops_all_member_state() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    topic.join("s1", now=1.0, threshold="urgent")
+    _post(topic, "s1", now=2.0)
+    topic.acked["s1"].add("msg:chan:general:0")
+    topic.missed["s1"] = 3
+    topic.leave("s1")
+    assert "s1" not in topic.members
+    assert "s1" not in topic.acked
+    assert "s1" not in topic.missed
+    assert "s1" not in topic.thresholds
+
+
+def test_post_assigns_increasing_seq_id_and_bumps_activity() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    a = topic.post(
+        "s1", now=10.0, body="first", intent="fyi", severity="normal", mentions=()
+    )
+    b = topic.post(
+        "s2",
+        now=20.0,
+        body="second",
+        intent="reply",
+        severity="high",
+        mentions=("s1",),
+    )
+    assert (a.seq, a.id) == (0, "msg:chan:general:0")
+    assert (b.seq, b.id) == (1, "msg:chan:general:1")
+    assert topic.next_seq == 2
+    assert topic.last_activity == 20.0
+    assert b.sender == "s2"
+    assert b.mentions == ("s1",)
+    assert b.created_at == 20.0
+
+
+def test_history_tail() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    msgs = [_post(topic, "s1", now=float(i)) for i in range(5)]
+    assert topic.history_tail(2) == msgs[-2:]
+    assert topic.history_tail(0) == []
+    assert topic.history_tail(10) == msgs  # n larger than count -> all
+
+
+def test_reapable_member_present_is_false() -> None:
+    topic = MessageTopic("chan:x", "channel")
+    topic.join("s1", now=0.0)
+    _post(topic, "s1", now=100.0)
+    assert topic.reapable(now=1_000_000.0, ttl=10.0) is False
+
+
+def test_reapable_memberless_and_silent() -> None:
+    topic = MessageTopic("chan:x", "channel")
+    topic.join("s1", now=0.0)
+    _post(topic, "s1", now=100.0)
+    topic.leave("s1")
+    assert topic.reapable(now=105.0, ttl=10.0) is False  # silent 5s < ttl
+    assert topic.reapable(now=110.0, ttl=10.0) is True  # silent exactly ttl
+
+
+def test_reapable_zero_ttl_edge() -> None:
+    topic = MessageTopic("chan:x", "channel")
+    _post(topic, "s1", now=50.0)  # never joined -> memberless
+    assert topic.reapable(now=50.0, ttl=0.0) is True
+    assert topic.reapable(now=49.9, ttl=0.0) is False  # before activity
+
+
+# --------------------------------------------------------------------------- #
+# MessageTopic: compaction
+# --------------------------------------------------------------------------- #
+
+
+def test_compaction_bumps_missed_for_unacked(tmp_path: Path) -> None:
+    topic = MessageTopic("chan:big", "channel")
+    topic.join("reader", now=0.0)  # acked seeded empty (no messages yet)
+    overflow = 5
+    for i in range(mt.MAX_CACHED_MESSAGES + overflow):
+        msg = _post(topic, "s1", now=float(i + 1))
+        mt.append_messages(tmp_path, topic, [msg])
+    # Exactly `overflow` of the oldest messages fell out of the cache, none of
+    # which the reader had acked -> they count as missed.
+    assert len(topic.messages) == mt.MAX_CACHED_MESSAGES
+    assert topic.missed["reader"] == overflow
+    # Dropped ids no longer linger in the (empty) acked set.
+    assert topic.acked["reader"] == set()
+    # The bumped count was persisted by the compaction path's save_subscriber.
+    mt.save_state(tmp_path, topic)
+    sub = mt.load_topic(tmp_path / "msg" / "chan_big")
+    assert sub is not None
+    assert sub.missed["reader"] == overflow
+
+
+# --------------------------------------------------------------------------- #
+# MessageTopic: persistence round-trip
+# --------------------------------------------------------------------------- #
+
+
+def test_persistence_round_trip(tmp_path: Path) -> None:
+    topic = MessageTopic("chan:general", "channel", topic="dev chat")
+    topic.join("s1", now=1.0, threshold="urgent")
+    topic.join("s2", now=1.0)
+    a = topic.post(
+        "s1", now=10.0, body="hello", intent="fyi", severity="normal", mentions=("s2",)
+    )
+    b = topic.post(
+        "s2", now=11.0, body="hi back", intent="reply", severity="normal", mentions=()
+    )
+    mt.append_messages(tmp_path, topic, [a])
+    mt.append_messages(tmp_path, topic, [b])
+    topic.acked["s1"].add(a.id)  # simulate s1 having acked the first message
+
+    mt.save_state(tmp_path, topic)
+    mt.save_subscriber(tmp_path, topic, "s1")
+    mt.save_subscriber(tmp_path, topic, "s2")
+
+    topics = mt.load_all_topics(tmp_path)
+    assert len(topics) == 1
+    loaded = topics[0]
+
+    assert loaded.key == "chan:general"
+    assert loaded.kind == "channel"
+    assert loaded.topic == "dev chat"
+    assert loaded.members == {"s1", "s2"}
+    assert loaded.next_seq == 2
+    assert loaded.last_activity == 11.0
+
+    assert [msg.id for msg in loaded.messages] == [a.id, b.id]
+    assert [msg.seq for msg in loaded.messages] == [0, 1]
+    assert [msg.body for msg in loaded.messages] == ["hello", "hi back"]
+    assert loaded.messages[0].mentions == ("s2",)
+    assert loaded.messages[0].intent == "fyi"
+    assert loaded.messages[1].intent == "reply"
+
+    assert loaded.acked["s1"] == {a.id}
+    assert loaded.acked["s2"] == set()
+    assert loaded.thresholds.get("s1") == "urgent"
+    assert "s2" not in loaded.thresholds
+
+
+def test_load_all_topics_empty_dir(tmp_path: Path) -> None:
+    assert mt.load_all_topics(tmp_path) == []
+
+
+def test_delete_topic_and_subscriber(tmp_path: Path) -> None:
+    topic = MessageTopic("chan:gone", "channel")
+    topic.join("s1", now=1.0)
+    msg = _post(topic, "s1", now=2.0)
+    mt.append_messages(tmp_path, topic, [msg])
+    mt.save_state(tmp_path, topic)
+    mt.save_subscriber(tmp_path, topic, "s1")
+
+    mt.delete_subscriber(tmp_path, topic, "s1")
+    reloaded = mt.load_topic(tmp_path / "msg" / "chan_gone")
+    assert reloaded is not None
+    assert "s1" not in reloaded.acked
+
+    mt.delete_topic(tmp_path, "chan:gone")
+    assert mt.load_all_topics(tmp_path) == []
+    mt.delete_subscriber(tmp_path, topic, "s1")  # idempotent, must not raise
