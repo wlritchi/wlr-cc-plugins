@@ -231,13 +231,37 @@ A **topic** generalizes the PR tracker: a stream of message-events with
 per-subscriber ack state. Producers are now agents. The addressing schemes are
 just different *membership rules* over the same primitive:
 
-- **Channel** — a named topic. *Join* = subscribe (with a threshold); *post* =
-  produce. Open membership within the trust domain.
-- **DM** — the degenerate channel whose membership is `{sender, recipients}`. A
-  multi-recipient DM is an ad-hoc channel. (Whether it gets a stable name/persists
-  is an Open Question.)
+- **Channel** — a named topic. **Join = subscribe** (with a threshold); **post =
+  produce** (and auto-joins you if you weren't a member). There is **no explicit
+  create step** — a channel exists once it has activity/members; join-or-post
+  creates it. Names are kebab-case; channels are communal (not session-owned, so
+  no reclaim concept). The join/post reply reports the member count, so a typo'd
+  name surfaces immediately as "you're the only member" instead of failing
+  silently, and `list_channels` gives discovery so agents converge on real names.
+- **DM** — the degenerate channel whose membership is `{sender, recipients}`,
+  auto-created by addressing (no join ceremony). A multi-recipient DM is just such
+  an auto-named channel, persisting under the same inactivity retention as any
+  channel — no special-casing.
 - **Feed** (the "blog" half of the profile model) — a single-producer channel.
   Deferred to Phase D, but it costs nothing structurally.
+
+### Channel lifecycle, history, and topic
+
+- **Lifecycle / GC — inactivity-based.** A channel is reaped only once it has been
+  *both* memberless and silent for `NOTIFICATIONS_CHANNEL_TTL_SECONDS` (reusing the
+  PR reaper loop with a `last_activity` marker). So a channel an orchestrator seeds
+  survives workers briefly disconnecting, an active-but-momentarily-empty channel
+  doesn't evaporate, and a one-message typo room self-cleans. Channels persist
+  across daemon restart via the same `state.json` / `events.jsonl`.
+- **History on join.** A new member's acked-set is seeded to *all current message
+  ids* (the existing join-without-replay trick), so **history never wakes anyone**.
+  The join reply *additionally* renders the last **N** messages (default ~20, or a
+  time window — tunable) as scrollback: pulled, marked seen, delivered at the
+  natural no-wake moment (the agent just called `join` and is reading the reply).
+  The live subscription starts from "now"; deeper history is an optional later
+  `channel_history(channel, n)` pull tool.
+- **Topic.** The first joiner may set a one-line channel topic (shown in
+  `list_channels`), mirroring the agent profile — cheap, and a real discovery aid.
 
 ### Wire / storage model (reuse)
 
@@ -288,12 +312,15 @@ Signatures are a sketch to be pinned down in the implementation plan.
 - `set_availability(default_threshold)` — the global DND/focus knob.
 
 **Phase B**
-- `join_channel(channel, threshold?)` / `leave_channel(channel)`
+- `join_channel(channel, threshold?, topic?)` / `leave_channel(channel)` — join
+  creates the channel if absent; reply reports member count + topic.
 - `set_threshold(context, level)` — per-context wake threshold.
-- `post(channel, body, intent?, severity?, mentions?)`
+- `set_channel_topic(channel, topic)` — one-line topic shown in `list_channels`.
+- `post(channel, body, intent?, severity?, mentions?)` — auto-joins if needed.
 - `dm(to[], body, intent?, severity?)`
 - `catch_up()` — generalized to drain buffered messages across all subscriptions.
 - `list_channels()` / `list_subscriptions()`
+- *(optional, later)* `channel_history(channel, n?)` — scrollback beyond the join tail.
 
 **Phase C**
 - `react(message_id, reaction)`
@@ -320,25 +347,27 @@ Signatures are a sketch to be pinned down in the implementation plan.
 | Wake decision | Ordinal `level ≥ bar` (levels ambient/direct/urgent; thresholds all/direct/urgent) | One simple comparison; same lever controls ACK storms and thrash |
 | Focus / DND | Global threshold default, agent-owned; floor is `urgent` (no `@here`-proof tier) | `@here` is for show-stoppers and should punch through; disconnecting maps to ending a session, not muting; abuse is a sender-side norm |
 | Naming | Self-assigned, daemon collision-rejected | Simple; role-prefill builds on top later |
-| DM | Degenerate channel | One primitive; no separate code path |
+| DM | Degenerate channel (auto-named, multi-recipient = ad-hoc channel) | One primitive; no separate code path |
+| Channel lifecycle | No explicit create; join-or-post creates; inactivity-based GC | Frictionless for swarms; typos surface via member-count feedback + `list_channels`; reuses the PR reaper |
+| History on join | Bounded recent tail in the join reply; never pushed | Context without a wake-storm; reuses join-without-replay |
+| Channel topic | One-line, set by first joiner, shown in `list_channels` | Cheap discovery aid; mirrors the agent profile |
 | Gating location | Daemon-side | Already owns per-subscriber state & push decision; shim stays thin |
 | Read receipts | Derived from existing acks; pull-only | Free from the ack model; never a wake source |
 
 ## Open questions
 
-1. **Channel lifecycle.** Auto-create on first post/join, or explicit creation?
-   Are empty channels GC'd (cf. PR "warm then reaped")?
-2. **History on join.** PR model gives new subscribers *no* replay. Channels
-   probably want a bounded backlog on join — how much, and via `catch_up`?
-3. **Multi-recipient DM.** Ephemeral, or does it persist / get a stable name?
-4. **Presence granularity.** Connected/disconnected is free; is self-reported
+1. **Presence granularity.** Connected/disconnected is free; is self-reported
    busy/idle worth the protocol surface, or is the threshold knob enough?
-5. **Reaction vocabulary.** Free-form string/emoji, or a fixed small set?
-6. **Name rebinding across sessions.** Needed before Phase D role/spawn work;
+2. **Reaction vocabulary.** Free-form string/emoji, or a fixed small set?
+3. **Name rebinding across sessions.** Needed before Phase D role/spawn work;
    does anything in A–C have to anticipate it?
 
-*(Resolved: `@here` vs. DND — `@here` always wakes; no true-DND tier. See "No
-true DND" in the attention model and the decisions table.)*
+*(Resolved: `@here` vs. DND — `@here` always wakes, no true-DND tier. Channel
+lifecycle — no explicit create; join-or-post creates; inactivity-based GC.
+History on join — bounded recent tail in the join reply, never pushed. Channel
+topic — one-line, set by the first joiner. Multi-recipient DM — an auto-named
+channel under the same retention. See the Phase B section and the decisions
+table.)*
 
 ## Relationship to `a2a` (supersession)
 
