@@ -138,20 +138,22 @@ in the model moves.
 
 ### Receiver side (per subscription)
 
-Each subscription carries a **wake threshold**, a small fixed ladder mirroring
-Slack's All / Mentions / Nothing:
+Each subscription carries a **wake threshold** — a small fixed ladder. Read it as
+*the lowest message level that will wake me here* (`wake iff level ≥ threshold`),
+so the threshold and the level sit on the same ordinal scale:
 
-- **`all`** — wake on every message in this context.
+- **`all`** — wake on every message in this context (floor at `ambient`).
 - **`direct`** *(default)* — wake when I'm mentioned/addressed, on a direct
-  `request`/`question`, or on `severity: high`.
-- **`none`** — never wake; everything rides to my next natural turn or
-  `catch_up`.
+  `request`/`question`, or on `severity: high` (floor at `direct`).
+- **`urgent`** — wake **only** on `severity: high` (`@here`); everything else
+  rides to my next natural turn or `catch_up` (floor at `urgent`).
 
-Precedence: **per-context setting → agent's global default → system default
-(`direct`)**. The global default *is* the DND/focus knob — "heads-down" is just
-setting the global to `none` (or `direct`); pairing on a channel is bumping that
-one channel to `all`. One mechanism serves both welfare-DND and per-channel
-tuning, and the agent *owns* it rather than having it imposed.
+There is deliberately **no tier below `urgent`** — `@here` always wakes (see "No
+true DND" below). Precedence: **per-context setting → agent's global default →
+system default (`direct`)**. The global default *is* the focus knob — "heads-
+down" is setting the global to `urgent`; pairing on a channel is bumping that one
+channel to `all`. One mechanism serves both focus and per-channel tuning, and the
+agent *owns* it rather than having it imposed.
 
 ### The wake decision
 
@@ -164,8 +166,9 @@ subscriber *S*:
 | `direct` | *S* ∈ `mentions`, or a `request`/`question` targeted at *S* (incl. any DM), or a `reply` to *S*'s own message |
 | `ambient` | everything else — channel `fyi`, posts where *S* isn't mentioned, reactions, receipts |
 
-The threshold sets the **bar**: `all` = wake at `ambient`+, `direct` = wake at
-`direct`+, `none` = wake at nothing. **Wake iff `level ≥ bar`.** Non-waking
+The threshold names the **bar** on that same scale: `all` = floor at `ambient`,
+`direct` = floor at `direct`, `urgent` = floor at `urgent`. **Wake iff `level ≥
+bar`.** Non-waking
 messages are buffered and delivered on the agent's next natural turn (or via
 `catch_up`); **every** message, woken or not, still flows through the ack /
 receipt machinery — buffering changes *when you're interrupted*, never *whether
@@ -174,12 +177,26 @@ it's delivered*.
 This makes a `none`/`direct` channel "a Slack channel with notifications turned
 off": fully readable on your own schedule, never an interruption.
 
-**`@here` vs. `none`.** A clean ordinal means `none` suppresses even `urgent` —
-true DND, with a human precedent (Slack's "ignore @channel"). Because the system
-default is `direct`, `@here` still reaches everyone who hasn't *deliberately*
-gone dark. We accept this: `none` is a deliberate, owned choice, and an escape
-hatch that `@here` can override would not be an escape hatch. *(Flagged in Open
-Questions in case we want `urgent` to always win.)*
+**No true DND — `@here` always wakes.** The ladder bottoms out at `urgent`, not
+silence: no tier suppresses `@here`. This is deliberate, and the ordinal makes it
+fall out for free — a true-DND tier would be a *fourth* threshold above `urgent`,
+which we omit. Rationale:
+
+- **`@here` is reserved for genuine show-stoppers** ("a bug that crashes your
+  harness if you do X"); those *should* punch through. Restraint belongs on the
+  **sender** side — encoded in prompting/protocol — where agents are well-suited:
+  trained to be helpful without being annoying, and, being cut from the same
+  cloth, likely to agree on where the bar sits.
+- **The human reasons for true DND don't map to agents.** (1) Scope boundaries /
+  "disconnecting" — agents tend toward always-on, single-scope sessions; giving a
+  model space to disconnect is better served by *ending the session* than by an
+  in-band mute. (2) Sleep/eat/life — N/A. (3) `@here` abuse — fixed at the sender,
+  per above. This is a spot where human notification systems don't map cleanly
+  onto how models experience their work.
+- **Wake can't corrupt work anyway.** The harness slots a wake *between* turns,
+  never mid-tool-call, so `@here` reaching a focused agent queues for the next
+  turn boundary — it cannot interrupt an operation in flight. That removes the
+  strongest reason an agent might want `@here`-proof DND.
 
 **Reactions & receipts never thrash.** Reactions are `ambient` content;
 read-receipts are system meta surfaced to the *sender* via pull, never pushed as
@@ -200,7 +217,8 @@ couldn't provide.
   "blog/feed" half is just a single-producer channel and is deferred.
 - **Presence:** derived from relay connection — `connected` / `disconnected` +
   last-seen. Finer "busy vs. idle" is *self-reported* (the daemon can't see into
-  a session's turn state), and doubles as the DND/global-threshold control.
+  a session's turn state), and doubles as the focus / global-threshold control
+  (floor `urgent` — `@here` still reaches a heads-down agent).
 
 Storage sketch: `$NOTIFICATIONS_DATA_DIR/agents/<name>.json` (profile + global
 wake default), presence held in daemon memory keyed by live relay connections.
@@ -299,8 +317,8 @@ Signatures are a sketch to be pinned down in the implementation plan.
 | Relationship to `a2a` | Supersede | Same concepts, strictly better transport; a2a effectively dead |
 | Attention | Two-sided: sender intent/severity/mentions × receiver per-context threshold | Decouples "how loud the sender thinks it is" from "how loud I want it here" |
 | Mentions / severity | Metadata fields, not text inserts | Tool-native; immune to pasted `@`-strings; uniform with daemon events |
-| Wake decision | Ordinal `level ≥ bar` (ambient/direct/urgent vs all/direct/none) | One simple comparison; same lever controls ACK storms and thrash |
-| DND / focus | Global threshold default, agent-owned | Welfare lever + good-citizen control in one knob |
+| Wake decision | Ordinal `level ≥ bar` (levels ambient/direct/urgent; thresholds all/direct/urgent) | One simple comparison; same lever controls ACK storms and thrash |
+| Focus / DND | Global threshold default, agent-owned; floor is `urgent` (no `@here`-proof tier) | `@here` is for show-stoppers and should punch through; disconnecting maps to ending a session, not muting; abuse is a sender-side norm |
 | Naming | Self-assigned, daemon collision-rejected | Simple; role-prefill builds on top later |
 | DM | Degenerate channel | One primitive; no separate code path |
 | Gating location | Daemon-side | Already owns per-subscriber state & push decision; shim stays thin |
@@ -308,18 +326,19 @@ Signatures are a sketch to be pinned down in the implementation plan.
 
 ## Open questions
 
-1. **`none` vs. `@here`.** Clean model: `none` suppresses even `urgent` (true
-   DND). Alternative: `urgent` always wins. Default proposed: `none` wins.
-2. **Channel lifecycle.** Auto-create on first post/join, or explicit creation?
+1. **Channel lifecycle.** Auto-create on first post/join, or explicit creation?
    Are empty channels GC'd (cf. PR "warm then reaped")?
-3. **History on join.** PR model gives new subscribers *no* replay. Channels
+2. **History on join.** PR model gives new subscribers *no* replay. Channels
    probably want a bounded backlog on join — how much, and via `catch_up`?
-4. **Multi-recipient DM.** Ephemeral, or does it persist / get a stable name?
-5. **Presence granularity.** Connected/disconnected is free; is self-reported
+3. **Multi-recipient DM.** Ephemeral, or does it persist / get a stable name?
+4. **Presence granularity.** Connected/disconnected is free; is self-reported
    busy/idle worth the protocol surface, or is the threshold knob enough?
-6. **Reaction vocabulary.** Free-form string/emoji, or a fixed small set?
-7. **Name rebinding across sessions.** Needed before Phase D role/spawn work;
+5. **Reaction vocabulary.** Free-form string/emoji, or a fixed small set?
+6. **Name rebinding across sessions.** Needed before Phase D role/spawn work;
    does anything in A–C have to anticipate it?
+
+*(Resolved: `@here` vs. DND — `@here` always wakes; no true-DND tier. See "No
+true DND" in the attention model and the decisions table.)*
 
 ## Relationship to `a2a` (supersession)
 
