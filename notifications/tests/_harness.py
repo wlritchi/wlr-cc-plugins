@@ -509,10 +509,30 @@ async def mcp_list_tools(read, write, request_id: int) -> list[str]:
     return sorted(t["name"] for t in resp.result["tools"])
 
 
+@contextlib.asynccontextmanager
+async def agent_session(
+    tmp_path: Path,
+    ws_port: int,
+    data_dir: Path,
+    xdg_dir: Path,
+    session_id: str,
+):
+    """Open a push-mode relay for `session_id`, complete the MCP handshake, and yield
+    its (read, write) streams. Wraps the push_relay_env + relay_params + stdio_client +
+    handshake boilerplate the e2e tests repeat, so a test can stand up several relay
+    sessions against one daemon with minimal noise."""
+    async with stdio_client(
+        relay_params(push_relay_env(tmp_path, ws_port, data_dir, xdg_dir, session_id))
+    ) as (read, write):
+        await mcp_handshake(read, write)
+        yield read, write
+
+
 __all__ = [
     "DAEMON",
     "RELAY",
     "FakeGitHub",
+    "agent_session",
     "daemon_env",
     "daemon_process",
     "free_port",
@@ -525,6 +545,7 @@ __all__ = [
     "mcp_handshake",
     "mcp_list_tools",
     "mcp_send",
+    "push_relay_env",
     "relay_env",
     "relay_params",
     "stdio_client",

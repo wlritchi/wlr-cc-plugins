@@ -49,6 +49,7 @@ from websockets.exceptions import ConnectionClosed
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
+import agent_registry  # noqa: E402
 import github_client  # noqa: E402
 import pr_monitor  # noqa: E402
 import pr_schedule  # noqa: E402
@@ -62,6 +63,9 @@ AUTH_BACKOFF_LEVEL = 14
 # How long an unsubscribed (subscriber-less, non-terminal) tracker is kept warm
 # before the reaper deletes it, so a quick re-subscribe reuses its cached state.
 WARM_TTL_DEFAULT_SECONDS = 1800.0
+# How long an offline agent keeps its directory name reserved before a colliding
+# register_agent may reclaim it. <=0 reclaims immediately once the session is gone.
+AGENT_TTL_DEFAULT_SECONDS = 900.0
 
 
 def _warm_ttl_seconds() -> float:
@@ -74,14 +78,37 @@ def _warm_ttl_seconds() -> float:
     return WARM_TTL_DEFAULT_SECONDS
 
 
+def _data_dir() -> Path:
+    """Root persistence directory, resolved the same way as the storage modules."""
+    base = os.environ.get("NOTIFICATIONS_DATA_DIR")
+    return Path(base) if base else Path.home() / ".claude" / "notifications"
+
+
+def _agent_ttl_seconds() -> float:
+    raw = os.environ.get("NOTIFICATIONS_AGENT_TTL_SECONDS")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return AGENT_TTL_DEFAULT_SECONDS
+
+
 # session id -> its current connection
 CONNECTIONS: dict[str, "Connection"] = {}
 # "owner/repo#number" -> PRTracker
 TRACKERS: dict[str, pr_monitor.PRTracker] = {}
+# The agent directory (Phase A): names -> records, persisted under <data_dir>/agents.
+REGISTRY: agent_registry.AgentRegistry = agent_registry.AgentRegistry(_data_dir())
 GH: github_client.GitHubClient | None = None
 # Shared secret each relay must present (Authorization: Bearer <token>) to connect.
 # Computed once at startup; relays compute the same value from NOTIFICATIONS_DATA_DIR.
 TOKEN = ""
+
+
+def _session_live(session_id: str) -> bool:
+    """Liveness predicate the registry uses for name-reclaim decisions."""
+    return session_id in CONNECTIONS
 
 
 def _now_utc() -> datetime:
@@ -314,11 +341,27 @@ async def _handle(websocket) -> None:
 
             elif kind == wsproto.LIST_SUBSCRIPTIONS:
                 await _handle_list_subscriptions(websocket, conn, msg)
+
+            elif kind == wsproto.REGISTER_AGENT:
+                await _handle_register_agent(websocket, conn, msg)
+
+            elif kind == wsproto.UNREGISTER_AGENT:
+                await _handle_unregister_agent(websocket, conn, msg)
+
+            elif kind == wsproto.LIST_AGENTS:
+                await _handle_list_agents(websocket, conn, msg)
+
+            elif kind == wsproto.SET_AVAILABILITY:
+                await _handle_set_availability(websocket, conn, msg)
     except ConnectionClosed:
         pass
     finally:
         if dispatch_task is not None:
             dispatch_task.cancel()
+        # Stamp last_seen so the name-reclaim grace clock starts from now; presence
+        # flips to offline automatically once the connection leaves CONNECTIONS.
+        if conn.session_id:
+            REGISTRY.touch(conn.session_id, time.time())
         if conn.session_id and CONNECTIONS.get(conn.session_id) is conn:
             del CONNECTIONS[conn.session_id]
 
@@ -472,6 +515,73 @@ async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> 
         if session_id in t.subscribers
     ]
     await _send(websocket, wsproto.SUBSCRIPTIONS_RESULT, msg, items=items)
+
+
+# --------------------------------------------------------------------------- #
+# agent directory handling (Phase A)
+# --------------------------------------------------------------------------- #
+
+
+async def _handle_register_agent(websocket, conn: Connection, msg: dict) -> None:
+    session_id = conn.session_id or msg.get("session_id")
+    if not session_id:
+        await _send(websocket, wsproto.ERROR, msg, error="no session id")
+        return
+    name = msg.get("name")
+    if not name:
+        await _send(websocket, wsproto.ERROR, msg, error="missing agent name")
+        return
+    try:
+        record = REGISTRY.register(
+            session_id,
+            name,
+            now=time.time(),
+            is_session_live=_session_live,
+            ttl=_agent_ttl_seconds(),
+            description=msg.get("description") or "",
+            capabilities=msg.get("capabilities") or "",
+            working_dir=msg.get("working_dir") or "",
+            default_threshold=msg.get("default_threshold"),
+        )
+    except agent_registry.AgentRegistryError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    await _send(websocket, wsproto.AGENT_OK, msg, agent=record.to_dict())
+
+
+async def _handle_unregister_agent(websocket, conn: Connection, msg: dict) -> None:
+    session_id = conn.session_id or msg.get("session_id")
+    if not session_id:
+        await _send(websocket, wsproto.ERROR, msg, error="no session id")
+        return
+    record = REGISTRY.unregister(session_id)
+    await _send(
+        websocket,
+        wsproto.AGENT_OK,
+        msg,
+        agent=record.to_dict() if record is not None else None,
+    )
+
+
+async def _handle_set_availability(websocket, conn: Connection, msg: dict) -> None:
+    session_id = conn.session_id or msg.get("session_id")
+    if not session_id:
+        await _send(websocket, wsproto.ERROR, msg, error="no session id")
+        return
+    try:
+        record = REGISTRY.set_availability(session_id, msg.get("default_threshold"))
+    except agent_registry.AgentRegistryError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    await _send(websocket, wsproto.AGENT_OK, msg, agent=record.to_dict())
+
+
+async def _handle_list_agents(websocket, conn: Connection, msg: dict) -> None:
+    agents = [
+        {**record.to_dict(), "connected": record.session_id in CONNECTIONS}
+        for record in REGISTRY.list()
+    ]
+    await _send(websocket, wsproto.AGENT_LIST, msg, agents=agents)
 
 
 def _finalize_terminal(tracker: pr_monitor.PRTracker, session_id: str) -> None:

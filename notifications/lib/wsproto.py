@@ -24,6 +24,11 @@ LIST = "list"  # {req_id, session_id}
 SUBSCRIBE_PR = "subscribe_pr"  # {req_id, session_id, owner, repo, number}
 UNSUBSCRIBE_PR = "unsubscribe_pr"  # {req_id, session_id, owner, repo, number}
 LIST_SUBSCRIPTIONS = "list_subscriptions"  # {req_id, session_id}
+# agent directory (Phase A)
+REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?}
+UNREGISTER_AGENT = "unregister_agent"  # {req_id, session_id}
+LIST_AGENTS = "list_agents"  # {req_id, session_id}
+SET_AVAILABILITY = "set_availability"  # {req_id, session_id, default_threshold}
 
 # daemon -> relay
 NOTIFY = "notify"  # {id, content, meta}          deliver this to the agent, then ack
@@ -32,6 +37,8 @@ LIST_RESULT = "list_result"  # {req_id, items}
 SUBSCRIBED = "subscribed"  # {req_id, pr, summary, merged, closed}
 UNSUBSCRIBED = "unsubscribed"  # {req_id, pr}
 SUBSCRIPTIONS_RESULT = "subscriptions_result"  # {req_id, items}
+AGENT_OK = "agent_ok"  # {req_id, agent}          resulting record dict (or null/{name} for unregister)
+AGENT_LIST = "agent_list"  # {req_id, agents}      [record-dict + "connected": bool]
 ERROR = "error"  # {req_id, error}
 
 

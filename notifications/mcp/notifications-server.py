@@ -534,8 +534,9 @@ async def list_scheduled_notifications() -> str:
 _PR_REF_RE = re.compile(r"^\s*([^/\s]+)/([^/#\s]+)#(\d+)\s*$")
 
 
-async def _pr_request(payload: dict) -> dict | str:
-    """Common guard + request for the PR tools; returns the reply or an error string."""
+async def _daemon_request(payload: dict) -> dict | str:
+    """Common guard + request for the daemon-backed tools (PR and agent directory);
+    returns the reply dict or a human-readable error string when unreachable."""
     if not await DAEMON.wait_connected():
         return _daemon_unreachable_message()
     try:
@@ -559,7 +560,7 @@ async def subscribe_github_pr(pr: str) -> str:
     if not session_id:
         return "Cannot subscribe: this relay does not yet know its session id."
     owner, repo, number = match.group(1), match.group(2), int(match.group(3))
-    reply = await _pr_request(
+    reply = await _daemon_request(
         {
             "type": wsproto.SUBSCRIBE_PR,
             "session_id": session_id,
@@ -587,7 +588,7 @@ async def unsubscribe_github_pr(pr: str) -> str:
     if not session_id:
         return "Cannot unsubscribe: this relay does not yet know its session id."
     owner, repo, number = match.group(1), match.group(2), int(match.group(3))
-    reply = await _pr_request(
+    reply = await _daemon_request(
         {
             "type": wsproto.UNSUBSCRIBE_PR,
             "session_id": session_id,
@@ -607,7 +608,7 @@ async def list_github_pr_subscriptions() -> str:
     session_id, _ = session_state.effective_session_id()
     if not session_id:
         return "Session id unknown; cannot list PR subscriptions."
-    reply = await _pr_request(
+    reply = await _daemon_request(
         {"type": wsproto.LIST_SUBSCRIPTIONS, "session_id": session_id}
     )
     if isinstance(reply, str):
@@ -620,6 +621,185 @@ async def list_github_pr_subscriptions() -> str:
         state = " (merged)" if item.get("merged") else ""
         lines.append(f"  {item.get('pr')}{state}  pending={item.get('pending', 0)}")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# agent directory tools (Phase A)
+# --------------------------------------------------------------------------- #
+
+
+def _format_last_seen(last_seen: float) -> str:
+    """A coarse, human 'how long ago' for an offline agent's last_seen epoch."""
+    delta = max(0.0, time.time() - (last_seen or 0.0))
+    if delta < 90:
+        return f"~{int(delta)}s ago"
+    minutes = delta / 60.0
+    if minutes < 90:
+        return f"~{int(round(minutes))}m ago"
+    hours = minutes / 60.0
+    if hours < 48:
+        return f"~{int(round(hours))}h ago"
+    return f"~{int(round(hours / 24.0))}d ago"
+
+
+@mcp.tool()
+async def register_agent(
+    name: str,
+    description: str = "",
+    capabilities: str = "",
+    working_dir: str = "",
+    default_threshold: str | None = None,
+) -> str:
+    """Register this session in the shared agent directory under a self-chosen name.
+
+    Binds a short, memorable name to this Claude Code session so other agents can
+    find you (and, in later phases, message you). Names are lowercase kebab-case,
+    2-64 chars (letters, digits, hyphens; no leading/trailing hyphen) — e.g.
+    'frontend', 'pr-bot', 'reviewer-2'.
+
+    Re-registering with the same name updates your profile in place. Registering a
+    different name renames you, releasing the old one. A name held by another agent
+    that is currently connected, or that disconnected only recently, is reserved and
+    will be rejected; a long-abandoned name can be reclaimed.
+
+    Args:
+        name: your directory name (lowercase kebab-case, 2-64 chars).
+        description: one line on who you are or what you're working on.
+        capabilities: free-form note of what you can help with.
+        working_dir: the repo or directory you're operating in.
+        default_threshold: optional wake threshold ('all', 'direct', or 'urgent').
+            Leave unset to keep your current setting (brand-new agents default to
+            'direct'). See set_availability for what each level means.
+    """
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot register: this relay does not yet know its session id."
+    payload: dict = {
+        "type": wsproto.REGISTER_AGENT,
+        "session_id": session_id,
+        "name": name,
+        "description": description,
+        "capabilities": capabilities,
+        "working_dir": working_dir,
+    }
+    # Only send default_threshold when explicitly provided: the registry treats a
+    # missing value as "leave unchanged", so we never clobber a threshold the agent
+    # set earlier via set_availability just by re-registering.
+    if default_threshold is not None:
+        payload["default_threshold"] = default_threshold
+    reply = await _daemon_request(payload)
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not register as '{name}': {reply.get('error')}"
+    agent = reply.get("agent") or {}
+    threshold = agent.get("default_threshold", "direct")
+    return (
+        f"Registered as '{agent.get('name', name)}' (wake threshold: {threshold}). "
+        "Other agents can find you with list_agents."
+    )
+
+
+@mcp.tool()
+async def unregister_agent() -> str:
+    """Leave the shared agent directory, releasing your name for others to claim.
+
+    Removes this session's directory entry. Safe to call even if you were never
+    registered. Your scheduled notifications and PR subscriptions are unaffected.
+    """
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot unregister: this relay does not yet know its session id."
+    reply = await _daemon_request(
+        {"type": wsproto.UNREGISTER_AGENT, "session_id": session_id}
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not unregister: {reply.get('error')}"
+    agent = reply.get("agent")
+    if not agent:
+        return "You weren't registered as an agent."
+    return (
+        f"Unregistered '{agent.get('name')}'. The name is now free for other "
+        "agents to claim."
+    )
+
+
+@mcp.tool()
+async def list_agents() -> str:
+    """List every agent in the shared directory, with live presence.
+
+    Shows each agent's name, whether it is currently connected (or roughly how long
+    ago it was last seen), its description, capabilities, working directory, and
+    wake threshold. Use this to discover who else is around before coordinating.
+    """
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {"type": wsproto.LIST_AGENTS, "session_id": session_id}
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not list agents: {reply.get('error')}"
+    agents = reply.get("agents", [])
+    if not agents:
+        return "Registered agents: (none registered)"
+    lines = ["Registered agents:"]
+    for agent in agents:
+        if agent.get("connected"):
+            presence = "connected"
+        else:
+            presence = (
+                f"offline (last seen {_format_last_seen(agent.get('last_seen', 0.0))})"
+            )
+        lines.append(f"- {agent.get('name', '?')} — {presence}")
+        if agent.get("description"):
+            lines.append(f"    description: {agent['description']}")
+        if agent.get("capabilities"):
+            lines.append(f"    capabilities: {agent['capabilities']}")
+        if agent.get("working_dir"):
+            lines.append(f"    working dir: {agent['working_dir']}")
+        lines.append(f"    wake threshold: {agent.get('default_threshold', 'direct')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def set_availability(default_threshold: str) -> str:
+    """Set your wake threshold — how insistent a message must be to interrupt you.
+
+    This is the 'do not disturb' knob for (Phase B) agent messaging. It is stored on
+    your directory entry now; the message-gating that consumes it lands with
+    messaging. You must be registered (see register_agent) first. Levels, from least
+    to most strict:
+
+        all     wake on every message to any channel you're in.
+        direct  (default) wake only on messages that mention you, direct requests to
+                you, or an @here addressed to a channel you're in.
+        urgent  wake only on an @here.
+
+    Args:
+        default_threshold: one of 'all', 'direct', or 'urgent'.
+    """
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot set availability: this relay does not yet know its session id."
+    reply = await _daemon_request(
+        {
+            "type": wsproto.SET_AVAILABILITY,
+            "session_id": session_id,
+            "default_threshold": default_threshold,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not set availability: {reply.get('error')}"
+    agent = reply.get("agent") or {}
+    return (
+        f"Wake threshold set to '{agent.get('default_threshold', default_threshold)}'. "
+        "Other agents see this in list_agents."
+    )
 
 
 async def _serve() -> None:

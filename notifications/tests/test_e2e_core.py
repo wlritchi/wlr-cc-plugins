@@ -18,10 +18,14 @@ pytestmark = pytest.mark.slow
 
 EXPECTED_TOOLS = [
     "get_session_id",
+    "list_agents",
     "list_github_pr_subscriptions",
     "list_scheduled_notifications",
+    "register_agent",
     "schedule_test_notification",
+    "set_availability",
     "subscribe_github_pr",
+    "unregister_agent",
     "unsubscribe_github_pr",
 ]
 
