@@ -54,6 +54,7 @@ def daemon_env(
     graphql_url: str | None = None,
     poll_seconds: str = "1",
     warm_ttl: str | None = None,
+    agent_ttl: str | None = None,
 ) -> dict:
     env = dict(os.environ)
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
@@ -61,6 +62,8 @@ def daemon_env(
     env["NOTIFICATIONS_PR_POLL_SECONDS"] = poll_seconds
     if warm_ttl is not None:
         env["NOTIFICATIONS_PR_WARM_TTL_SECONDS"] = warm_ttl
+    if agent_ttl is not None:
+        env["NOTIFICATIONS_AGENT_TTL_SECONDS"] = agent_ttl
     if graphql_url:
         env["GITHUB_GRAPHQL_URL"] = graphql_url
         env["GITHUB_TOKEN"] = "test-token"
@@ -500,6 +503,34 @@ async def mcp_call(
     return resp.result["content"][0]["text"], channels
 
 
+async def mcp_try_call(
+    read,
+    write,
+    request_id: int,
+    name: str,
+    arguments: dict | None = None,
+    *,
+    timeout: float = 12.0,
+):
+    """Like mcp_call, but return (None, channels) instead of raising when no response
+    arrives within `timeout`. For poll-until-settled loops where a single slow relay
+    round-trip (a cold `uv run` boot under CPU starvation) should just trigger another
+    retry rather than fail the whole test."""
+    await mcp_send(
+        write,
+        JSONRPCRequest(
+            jsonrpc="2.0",
+            id=request_id,
+            method="tools/call",
+            params={"name": name, "arguments": arguments or {}},
+        ),
+    )
+    resp, channels = await mcp_await_response(read, request_id, timeout=timeout)
+    if resp is None:
+        return None, channels
+    return resp.result["content"][0]["text"], channels
+
+
 async def mcp_list_tools(read, write, request_id: int) -> list[str]:
     await mcp_send(
         write,
@@ -545,6 +576,7 @@ __all__ = [
     "mcp_handshake",
     "mcp_list_tools",
     "mcp_send",
+    "mcp_try_call",
     "push_relay_env",
     "relay_env",
     "relay_params",
