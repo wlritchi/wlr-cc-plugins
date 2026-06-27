@@ -26,6 +26,9 @@ Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
                NOTIFICATIONS_TOKEN (default: auto-created <DATA_DIR>/token)
                NOTIFICATIONS_PR_WARM_TTL_SECONDS (default 1800)
                NOTIFICATIONS_PR_CHECK_SUMMARY_THRESHOLD (default 5; 0 disables)
+               NOTIFICATIONS_AGENT_TTL_SECONDS (default 900)
+               NOTIFICATIONS_CHANNEL_TTL_SECONDS (default 86400)
+               NOTIFICATIONS_CHANNEL_HISTORY (default 20)
                GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com)
 """
 
@@ -51,6 +54,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import agent_registry  # noqa: E402
 import github_client  # noqa: E402
+import messaging  # noqa: E402
+import message_topic  # noqa: E402
 import pr_monitor  # noqa: E402
 import pr_schedule  # noqa: E402
 import scheduler  # noqa: E402
@@ -66,6 +71,10 @@ WARM_TTL_DEFAULT_SECONDS = 1800.0
 # How long an offline agent keeps its directory name reserved before a colliding
 # register_agent may reclaim it. <=0 reclaims immediately once the session is gone.
 AGENT_TTL_DEFAULT_SECONDS = 900.0
+# How long a memberless+silent message topic (channel or DM) is kept before the
+# reaper deletes it, and how many recent messages a join reply renders as scrollback.
+CHANNEL_TTL_DEFAULT_SECONDS = 86400.0
+CHANNEL_HISTORY_DEFAULT = 20
 
 
 def _warm_ttl_seconds() -> float:
@@ -94,12 +103,37 @@ def _agent_ttl_seconds() -> float:
     return AGENT_TTL_DEFAULT_SECONDS
 
 
+def _channel_ttl_seconds() -> float:
+    raw = os.environ.get("NOTIFICATIONS_CHANNEL_TTL_SECONDS")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return CHANNEL_TTL_DEFAULT_SECONDS
+
+
+def _channel_history_n() -> int:
+    raw = os.environ.get("NOTIFICATIONS_CHANNEL_HISTORY")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return CHANNEL_HISTORY_DEFAULT
+
+
 # session id -> its current connection
 CONNECTIONS: dict[str, "Connection"] = {}
 # "owner/repo#number" -> PRTracker
 TRACKERS: dict[str, pr_monitor.PRTracker] = {}
 # The agent directory (Phase A): names -> records, persisted under <data_dir>/agents.
 REGISTRY: agent_registry.AgentRegistry = agent_registry.AgentRegistry(_data_dir())
+# Message topics (Phase B): topic key ("chan:<name>" / "dm:<names>") -> MessageTopic,
+# persisted under <data_dir>/msg/<safe_key>/ (mirrors how TRACKERS is loaded).
+TOPICS: dict[str, message_topic.MessageTopic] = {
+    topic.key: topic for topic in message_topic.load_all_topics(_data_dir())
+}
 GH: github_client.GitHubClient | None = None
 # Shared secret each relay must present (Authorization: Bearer <token>) to connect.
 # Computed once at startup; relays compute the same value from NOTIFICATIONS_DATA_DIR.
@@ -267,6 +301,8 @@ async def _dispatch_loop(conn: Connection) -> None:
                     if not await _safe_send(conn, payload):
                         return
                     conn.inflight.add(nid)
+            if not await _deliver_messages(conn, session_id):
+                return
             timeout = _next_callback_timeout(session_id, now)
         try:
             await asyncio.wait_for(conn.wake.wait(), timeout)
@@ -353,6 +389,30 @@ async def _handle(websocket) -> None:
 
             elif kind == wsproto.SET_AVAILABILITY:
                 await _handle_set_availability(websocket, conn, msg)
+
+            elif kind == wsproto.JOIN_CHANNEL:
+                await _handle_join_channel(websocket, conn, msg)
+
+            elif kind == wsproto.LEAVE_CHANNEL:
+                await _handle_leave_channel(websocket, conn, msg)
+
+            elif kind == wsproto.POST:
+                await _handle_post(websocket, conn, msg)
+
+            elif kind == wsproto.DM:
+                await _handle_dm(websocket, conn, msg)
+
+            elif kind == wsproto.SET_THRESHOLD:
+                await _handle_set_threshold(websocket, conn, msg)
+
+            elif kind == wsproto.SET_CHANNEL_TOPIC:
+                await _handle_set_channel_topic(websocket, conn, msg)
+
+            elif kind == wsproto.LIST_CHANNELS:
+                await _handle_list_channels(websocket, conn, msg)
+
+            elif kind == wsproto.LIST_MESSAGE_SUBSCRIPTIONS:
+                await _handle_list_message_subscriptions(websocket, conn, msg)
     except ConnectionClosed:
         pass
     finally:
@@ -403,6 +463,16 @@ def _handle_ack(conn: Connection, msg: dict) -> None:
             conn.inflight.discard(nid)
             pr_monitor.save_subscriber(tracker, conn.session_id)
             _finalize_terminal(tracker, conn.session_id)
+    elif isinstance(nid, str) and nid.startswith("msg:"):
+        # nid is the message id "msg:<topic_key>:<seq>". The topic key itself carries
+        # a ':' ("chan:"/"dm:") but the trailing seq never does, so rpartition(':')
+        # peels the seq off and the remainder (after the "msg:" prefix) is the key.
+        topic_key, _, _seq = nid[len("msg:") :].rpartition(":")
+        topic = TOPICS.get(topic_key)
+        if topic is not None and conn.session_id and conn.session_id in topic.members:
+            topic.acked.setdefault(conn.session_id, set()).add(nid)
+            conn.inflight.discard(nid)
+            message_topic.save_subscriber(_data_dir(), topic, conn.session_id)
     else:
         if conn.session_id:
             scheduler.delete(conn.session_id, nid)
@@ -584,6 +654,370 @@ async def _handle_list_agents(websocket, conn: Connection, msg: dict) -> None:
     await _send(websocket, wsproto.AGENT_LIST, msg, agents=agents)
 
 
+# --------------------------------------------------------------------------- #
+# agent messaging (Phase B): channels + DMs over the message-topic primitive
+# --------------------------------------------------------------------------- #
+
+
+async def _resolve_sender(
+    websocket, conn: Connection, msg: dict
+) -> tuple[str | None, agent_registry.AgentRecord | None]:
+    """Resolve (session_id, agent record) for a messaging request, or (None, None)
+    after sending an ERROR. Every messaging op requires the caller to be a registered
+    agent: that is what guarantees a display name (for `from`/mentions/DM addressing)
+    and a global wake-threshold default."""
+    session_id = conn.session_id or msg.get("session_id")
+    if not session_id:
+        await _send(websocket, wsproto.ERROR, msg, error="no session id")
+        return None, None
+    record = REGISTRY.get_by_session(session_id)
+    if record is None:
+        await _send(websocket, wsproto.ERROR, msg, error="register_agent first")
+        return None, None
+    return session_id, record
+
+
+def _registry_by_name(name: str) -> agent_registry.AgentRecord | None:
+    for record in REGISTRY.list():
+        if record.name == name:
+            return record
+    return None
+
+
+def _member_names(topic: message_topic.MessageTopic) -> list[str]:
+    """Resolve a topic's member session ids to their current directory names (falling
+    back to the raw session id if a member has since unregistered)."""
+    names: list[str] = []
+    for sid in sorted(topic.members):
+        record = REGISTRY.get_by_session(sid)
+        names.append(record.name if record is not None else sid)
+    return names
+
+
+def _channel_name(topic: message_topic.MessageTopic) -> str:
+    return topic.key[len("chan:") :] if topic.key.startswith("chan:") else topic.key
+
+
+def _render_message(
+    topic: message_topic.MessageTopic, message: message_topic.Message, addressed: bool
+) -> str:
+    """The one-line rendering a recipient sees. DMs read `[dm] sender: body`; channels
+    read `[#name] sender: body`; an addressed (DM / mentioned / @here) message gets a
+    trailing ` (→ you)` marker so the recipient can tell it was aimed at them."""
+    marker = " (→ you)" if addressed else ""
+    if topic.kind == "dm":
+        return f"[dm] {message.sender}: {message.body}{marker}"
+    return f"[#{_channel_name(topic)}] {message.sender}: {message.body}{marker}"
+
+
+def _wake_topic_members(topic: message_topic.MessageTopic) -> None:
+    """Nudge every member's dispatch loop after a new message is appended, so each
+    delivers it on the next pass (mirrors _wake_subscribers for PR trackers)."""
+    for sid in topic.members:
+        _wake(sid)
+
+
+async def _deliver_messages(conn: Connection, session_id: str) -> bool:
+    """Ship every not-yet-acked message in every topic this session belongs to.
+
+    Sender-side loudness only: each NOTIFY is stamped with the per-recipient `level`
+    (compute_level) and `threshold` (the per-topic override or the agent's default) so
+    the shim can make the surface-vs-hold decision. The daemon never gates — it ships
+    eagerly, exactly as the PR path does. Returns False if the send failed (so the
+    dispatch loop tears down), True otherwise."""
+    record = REGISTRY.get_by_session(session_id)
+    if record is None:  # member that has since unregistered: nothing to address it as
+        return True
+    for topic in list(TOPICS.values()):
+        if session_id not in topic.members:
+            continue
+        acked = topic.acked.get(session_id, set())
+        threshold = messaging.effective_threshold(
+            topic.thresholds.get(session_id), record.default_threshold
+        )
+        is_dm = topic.kind == "dm"
+        for message in topic.messages:
+            if message.id in acked or message.id in conn.inflight:
+                continue
+            addressed = is_dm or record.name in message.mentions
+            level = messaging.compute_level(
+                severity=message.severity, addressed=addressed
+            )
+            payload = {
+                "type": wsproto.NOTIFY,
+                "id": message.id,
+                "content": _render_message(topic, message, addressed),
+                "meta": {
+                    "kind": "message",
+                    "context": topic.key,
+                    "from": message.sender,
+                    "intent": message.intent,
+                    "severity": message.severity,
+                    "mentions": list(message.mentions),
+                    "level": level,
+                    "threshold": threshold,
+                },
+            }
+            if not await _safe_send(conn, payload):
+                return False
+            conn.inflight.add(message.id)
+    return True
+
+
+def _get_or_create_topic(key: str, kind: str) -> message_topic.MessageTopic:
+    topic = TOPICS.get(key)
+    if topic is None:
+        topic = message_topic.MessageTopic(key, kind)
+        TOPICS[key] = topic
+    return topic
+
+
+async def _handle_join_channel(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    try:
+        key = messaging.channel_key(msg.get("channel") or "")
+        threshold = msg.get("threshold")
+        if threshold is not None:
+            messaging.validate_threshold(threshold)
+    except messaging.MessagingError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    created = key not in TOPICS
+    topic = _get_or_create_topic(key, "channel")
+    requested_topic = msg.get("topic")
+    if requested_topic and (created or not topic.messages):
+        topic.topic = requested_topic
+    topic.join(session_id, now=time.time(), threshold=threshold)
+    message_topic.save_state(_data_dir(), topic)
+    message_topic.save_subscriber(_data_dir(), topic, session_id)
+    await _send(
+        websocket,
+        wsproto.CHANNEL_JOINED,
+        msg,
+        channel=_channel_name(topic),
+        members=_member_names(topic),
+        topic=topic.topic,
+        history=[m.to_dict() for m in topic.history_tail(_channel_history_n())],
+    )
+
+
+async def _handle_leave_channel(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    try:
+        key = messaging.channel_key(msg.get("channel") or "")
+    except messaging.MessagingError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    topic = TOPICS.get(key)
+    if topic is not None and session_id in topic.members:
+        topic.leave(session_id)
+        message_topic.delete_subscriber(_data_dir(), topic, session_id)
+        message_topic.save_state(_data_dir(), topic)
+    await _send(websocket, wsproto.AGENT_OK, msg)
+
+
+def _validate_message_fields(msg: dict, default_intent: str) -> tuple[str, str]:
+    """Validate and return (intent, severity) for a post/dm, raising MessagingError."""
+    intent = msg.get("intent") or default_intent
+    severity = msg.get("severity") or "normal"
+    messaging.validate_intent(intent)
+    messaging.validate_severity(severity)
+    return intent, severity
+
+
+def _persist_post(
+    topic: message_topic.MessageTopic,
+    sender_sid: str,
+    message: message_topic.Message,
+) -> None:
+    """Common persistence after authoring a message: the sender pre-acks its own post
+    (no self-delivery), the log is appended, and state/subscriber are flushed."""
+    topic.acked.setdefault(sender_sid, set()).add(message.id)
+    message_topic.append_messages(_data_dir(), topic, [message])
+    message_topic.save_state(_data_dir(), topic)
+    message_topic.save_subscriber(_data_dir(), topic, sender_sid)
+
+
+async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    session_id = record.session_id  # narrow to str: a record always has a session
+    try:
+        key = messaging.channel_key(msg.get("channel") or "")
+        intent, severity = _validate_message_fields(msg, "fyi")
+    except messaging.MessagingError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    now = time.time()
+    topic = _get_or_create_topic(key, "channel")
+    if session_id not in topic.members:  # posting auto-joins the sender
+        topic.join(session_id, now=now)
+    message = topic.post(
+        record.name,
+        now=now,
+        body=msg.get("body") or "",
+        intent=intent,
+        severity=severity,
+        mentions=tuple(msg.get("mentions") or ()),
+    )
+    _persist_post(topic, session_id, message)
+    _wake_topic_members(topic)
+    await _send(
+        websocket,
+        wsproto.POSTED,
+        msg,
+        id=message.id,
+        context=topic.key,
+        members=len(topic.members),
+    )
+
+
+async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    session_id = record.session_id  # narrow to str: a record always has a session
+    to = msg.get("to")
+    to = [to] if isinstance(to, str) else list(to or [])
+    try:
+        intent, severity = _validate_message_fields(msg, "request")
+    except messaging.MessagingError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    if not to:
+        await _send(
+            websocket, wsproto.ERROR, msg, error="dm needs at least one recipient"
+        )
+        return
+    recipients: list[agent_registry.AgentRecord] = []
+    for name in to:
+        target = _registry_by_name(name)
+        if target is None:
+            await _send(websocket, wsproto.ERROR, msg, error=f"unknown agent {name!r}")
+            return
+        recipients.append(target)
+    participants = sorted({record.name, *(r.name for r in recipients)})
+    key = messaging.dm_key(participants)
+    now = time.time()
+    topic = _get_or_create_topic(key, "dm")
+    for sid in {session_id, *(r.session_id for r in recipients)}:
+        if sid not in topic.members:  # a DM thread's members are its participants
+            topic.join(sid, now=now)
+            message_topic.save_subscriber(_data_dir(), topic, sid)
+    message = topic.post(
+        record.name,
+        now=now,
+        body=msg.get("body") or "",
+        intent=intent,
+        severity=severity,
+    )
+    _persist_post(topic, session_id, message)
+    _wake_topic_members(topic)
+    await _send(
+        websocket,
+        wsproto.POSTED,
+        msg,
+        id=message.id,
+        context=topic.key,
+        members=len(topic.members),
+    )
+
+
+async def _handle_set_threshold(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    threshold = msg.get("threshold")
+    try:
+        messaging.validate_threshold(threshold or "")
+    except messaging.MessagingError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    context = msg.get("context") or ""
+    topic = TOPICS.get(context)
+    if topic is None or session_id not in topic.members:
+        await _send(websocket, wsproto.ERROR, msg, error=f"not a member of {context!r}")
+        return
+    topic.thresholds[session_id] = threshold
+    message_topic.save_subscriber(_data_dir(), topic, session_id)
+    await _send(websocket, wsproto.AGENT_OK, msg)
+
+
+async def _handle_set_channel_topic(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    try:
+        key = messaging.channel_key(msg.get("channel") or "")
+    except messaging.MessagingError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    topic = TOPICS.get(key)
+    if topic is None:
+        await _send(
+            websocket,
+            wsproto.ERROR,
+            msg,
+            error=f"no such channel {msg.get('channel')!r}",
+        )
+        return
+    topic.topic = msg.get("topic") or ""
+    message_topic.save_state(_data_dir(), topic)
+    await _send(websocket, wsproto.AGENT_OK, msg)
+
+
+async def _handle_list_channels(websocket, conn: Connection, msg: dict) -> None:
+    channels = [
+        {
+            "name": _channel_name(topic),
+            "topic": topic.topic,
+            "members": len(topic.members),
+            "last_activity": topic.last_activity,
+        }
+        for topic in TOPICS.values()
+        if topic.kind == "channel"
+    ]
+    await _send(websocket, wsproto.CHANNEL_LIST, msg, channels=channels)
+
+
+async def _handle_list_message_subscriptions(
+    websocket, conn: Connection, msg: dict
+) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    subscriptions = [
+        {
+            "context": topic.key,
+            "kind": topic.kind,
+            "threshold": messaging.effective_threshold(
+                topic.thresholds.get(session_id), record.default_threshold
+            ),
+        }
+        for topic in TOPICS.values()
+        if session_id in topic.members
+    ]
+    await _send(websocket, wsproto.SUBSCRIPTION_LIST, msg, subscriptions=subscriptions)
+
+
+def _reap_idle_topics(now: float) -> list[str]:
+    """Delete message topics that have been both memberless and silent past the TTL,
+    dropping them from TOPICS and from disk. Returns the keys removed."""
+    ttl = _channel_ttl_seconds()
+    removed: list[str] = []
+    for key, topic in list(TOPICS.items()):
+        if topic.reapable(now=now, ttl=ttl):
+            del TOPICS[key]
+            message_topic.delete_topic(_data_dir(), key)
+            removed.append(key)
+    return removed
+
+
 def _finalize_terminal(tracker: pr_monitor.PRTracker, session_id: str) -> None:
     """After a subscriber acks the terminal (merged/gone) event, drop them."""
     if (
@@ -643,10 +1077,15 @@ def _reap_idle_trackers(now: float) -> list[str]:
 
 async def _reaper_loop() -> None:
     while True:
-        ttl = _warm_ttl_seconds()
-        interval = max(1.0, min(ttl / 2.0, 300.0)) if ttl > 0 else 300.0
+        # Wake often enough to honor the soonest of the warm-PR and channel TTLs (half
+        # each), but never busier than every second nor idler than every 5 minutes.
+        halves = [
+            t / 2.0 for t in (_warm_ttl_seconds(), _channel_ttl_seconds()) if t > 0
+        ]
+        interval = max(1.0, min([*halves, 300.0]))
         await asyncio.sleep(interval)
         _reap_idle_trackers(time.time())
+        _reap_idle_topics(time.time())
 
 
 def _emit(tracker: pr_monitor.PRTracker, event: dict) -> None:

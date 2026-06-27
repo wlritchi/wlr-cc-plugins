@@ -17,13 +17,22 @@ import scheduler
 pytestmark = pytest.mark.slow
 
 EXPECTED_TOOLS = [
+    "catch_up",
+    "dm",
     "get_session_id",
+    "join_channel",
+    "leave_channel",
     "list_agents",
+    "list_channels",
     "list_github_pr_subscriptions",
     "list_scheduled_notifications",
+    "list_subscriptions",
+    "post",
     "register_agent",
     "schedule_test_notification",
     "set_availability",
+    "set_channel_topic",
+    "set_threshold",
     "subscribe_github_pr",
     "unregister_agent",
     "unsubscribe_github_pr",

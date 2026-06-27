@@ -13,6 +13,10 @@ of the daemon/shim split can compute the same surface decision.
 import re
 
 INTENTS = frozenset({"fyi", "question", "request", "reply"})  # reaction = Phase C
+# Severity is the sender's loudness knob: ``high`` is the ``@here`` that makes a
+# message urgent for every recipient; ``normal`` is the default; ``low`` is a hint
+# that the message is incidental (it never raises the level on its own).
+SEVERITIES = frozenset({"low", "normal", "high"})
 
 # Level (how loud the sender made a message *for this recipient*) and threshold
 # (the recipient's bar) live on one shared ordinal axis so ``should_surface`` is
@@ -39,6 +43,14 @@ class InvalidChannelName(MessagingError):
 
 class InvalidThreshold(MessagingError):
     """The threshold is not one of {all, direct, urgent}."""
+
+
+class InvalidIntent(MessagingError):
+    """The intent is not one of the known message intents."""
+
+
+class InvalidSeverity(MessagingError):
+    """The severity is not one of {low, normal, high}."""
 
 
 def compute_level(*, severity: str, addressed: bool) -> str:
@@ -95,4 +107,19 @@ def validate_threshold(threshold: str) -> None:
         raise InvalidThreshold(
             f"invalid threshold {threshold!r}: must be one of "
             f"{', '.join(sorted(_THRESHOLDS))}"
+        )
+
+
+def validate_intent(intent: str) -> None:
+    if intent not in INTENTS:
+        raise InvalidIntent(
+            f"invalid intent {intent!r}: must be one of {', '.join(sorted(INTENTS))}"
+        )
+
+
+def validate_severity(severity: str) -> None:
+    if severity not in SEVERITIES:
+        raise InvalidSeverity(
+            f"invalid severity {severity!r}: must be one of "
+            f"{', '.join(sorted(SEVERITIES))}"
         )

@@ -29,8 +29,21 @@ REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, ca
 UNREGISTER_AGENT = "unregister_agent"  # {req_id, session_id}
 LIST_AGENTS = "list_agents"  # {req_id, session_id}
 SET_AVAILABILITY = "set_availability"  # {req_id, session_id, default_threshold}
+# agent messaging (Phase B) — relay -> daemon
+JOIN_CHANNEL = "join_channel"  # {req_id, session_id, channel, threshold?, topic?}
+LEAVE_CHANNEL = "leave_channel"  # {req_id, session_id, channel}
+POST = "post"  # {req_id, session_id, channel, body, intent?, severity?, mentions?}
+DM = "dm"  # {req_id, session_id, to: [name...], body, intent?, severity?}
+SET_THRESHOLD = "set_threshold"  # {req_id, session_id, context, threshold}
+SET_CHANNEL_TOPIC = "set_channel_topic"  # {req_id, session_id, channel, topic}
+LIST_CHANNELS = "list_channels"  # {req_id, session_id}
+# NB: the bare "list_subscriptions" wire type is already the PR path (above), so the
+# messaging subscription list gets its own distinct type rather than colliding.
+LIST_MESSAGE_SUBSCRIPTIONS = "list_message_subscriptions"  # {req_id, session_id}
 
 # daemon -> relay
+# NOTIFY meta optionally carries message-gating fields when kind=="message":
+#   {kind:"message", context, level, threshold, from, intent, severity, mentions}.
 NOTIFY = "notify"  # {id, content, meta}          deliver this to the agent, then ack
 SCHEDULED = "scheduled"  # {req_id, id, due_at}
 LIST_RESULT = "list_result"  # {req_id, items}
@@ -39,6 +52,18 @@ UNSUBSCRIBED = "unsubscribed"  # {req_id, pr}
 SUBSCRIPTIONS_RESULT = "subscriptions_result"  # {req_id, items}
 AGENT_OK = "agent_ok"  # {req_id, agent}          resulting record dict (or null/{name} for unregister)
 AGENT_LIST = "agent_list"  # {req_id, agents}      [record-dict + "connected": bool]
+# agent messaging (Phase B) — daemon -> relay (AGENT_OK acks leave/set_threshold/
+# set_channel_topic; ERROR reports not-registered/unknown-name/invalid args).
+CHANNEL_JOINED = (
+    "channel_joined"  # {req_id, channel, members, topic, history: [msg...]}
+)
+POSTED = "posted"  # {req_id, id, context, members}
+CHANNEL_LIST = (
+    "channel_list"  # {req_id, channels: [{name, topic, members, last_activity}]}
+)
+SUBSCRIPTION_LIST = (
+    "subscription_list"  # {req_id, subscriptions: [{context, kind, threshold}]}
+)
 ERROR = "error"  # {req_id, error}
 
 

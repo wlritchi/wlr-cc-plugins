@@ -55,11 +55,11 @@ from websockets.exceptions import ConnectionClosed, InvalidURI, WebSocketExcepti
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import channel_detect  # noqa: E402
+import messaging  # noqa: E402
 import session_state  # noqa: E402
 import wsproto  # noqa: E402
 
 CHANNEL_METHOD = "notifications/claude/channel"
-TOOLS_CHANGED_METHOD = "notifications/tools/list_changed"
 SERVER_NAME = "notifications"  # used to locate this server's Claude Code MCP log
 # How long to wait for Claude Code to log whether we were loaded as a channel.
 CHANNEL_DETECT_TIMEOUT_SECONDS = 12.0
@@ -113,18 +113,16 @@ def _reconnect_delay(failures: int) -> float:
 
 
 INSTRUCTIONS = (
-    "This plugin delivers notifications (scheduled callbacks and GitHub PR updates) "
-    "through the Claude Code channels feature. Events normally arrive on their own as "
-    '<channel source="notifications" ...> messages; when one arrives, surface it to the '
-    "user. If a `catch_up` tool is available, this session was NOT loaded as a channel, "
-    "so notifications are not pushed automatically — call `catch_up` periodically (and "
-    "after long pauses) to retrieve pending updates."
+    "This plugin delivers notifications (scheduled callbacks, GitHub PR updates, and "
+    "agent messages) through the Claude Code channels feature. Events normally arrive "
+    'on their own as <channel source="notifications" ...> messages; when one arrives, '
+    "surface it to the user. Quiet agent messages that fall below your wake threshold "
+    "are held silently — call `catch_up` periodically (and after long pauses) to drain "
+    "them. If this session was NOT loaded as a channel, nothing is pushed automatically "
+    "and `catch_up` is the only way to retrieve pending updates."
 )
 
 mcp = FastMCP("notifications", instructions=INSTRUCTIONS)
-
-# Set once the relay learns it is not a channel and registers the catch_up tool.
-_catch_up_registered = False
 
 
 class DaemonClient:
@@ -143,6 +141,10 @@ class DaemonClient:
         self._buffer: dict[
             str, dict
         ] = {}  # notification id -> {content, meta}; held until acked
+        # Wake-gating buffer (Phase B): message notifies the shim chose not to surface
+        # (sub-threshold, or this session isn't a channel). Kept UNACKED so a reconnect
+        # re-ships them; flushed when a surfacing message arrives or catch_up drains them.
+        self._held: list[dict] = []  # [{id, content, meta}] in arrival order
         # Push-mode debounce: a burst of notifications is coalesced into one
         # channel event. Items wait here until the burst goes quiet (or caps out).
         self._pending_debounce: list[dict] = []  # [{id, content, meta}]
@@ -211,6 +213,28 @@ class DaemonClient:
             await ws.send(json.dumps({"type": wsproto.ACK, "id": notification_id}))
         except (ConnectionClosed, WebSocketException):
             pass
+
+    async def _handle_message_notify(
+        self, notification_id, content: str, meta: dict
+    ) -> None:
+        """The receiver-side gate for agent messages (Phase B).
+
+        Surface a message only when it is a channel (push) session AND the stamped
+        ``level`` clears this session's ``threshold``. On surface, it goes to the
+        debounce coalescer and the whole held backlog is flushed alongside it, and
+        every surfaced/flushed message is acked. Otherwise the message is held UNACKED
+        (sub-threshold, or this session can't push), to be drained by a later surfacing
+        message or by catch_up. The ack-on-surface invariant — never ack on mere
+        receipt — is what lets a reconnect re-ship anything still held."""
+        if self._mode == "push" and messaging.should_surface(
+            meta.get("level", "ambient"), meta.get("threshold", "direct")
+        ):
+            held, self._held = self._held, []
+            for item in held:  # flush the quiet backlog in the same channel event
+                await self._enqueue_push(item["id"], item["content"], item["meta"])
+            await self._enqueue_push(notification_id, content, meta)
+        else:
+            self._held.append({"id": notification_id, "content": content, "meta": meta})
 
     async def _enqueue_push(
         self, notification_id, content: str, meta: dict | None
@@ -289,7 +313,12 @@ class DaemonClient:
             await self._flush_debounce()
 
     async def apply_mode(self, detected: str) -> None:
-        """Switch out of buffering once we know whether we're a channel."""
+        """Switch out of buffering once we know whether we're a channel.
+
+        In push mode the PR/scheduled buffer is flushed straight to the debounce path,
+        and any agent messages held during detection are re-run through the gate (so
+        sub-threshold ones stay held rather than surfacing on mode resolution). In pull
+        mode nothing is pushed — catch_up (always registered) is the only drain."""
         if detected == channel_detect.REGISTERED:
             self._mode = "push"
             for notification_id, payload in list(
@@ -299,13 +328,13 @@ class DaemonClient:
                 await self._enqueue_push(
                     notification_id, payload["content"], payload["meta"]
                 )
+            held, self._held = self._held, []
+            for item in held:  # re-evaluate the gate now that we can push
+                await self._handle_message_notify(
+                    item["id"], item["content"], item["meta"]
+                )
         else:  # skipped or unknown: err toward no silent loss
             self._mode = "pull"
-            global _catch_up_registered
-            if not _catch_up_registered:
-                _catch_up_registered = True
-                mcp.add_tool(catch_up)
-                await self._send_raw(TOOLS_CHANGED_METHOD, {})
 
     async def detect_and_apply(self) -> None:
         start = time.time()
@@ -321,17 +350,30 @@ class DaemonClient:
         await self.apply_mode(detected)
 
     async def drain_buffer(self) -> str:
-        if not self._buffer:
+        """Drain everything pending for this session and ack it: the pull-mode buffer
+        (PR/scheduled notifications never pushed) and the wake-gating held buffer (agent
+        messages below the threshold, or that arrived while not a channel)."""
+        sections: list[str] = []
+        if self._buffer:
+            parts = [
+                "Pending notifications (this session is not a channel, so they weren't pushed automatically):",
+                "",
+            ]
+            for notification_id, payload in list(self._buffer.items()):
+                parts.append(payload.get("content", ""))
+                await self._ack(notification_id)
+                self._buffer.pop(notification_id, None)
+            sections.append("\n\n".join(parts))
+        if self._held:
+            held, self._held = self._held, []
+            parts = ["Held agent messages (below your wake threshold):", ""]
+            for item in held:
+                parts.append(item.get("content", ""))
+                await self._ack(item["id"])
+            sections.append("\n\n".join(parts))
+        if not sections:
             return "No pending notifications."
-        lines = [
-            "Pending notifications (this session is not a channel, so they weren't pushed automatically):",
-            "",
-        ]
-        for notification_id, payload in list(self._buffer.items()):
-            lines.append(payload.get("content", ""))
-            await self._ack(notification_id)
-            self._buffer.pop(notification_id, None)
-        return "\n\n".join(lines)
+        return "\n\n".join(sections)
 
     async def request(self, payload: dict) -> dict:
         """Send a request to the daemon and await its correlated reply."""
@@ -373,6 +415,9 @@ class DaemonClient:
                 self._pending_debounce = []
                 self._debounce_first = None
                 self._debounce_last = None
+                # Held messages are unacked, so the daemon re-ships them on reconnect
+                # and they'll re-hold; clear to avoid duplicating the re-shipped copies.
+                self._held = []
             stable = (
                 self._connected_once
                 and (time.monotonic() - started) >= RECONNECT_STABLE_SECONDS
@@ -406,14 +451,18 @@ class DaemonClient:
                     continue
                 if msg.get("type") == wsproto.NOTIFY:
                     notification_id = msg.get("id")
-                    if self._mode == "push":
-                        await self._enqueue_push(
-                            notification_id, msg.get("content", ""), msg.get("meta")
+                    meta = msg.get("meta") or {}
+                    content = msg.get("content", "")
+                    if meta.get("kind") == "message":  # Phase B: gated agent message
+                        await self._handle_message_notify(
+                            notification_id, content, meta
                         )
+                    elif self._mode == "push":
+                        await self._enqueue_push(notification_id, content, meta)
                     elif notification_id:  # detecting or pull: hold without acking
                         self._buffer[notification_id] = {
-                            "content": msg.get("content", ""),
-                            "meta": msg.get("meta"),
+                            "content": content,
+                            "meta": meta,
                         }
                 else:
                     stream = self._pending.get(msg.get("req_id"))
@@ -449,12 +498,14 @@ def _daemon_unreachable_message() -> str:
     )
 
 
+@mcp.tool()
 async def catch_up() -> str:
-    """Retrieve pending notifications for this session.
+    """Retrieve and acknowledge pending notifications and quiet agent messages.
 
-    This tool only exists because the session was NOT launched as a channel, so
-    notifications can't be pushed automatically — they're buffered here. Call it
-    periodically (and after long pauses) to pull and acknowledge pending updates.
+    Two things land here without interrupting you: agent messages that fell below your
+    wake threshold (a plain channel post while you're at 'direct', say), and — if this
+    session was NOT launched as a channel — every notification, since none can be pushed
+    automatically. Call it periodically (and after long pauses) to drain both.
     """
     return await DAEMON.drain_buffer()
 
@@ -800,6 +851,311 @@ async def set_availability(default_threshold: str) -> str:
         f"Wake threshold set to '{agent.get('default_threshold', default_threshold)}'. "
         "Other agents see this in list_agents."
     )
+
+
+# --------------------------------------------------------------------------- #
+# agent messaging tools (Phase B): channels + DMs
+# --------------------------------------------------------------------------- #
+#
+# Attention model (shared vocabulary across these tools):
+#   intent    fyi (default, terminal — no reply expected) | question | request | reply.
+#             Intent is display/reply semantics only; it does NOT change how loud a
+#             message is.
+#   severity  low | normal (default) | high. severity="high" is an @here: it wakes
+#             every member regardless of their threshold.
+#   mentions  a list of agent names — an @someone. A mentioned recipient is "addressed",
+#             so the message wakes them at the 'direct' threshold even without @here.
+#   threshold each recipient's bar (set via set_availability or per-context set_threshold):
+#             all (every message) < direct (mentions / DMs / @here) < urgent (@here only).
+# A message a recipient doesn't clear is held silently for their catch_up.
+
+
+def _require_session(action: str) -> str | None:
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return f"Cannot {action}: this relay does not yet know its session id."
+    return None
+
+
+def _render_history(history: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for msg in history:
+        sender = msg.get("sender", "?")
+        body = msg.get("body", "")
+        marker = " [@here]" if msg.get("severity") == "high" else ""
+        lines.append(f"    {sender}: {body}{marker}")
+    return lines
+
+
+@mcp.tool()
+async def join_channel(
+    channel: str, threshold: str | None = None, topic: str | None = None
+) -> str:
+    """Join (creating if needed) a shared channel so its messages reach you.
+
+    Channels are communal: there is no owner, joining or posting creates one, and the
+    member set is just whoever joined. Names are lowercase kebab-case (e.g. 'backend',
+    'release-2'). Joining replays no history as notifications, but the reply shows the
+    recent scrollback so you can catch up.
+
+    Args:
+        channel: the channel name (lowercase kebab-case).
+        threshold: optional per-channel wake threshold ('all', 'direct', 'urgent') that
+            overrides your global default just for this channel.
+        topic: optional one-line topic to set if the channel is new/empty.
+    """
+    if err := _require_session("join channel"):
+        return err
+    try:
+        messaging.validate_channel_name(channel or "")
+        if threshold is not None:
+            messaging.validate_threshold(threshold)
+    except messaging.MessagingError as exc:
+        return f"Could not join '{channel}': {exc}"
+    session_id, _ = session_state.effective_session_id()
+    payload: dict = {
+        "type": wsproto.JOIN_CHANNEL,
+        "session_id": session_id,
+        "channel": channel,
+    }
+    if threshold is not None:
+        payload["threshold"] = threshold
+    if topic is not None:
+        payload["topic"] = topic
+    reply = await _daemon_request(payload)
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not join '{channel}': {reply.get('error')}"
+    members = reply.get("members", [])
+    lines = [
+        f"Joined #{reply.get('channel', channel)} ({len(members)} member(s): "
+        f"{', '.join(members) if members else 'just you'})."
+    ]
+    if reply.get("topic"):
+        lines.append(f"Topic: {reply['topic']}")
+    history = reply.get("history") or []
+    if history:
+        lines.append("Recent messages:")
+        lines.extend(_render_history(history))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def leave_channel(channel: str) -> str:
+    """Leave a channel you previously joined; its messages stop reaching you."""
+    if err := _require_session("leave channel"):
+        return err
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {"type": wsproto.LEAVE_CHANNEL, "session_id": session_id, "channel": channel}
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not leave '{channel}': {reply.get('error')}"
+    return f"Left #{channel}."
+
+
+@mcp.tool()
+async def post(
+    channel: str,
+    body: str,
+    intent: str = "fyi",
+    severity: str = "normal",
+    mentions: list[str] | None = None,
+) -> str:
+    """Post a message to a channel (auto-joining it if you haven't already).
+
+    Args:
+        channel: the channel name (lowercase kebab-case). A name nobody else has joined
+            means only you will see the post — the reply's member count flags that.
+        body: the message text.
+        intent: 'fyi' (default, terminal — no reply expected), 'question', 'request',
+            or 'reply'. Intent conveys reply/display semantics, not loudness.
+        severity: 'low', 'normal' (default), or 'high'. 'high' is an @here — it wakes
+            every member no matter their threshold.
+        mentions: a list of agent names to @-mention; each mentioned member is woken at
+            the 'direct' threshold even without an @here.
+    """
+    if err := _require_session("post"):
+        return err
+    try:
+        messaging.validate_channel_name(channel or "")
+        messaging.validate_intent(intent)
+        messaging.validate_severity(severity)
+    except messaging.MessagingError as exc:
+        return f"Could not post to '{channel}': {exc}"
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {
+            "type": wsproto.POST,
+            "session_id": session_id,
+            "channel": channel,
+            "body": body,
+            "intent": intent,
+            "severity": severity,
+            "mentions": list(mentions or []),
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not post to '{channel}': {reply.get('error')}"
+    members = reply.get("members", 1)
+    if members <= 1:
+        return (
+            f"Posted to #{channel}, but you're the only member — no one else will see "
+            "it. Did you mean a different channel name?"
+        )
+    return f"Posted to #{channel} ({members} members will see it)."
+
+
+@mcp.tool()
+async def dm(
+    to: list[str], body: str, intent: str = "request", severity: str = "normal"
+) -> str:
+    """Send a direct message to one or more agents by name.
+
+    A DM is a private thread keyed by its participant set, so messaging the same people
+    again reuses one thread. Every recipient is 'addressed', so a DM wakes them at the
+    'direct' threshold (and an @here — severity='high' — overrides even 'urgent').
+
+    Args:
+        to: a list of agent names to message (see list_agents for who's around).
+        body: the message text.
+        intent: 'request' (default), 'question', 'reply', or 'fyi' (terminal — no reply
+            expected).
+        severity: 'low', 'normal' (default), or 'high' (@here).
+    """
+    if err := _require_session("send DM"):
+        return err
+    try:
+        messaging.validate_intent(intent)
+        messaging.validate_severity(severity)
+    except messaging.MessagingError as exc:
+        return f"Could not send DM: {exc}"
+    recipients = [to] if isinstance(to, str) else list(to or [])
+    if not recipients:
+        return "Could not send DM: name at least one recipient."
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {
+            "type": wsproto.DM,
+            "session_id": session_id,
+            "to": recipients,
+            "body": body,
+            "intent": intent,
+            "severity": severity,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not send DM: {reply.get('error')}"
+    return (
+        f"Sent DM to {', '.join(recipients)} ({reply.get('members', 0)} in the thread)."
+    )
+
+
+@mcp.tool()
+async def set_threshold(context: str, threshold: str) -> str:
+    """Set a per-channel/DM wake threshold, overriding your global default there.
+
+    Args:
+        context: the topic key from list_subscriptions (e.g. 'chan:backend').
+        threshold: 'all' (every message), 'direct' (mentions / DMs / @here), or
+            'urgent' (@here only).
+    """
+    if err := _require_session("set threshold"):
+        return err
+    try:
+        messaging.validate_threshold(threshold or "")
+    except messaging.MessagingError as exc:
+        return f"Could not set threshold: {exc}"
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {
+            "type": wsproto.SET_THRESHOLD,
+            "session_id": session_id,
+            "context": context,
+            "threshold": threshold,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not set threshold: {reply.get('error')}"
+    return f"Wake threshold for {context} set to '{threshold}'."
+
+
+@mcp.tool()
+async def set_channel_topic(channel: str, topic: str) -> str:
+    """Set a channel's one-line topic (the 'what this channel is for' description)."""
+    if err := _require_session("set channel topic"):
+        return err
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {
+            "type": wsproto.SET_CHANNEL_TOPIC,
+            "session_id": session_id,
+            "channel": channel,
+            "topic": topic,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not set topic for '{channel}': {reply.get('error')}"
+    return f"Topic for #{channel} set to: {topic}"
+
+
+@mcp.tool()
+async def list_channels() -> str:
+    """List every channel the daemon knows about, with topic and member count."""
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {"type": wsproto.LIST_CHANNELS, "session_id": session_id}
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not list channels: {reply.get('error')}"
+    channels = reply.get("channels", [])
+    if not channels:
+        return "No channels exist yet. Use join_channel to create one."
+    lines = ["Channels:"]
+    for ch in sorted(channels, key=lambda c: c.get("name", "")):
+        topic = f" — {ch['topic']}" if ch.get("topic") else ""
+        lines.append(
+            f"- #{ch.get('name', '?')} ({ch.get('members', 0)} member(s)){topic}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def list_subscriptions() -> str:
+    """List the channels and DMs you're in, with your effective wake threshold for each."""
+    if err := _require_session("list subscriptions"):
+        return err
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {"type": wsproto.LIST_MESSAGE_SUBSCRIPTIONS, "session_id": session_id}
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not list subscriptions: {reply.get('error')}"
+    subscriptions = reply.get("subscriptions", [])
+    if not subscriptions:
+        return "You're not in any channels or DMs yet."
+    lines = ["Your channels and DMs:"]
+    for sub in sorted(subscriptions, key=lambda s: s.get("context", "")):
+        lines.append(
+            f"- {sub.get('context', '?')} ({sub.get('kind', '?')}) — "
+            f"wake threshold: {sub.get('threshold', 'direct')}"
+        )
+    return "\n".join(lines)
 
 
 async def _serve() -> None:
