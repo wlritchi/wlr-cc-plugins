@@ -1158,6 +1158,95 @@ async def list_subscriptions() -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- #
+# receipts + reactions (Phase C)
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+async def react(message_id: str, reaction: str) -> str:
+    """React to a message with a short, TERMINAL acknowledgment.
+
+    A reaction acknowledges a message without asking for a reply, and NEVER wakes the
+    recipient — it rides at 'ambient', so the author only sees it on their next turn,
+    via catch_up, or in message_status. Prefer it over a courtesy "got it" post: it is
+    the sanctioned way to say "received" without triggering a reply or an interruption.
+
+    The reaction body is free-form but short — a single emoji or a terse token, no
+    newlines (e.g. '👍', 'ack', 'done').
+
+    Args:
+        message_id: the id of the message to react to (e.g. 'msg:chan:room:3').
+        reaction: a short, single-line reaction body.
+    """
+    if err := _require_session("react"):
+        return err
+    try:
+        messaging.validate_reaction(reaction or "")
+    except messaging.MessagingError as exc:
+        return f"Could not react: {exc}"
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {
+            "type": wsproto.REACT,
+            "session_id": session_id,
+            "target": message_id,
+            "reaction": reaction,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not react to {message_id}: {reply.get('error')}"
+    return f'Reacted "{reaction}" to {message_id} (terminal — no reply expected).'
+
+
+@mcp.tool()
+async def message_status(message_id: str) -> str:
+    """Show who has received a message, who is still pending, and any reactions to it.
+
+    'Delivered' means the message reached that agent's context — it was surfaced, or
+    drained via catch_up — NOT that they read, understood, or acted on it. A recipient
+    holding the message below their wake threshold reads as 'pending' until they
+    catch_up. The message's own author is never counted (it pre-acks its own post).
+
+    Args:
+        message_id: the id of the message to inspect (e.g. 'msg:chan:room:3').
+    """
+    if err := _require_session("check message status"):
+        return err
+    session_id, _ = session_state.effective_session_id()
+    reply = await _daemon_request(
+        {
+            "type": wsproto.MESSAGE_STATUS,
+            "session_id": session_id,
+            "target": message_id,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not get status for {message_id}: {reply.get('error')}"
+    delivered = reply.get("delivered", [])
+    pending = reply.get("pending", [])
+    reactions = reply.get("reactions", [])
+    total = len(delivered) + len(pending)
+    parts = [f"Delivered to {len(delivered)} of {total}"]
+    if delivered:
+        parts[0] += ": " + ", ".join(delivered)
+    if pending:
+        parts.append("pending: " + ", ".join(pending))
+    if reactions:
+        parts.append(
+            "reactions: "
+            + ", ".join(f"{r.get('reaction')} {r.get('by')}" for r in reactions)
+        )
+    return (
+        f"{message_id} — {'; '.join(parts)}. (Delivered means the message reached the "
+        "agent's context, not that it was read or acted on.)"
+    )
+
+
 async def _serve() -> None:
     server = mcp._mcp_server
     init_options = server.create_initialization_options(

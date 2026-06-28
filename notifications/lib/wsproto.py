@@ -38,6 +38,9 @@ SET_THRESHOLD = "set_threshold"  # {req_id, session_id, context, threshold}
 SET_CHANNEL_TOPIC = "set_channel_topic"  # {req_id, session_id, channel, topic}
 LIST_CHANNELS = "list_channels"  # {req_id, session_id}
 LIST_SUBSCRIPTIONS = "list_subscriptions"  # {req_id, session_id}
+# receipts + reactions (Phase C) — relay -> daemon
+REACT = "react"  # {req_id, session_id, target, reaction}
+MESSAGE_STATUS = "message_status"  # {req_id, session_id, target}
 
 # daemon -> relay
 # NOTIFY meta optionally carries message-gating fields when kind=="message":
@@ -62,6 +65,9 @@ CHANNEL_LIST = (
 SUBSCRIPTION_LIST = (
     "subscription_list"  # {req_id, subscriptions: [{context, kind, threshold}]}
 )
+# receipts + reactions (Phase C) — daemon -> relay (AGENT_OK acks a react, carrying
+# the reaction's own id; ERROR reports not-a-member / unknown message / invalid reaction).
+MESSAGE_STATUS_RESULT = "message_status_result"  # {req_id, delivered: [name...], pending: [name...], reactions: [{by, reaction}]}
 ERROR = "error"  # {req_id, error}
 
 

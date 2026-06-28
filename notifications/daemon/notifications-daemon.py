@@ -75,6 +75,9 @@ AGENT_TTL_DEFAULT_SECONDS = 900.0
 # reaper deletes it, and how many recent messages a join reply renders as scrollback.
 CHANNEL_TTL_DEFAULT_SECONDS = 86400.0
 CHANNEL_HISTORY_DEFAULT = 20
+# How much of a reacted-to message's body to echo back when rendering a reaction,
+# so `agent-b reacted "👍" to agent-a's "<snippet>"` stays a single readable line.
+REACTION_SNIPPET_MAX = 40
 
 
 def _warm_ttl_seconds() -> float:
@@ -413,6 +416,12 @@ async def _handle(websocket) -> None:
 
             elif kind == wsproto.LIST_SUBSCRIPTIONS:
                 await _handle_list_subscriptions(websocket, conn, msg)
+
+            elif kind == wsproto.REACT:
+                await _handle_react(websocket, conn, msg)
+
+            elif kind == wsproto.MESSAGE_STATUS:
+                await _handle_message_status(websocket, conn, msg)
     except ConnectionClosed:
         pass
     finally:
@@ -698,16 +707,48 @@ def _channel_name(topic: message_topic.MessageTopic) -> str:
     return topic.key[len("chan:") :] if topic.key.startswith("chan:") else topic.key
 
 
+def _topic_prefix(topic: message_topic.MessageTopic) -> str:
+    """The `[dm]` / `[#name]` lead-in shared by every rendered line in a topic."""
+    return "[dm]" if topic.kind == "dm" else f"[#{_channel_name(topic)}]"
+
+
+def _snippet(body: str) -> str:
+    """A short, single-line excerpt of a message body for inline reaction rendering."""
+    flat = " ".join(body.split())
+    if len(flat) <= REACTION_SNIPPET_MAX:
+        return flat
+    return flat[: REACTION_SNIPPET_MAX - 1].rstrip() + "…"
+
+
+def _render_reaction(
+    topic: message_topic.MessageTopic, message: message_topic.Message
+) -> str:
+    """Render a reaction against the message it targets, e.g.
+    `[#room] agent-b reacted "👍" to agent-a's "<snippet>"`. If the target has been
+    compacted out of the log, fall back to a generic `… to an earlier message`."""
+    prefix = _topic_prefix(topic)
+    target = next((m for m in topic.messages if m.id == message.target), None)
+    if target is None:
+        return (
+            f'{prefix} {message.sender} reacted "{message.body}" to an earlier message'
+        )
+    return (
+        f'{prefix} {message.sender} reacted "{message.body}" to '
+        f'{target.sender}\'s "{_snippet(target.body)}"'
+    )
+
+
 def _render_message(
     topic: message_topic.MessageTopic, message: message_topic.Message, addressed: bool
 ) -> str:
     """The one-line rendering a recipient sees. DMs read `[dm] sender: body`; channels
     read `[#name] sender: body`; an addressed (DM / mentioned / @here) message gets a
-    trailing ` (→ you)` marker so the recipient can tell it was aimed at them."""
+    trailing ` (→ you)` marker so the recipient can tell it was aimed at them. A
+    reaction renders against its target instead (see `_render_reaction`)."""
+    if message.intent == "reaction":
+        return _render_reaction(topic, message)
     marker = " (→ you)" if addressed else ""
-    if topic.kind == "dm":
-        return f"[dm] {message.sender}: {message.body}{marker}"
-    return f"[#{_channel_name(topic)}] {message.sender}: {message.body}{marker}"
+    return f"{_topic_prefix(topic)} {message.sender}: {message.body}{marker}"
 
 
 def _wake_topic_members(topic: message_topic.MessageTopic) -> None:
@@ -741,7 +782,9 @@ async def _deliver_messages(conn: Connection, session_id: str) -> bool:
                 continue
             addressed = is_dm or record.name in message.mentions
             level = messaging.compute_level(
-                severity=message.severity, addressed=addressed
+                severity=message.severity,
+                addressed=addressed,
+                intent=message.intent,
             )
             payload = {
                 "type": wsproto.NOTIFY,
@@ -1001,6 +1044,101 @@ async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> 
         if session_id in topic.members
     ]
     await _send(websocket, wsproto.SUBSCRIPTION_LIST, msg, subscriptions=subscriptions)
+
+
+# --------------------------------------------------------------------------- #
+# receipts + reactions (Phase C): both ride the Phase B message-topic primitive
+# --------------------------------------------------------------------------- #
+
+
+def _topic_for_message(message_id: str) -> message_topic.MessageTopic | None:
+    """Resolve the topic owning ``message_id`` (``msg:<topic_key>:<seq>``), or None.
+
+    Mirrors the ``_handle_ack`` ``msg:`` parsing: the topic key carries a ``:``
+    (``chan:`` / ``dm:``) but the trailing seq never does, so ``rpartition(':')``
+    peels the seq and the remainder (after the ``msg:`` prefix) is the topic key."""
+    if not message_id.startswith("msg:"):
+        return None
+    topic_key, _, _seq = message_id[len("msg:") :].rpartition(":")
+    return TOPICS.get(topic_key)
+
+
+async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    session_id = record.session_id  # narrow to str: a record always has a session
+    target = msg.get("target") or ""
+    reaction = msg.get("reaction") or ""
+    topic = _topic_for_message(target)
+    if topic is None or not any(m.id == target for m in topic.messages):
+        await _send(websocket, wsproto.ERROR, msg, error=f"unknown message {target!r}")
+        return
+    if session_id not in topic.members:  # reacting does not auto-join
+        await _send(
+            websocket, wsproto.ERROR, msg, error=f"not a member of {topic.key!r}"
+        )
+        return
+    try:
+        messaging.validate_reaction(reaction)
+    except messaging.MessagingError as exc:
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+    # A reaction is a real message (intent="reaction", target=<id>) on the normal post
+    # path: it persists, appears in scrollback/catch_up, and ships at ambient (forced by
+    # compute_level), so it is seen but never wakes — not even the target's author.
+    message = topic.post(
+        record.name,
+        now=time.time(),
+        body=reaction,
+        intent="reaction",
+        target=target,
+    )
+    _persist_post(topic, session_id, message)
+    _wake_topic_members(topic)
+    await _send(websocket, wsproto.AGENT_OK, msg, id=message.id)
+
+
+async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None:
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if record is None:
+        return
+    session_id = record.session_id  # narrow to str: a record always has a session
+    target = msg.get("target") or ""
+    topic = _topic_for_message(target)
+    if topic is None:
+        await _send(websocket, wsproto.ERROR, msg, error=f"unknown message {target!r}")
+        return
+    if session_id not in topic.members:
+        await _send(
+            websocket, wsproto.ERROR, msg, error=f"not a member of {topic.key!r}"
+        )
+        return
+    target_msg = next((m for m in topic.messages if m.id == target), None)
+    # The message's own author pre-acks its post, so excluding it keeps the receipt an
+    # honest tally of *recipients*. Resolve the author's session to drop it from both
+    # lists; if the message has been compacted out, there is nothing to exclude.
+    author = _registry_by_name(target_msg.sender) if target_msg is not None else None
+    author_sid = author.session_id if author is not None else None
+
+    def _names(sids: list[str]) -> list[str]:
+        out: list[str] = []
+        for sid in sids:
+            if sid == author_sid:
+                continue
+            rec = REGISTRY.get_by_session(sid)
+            out.append(rec.name if rec is not None else sid)
+        return out
+
+    delivered_sids, pending_sids = topic.delivery_status(target)
+    await _send(
+        websocket,
+        wsproto.MESSAGE_STATUS_RESULT,
+        msg,
+        delivered=_names(delivered_sids),
+        pending=_names(pending_sids),
+        reactions=[{"by": s, "reaction": b} for s, b in topic.reactions_for(target)],
+    )
 
 
 def _reap_idle_topics(now: float) -> list[str]:

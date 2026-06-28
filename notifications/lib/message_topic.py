@@ -110,9 +110,13 @@ class MessageTopic:
         intent: str = "fyi",
         severity: str = "normal",
         mentions: tuple[str, ...] = (),
+        target: str = "",
     ) -> Message:
         """Author a message: assign the next monotonic ``seq`` and the derived id
-        ``msg:<key>:<seq>``, append it, and bump ``next_seq`` and ``last_activity``."""
+        ``msg:<key>:<seq>``, append it, and bump ``next_seq`` and ``last_activity``.
+
+        ``target`` carries the reacted-to message id for a reaction (Phase C,
+        ``intent == "reaction"``); it is empty for an ordinary message."""
         seq = self.next_seq
         message = Message(
             id=f"msg:{self.key}:{seq}",
@@ -123,6 +127,7 @@ class MessageTopic:
             severity=severity,
             mentions=tuple(mentions),
             created_at=now,
+            target=target,
         )
         self.messages.append(message)
         self.next_seq = seq + 1

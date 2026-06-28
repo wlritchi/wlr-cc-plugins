@@ -513,3 +513,190 @@ def test_memberless_channel_reaped(tmp_path):
                 assert "#room" not in text
 
         anyio.run(scenario)
+
+
+def test_reaction_is_ambient_and_visible_in_status(tmp_path):
+    """A reaction is terminal + 'ambient': it never wakes the author (no channel event),
+    yet it is recorded — A sees agent-b's 👍 via message_status and, rendered against the
+    original message, in catch_up. The first post to a fresh #room is deterministically
+    msg:chan:room:0 (seq starts at 0; joining adds no message)."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store)):
+
+        async def scenario():
+            async with (
+                h.agent_session(tmp_path, ws, store, xdg, "sid-A") as (read_a, write_a),
+                h.agent_session(tmp_path, ws, store, xdg, "sid-B") as (read_b, write_b),
+            ):
+                ids_a, ids_b = count(2), count(2)
+                await _register(read_a, write_a, ids_a, "agent-a")
+                await _register(read_b, write_b, ids_b, "agent-b")
+                await _join(read_a, write_a, ids_a, "room")
+                await _join(read_b, write_b, ids_b, "room")
+
+                text, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "post",
+                    {"channel": "room", "body": "hello"},
+                )
+                assert "Posted to #room" in text
+                hello_id = "msg:chan:room:0"
+
+                text, _ = await h.mcp_call(
+                    read_b,
+                    write_b,
+                    next(ids_b),
+                    "react",
+                    {"message_id": hello_id, "reaction": "👍"},
+                )
+                assert "👍" in text and hello_id in text
+
+                # Ambient: the reaction never wakes A (no channel event within a bound).
+                assert (
+                    await h.mcp_await_channel_with(read_a, "reacted", timeout=5) is None
+                )
+
+                # Recorded, though: A sees it in message_status (B still 'pending' on the
+                # held fyi; reacting does not ack the reacted-to message).
+                status, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "message_status",
+                    {"message_id": hello_id},
+                )
+                assert "👍" in status and "agent-b" in status
+
+                # ...and it drains via catch_up, rendered against the original message.
+                drained = await _poll_call_until(
+                    read_a, write_a, ids_a, "catch_up", lambda t: "reacted" in t
+                )
+                assert "👍" in drained
+                assert "agent-b reacted" in drained
+                assert 'agent-a\'s "hello"' in drained
+
+        anyio.run(scenario)
+
+
+def test_message_status_reflects_gating(tmp_path):
+    """A read receipt tracks the ack-on-surface invariant: a plain fyi held below B's
+    'direct' bar reads as pending until B drains it, then flips to delivered. The author
+    (agent-a) is excluded from the tally — it pre-acks its own post."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store)):
+
+        async def scenario():
+            async with (
+                h.agent_session(tmp_path, ws, store, xdg, "sid-A") as (read_a, write_a),
+                h.agent_session(tmp_path, ws, store, xdg, "sid-B") as (read_b, write_b),
+            ):
+                ids_a, ids_b = count(2), count(2)
+                await _register(read_a, write_a, ids_a, "agent-a")
+                await _register(read_b, write_b, ids_b, "agent-b")
+                await _join(read_a, write_a, ids_a, "room")
+                await _join(read_b, write_b, ids_b, "room")
+
+                text, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "post",
+                    {"channel": "room", "body": "fyi thing"},
+                )
+                assert "Posted to #room" in text
+                msg_id = "msg:chan:room:0"
+
+                # Held below B's bar -> B reads as pending; the author is not counted.
+                status, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "message_status",
+                    {"message_id": msg_id},
+                )
+                assert "pending: agent-b" in status
+                assert "agent-a" not in status  # author excluded from the tally
+
+                # B drains (and acks) the held message.
+                drained = await _poll_call_until(
+                    read_b, write_b, ids_b, "catch_up", lambda t: "fyi thing" in t
+                )
+                assert "fyi thing" in drained
+
+                # The receipt now reads delivered for agent-b.
+                status = await _poll_call_until(
+                    read_a,
+                    write_a,
+                    ids_a,
+                    "message_status",
+                    lambda t: "Delivered to 1 of 1" in t,
+                    arguments={"message_id": msg_id},
+                )
+                assert "Delivered to 1 of 1" in status
+                assert "agent-b" in status
+
+        anyio.run(scenario)
+
+
+def test_invalid_reaction_rejected(tmp_path):
+    """An empty or newline-containing reaction is rejected loudly client-side and never
+    reaches the log: message_status shows no reactions afterward."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store)):
+
+        async def scenario():
+            async with (
+                h.agent_session(tmp_path, ws, store, xdg, "sid-A") as (read_a, write_a),
+                h.agent_session(tmp_path, ws, store, xdg, "sid-B") as (read_b, write_b),
+            ):
+                ids_a, ids_b = count(2), count(2)
+                await _register(read_a, write_a, ids_a, "agent-a")
+                await _register(read_b, write_b, ids_b, "agent-b")
+                await _join(read_a, write_a, ids_a, "room")
+                await _join(read_b, write_b, ids_b, "room")
+
+                text, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "post",
+                    {"channel": "room", "body": "react to me"},
+                )
+                assert "Posted to #room" in text
+                msg_id = "msg:chan:room:0"
+
+                for bad in ("", "bad\nreaction"):
+                    text, _ = await h.mcp_call(
+                        read_b,
+                        write_b,
+                        next(ids_b),
+                        "react",
+                        {"message_id": msg_id, "reaction": bad},
+                    )
+                    assert "Could not react" in text
+
+                # Nothing was posted: the message carries no reactions.
+                status, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "message_status",
+                    {"message_id": msg_id},
+                )
+                assert "reactions:" not in status
+
+        anyio.run(scenario)
