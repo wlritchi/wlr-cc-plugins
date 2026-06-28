@@ -883,7 +883,9 @@ def _render_history(history: list[dict]) -> list[str]:
         sender = msg.get("sender", "?")
         body = msg.get("body", "")
         marker = " [@here]" if msg.get("severity") == "high" else ""
-        lines.append(f"    {sender}: {body}{marker}")
+        ordinal = msg.get("ordinal")
+        handle = f"#{ordinal} " if ordinal else ""  # match the live #N rendering
+        lines.append(f"    {handle}{sender}: {body}{marker}")
     return lines
 
 
@@ -1002,13 +1004,15 @@ async def post(
         return reply
     if reply.get("type") == wsproto.ERROR:
         return f"Could not post to '{channel}': {reply.get('error')}"
+    ordinal = reply.get("ordinal")
+    handle = f" (#{ordinal})" if ordinal else ""
     members = reply.get("members", 1)
     if members <= 1:
         return (
-            f"Posted to #{channel}, but you're the only member — no one else will see "
-            "it. Did you mean a different channel name?"
+            f"Posted to #{channel}{handle}, but you're the only member — no one else "
+            "will see it. Did you mean a different channel name?"
         )
-    return f"Posted to #{channel} ({members} members will see it)."
+    return f"Posted to #{channel}{handle} — {members} members will see it."
 
 
 @mcp.tool()
@@ -1053,8 +1057,11 @@ async def dm(
         return reply
     if reply.get("type") == wsproto.ERROR:
         return f"Could not send DM: {reply.get('error')}"
+    ordinal = reply.get("ordinal")
+    handle = f" (#{ordinal})" if ordinal else ""
     return (
-        f"Sent DM to {', '.join(recipients)} ({reply.get('members', 0)} in the thread)."
+        f"Sent DM to {', '.join(recipients)}{handle} — "
+        f"{reply.get('members', 0)} in the thread."
     )
 
 
@@ -1176,7 +1183,8 @@ async def react(message_id: str, reaction: str) -> str:
     newlines (e.g. '👍', 'ack', 'done').
 
     Args:
-        message_id: the id of the message to react to (e.g. 'msg:chan:room:3').
+        message_id: which message to react to. Pass the short '#N' handle shown on any
+            message (e.g. '#147' — or just '147'), or the full id ('msg:chan:room:3').
         reaction: a short, single-line reaction body.
     """
     if err := _require_session("react"):
@@ -1211,7 +1219,8 @@ async def message_status(message_id: str) -> str:
     catch_up. The message's own author is never counted (it pre-acks its own post).
 
     Args:
-        message_id: the id of the message to inspect (e.g. 'msg:chan:room:3').
+        message_id: which message to inspect. Pass the short '#N' handle shown on any
+            message (e.g. '#147' — or just '147'), or the full id ('msg:chan:room:3').
     """
     if err := _require_session("check message status"):
         return err

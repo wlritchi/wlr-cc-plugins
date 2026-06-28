@@ -4,6 +4,7 @@ relay sessions. Proves the wake-gating split both ways — an @here clears B's
 default 'direct' threshold and surfaces as a channel event, while a plain fyi
 falls below it and is held silently until B's catch_up drains it."""
 
+import re
 import time
 from collections.abc import Callable
 from itertools import count
@@ -644,6 +645,85 @@ def test_message_status_reflects_gating(tmp_path):
                 )
                 assert "Delivered to 1 of 1" in status
                 assert "agent-b" in status
+
+        anyio.run(scenario)
+
+
+def test_global_handle_drives_react_and_status(tmp_path):
+    """The #N handle the addendum surfaces makes react/message_status usable end-to-end.
+    A posts an @here (it surfaces for B); the post reply carries the message's #N handle,
+    and B's channel event leads with that same #N. B reacts using the handle, and A reads
+    the 👍 back via both the #N handle and the equivalent full msg: id (escape hatch)."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store)):
+
+        async def scenario():
+            async with (
+                h.agent_session(tmp_path, ws, store, xdg, "sid-A") as (read_a, write_a),
+                h.agent_session(tmp_path, ws, store, xdg, "sid-B") as (read_b, write_b),
+            ):
+                ids_a, ids_b = count(2), count(2)
+                await _register(read_a, write_a, ids_a, "agent-a")
+                await _register(read_b, write_b, ids_b, "agent-b")
+                await _join(read_a, write_a, ids_a, "room")
+                await _join(read_b, write_b, ids_b, "room")
+
+                # A posts an @here so it clears B's 'direct' bar and surfaces; the reply
+                # carries the message's #N handle.
+                text, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "post",
+                    {"channel": "room", "body": "ship it", "severity": "high"},
+                )
+                assert "Posted to #room" in text
+                match = re.search(r"\(#(\d+)\)", text)
+                assert match is not None, text
+                handle = match.group(1)
+
+                # B's channel event leads with the very same #N handle.
+                event = await h.mcp_await_channel_with(read_b, "ship it", timeout=20)
+                assert event is not None
+                content = event.params["content"]
+                assert content.lstrip().startswith(f"#{handle} "), content
+                assert f"#{handle} [#room] agent-a: ship it" in content
+
+                # B reacts using the #N handle (not the full id).
+                react_text, _ = await h.mcp_call(
+                    read_b,
+                    write_b,
+                    next(ids_b),
+                    "react",
+                    {"message_id": f"#{handle}", "reaction": "👍"},
+                )
+                assert "Could not react" not in react_text
+                assert "👍" in react_text
+
+                # A reads the reaction back via the #N handle...
+                status, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "message_status",
+                    {"message_id": f"#{handle}"},
+                )
+                assert "👍" in status and "agent-b" in status
+
+                # ...and via the equivalent full msg: id (the first post to a fresh #room
+                # is deterministically msg:chan:room:0). Both forms resolve to one message.
+                status_by_id, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    next(ids_a),
+                    "message_status",
+                    {"message_id": "msg:chan:room:0"},
+                )
+                assert "👍" in status_by_id and "agent-b" in status_by_id
 
         anyio.run(scenario)
 

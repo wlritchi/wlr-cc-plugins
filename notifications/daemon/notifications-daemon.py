@@ -59,6 +59,7 @@ import message_topic  # noqa: E402
 import pr_monitor  # noqa: E402
 import pr_schedule  # noqa: E402
 import scheduler  # noqa: E402
+import storage  # noqa: E402
 import wsproto  # noqa: E402
 
 # A scheduled callback this far past due was held while nothing was connected.
@@ -137,6 +138,50 @@ REGISTRY: agent_registry.AgentRegistry = agent_registry.AgentRegistry(_data_dir(
 TOPICS: dict[str, message_topic.MessageTopic] = {
     topic.key: topic for topic in message_topic.load_all_topics(_data_dir())
 }
+
+
+def _next_ordinal_path() -> Path:
+    """Where the global message-handle counter is persisted: a single int file under
+    the message root, so it survives topic reaps (which delete per-topic dirs)."""
+    return message_topic._msg_root(_data_dir()) / ".next_ordinal"
+
+
+def _load_next_ordinal() -> int:
+    """Read the persisted next-ordinal counter, tolerantly (default 0 when absent)."""
+    try:
+        return int(_next_ordinal_path().read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _init_next_ordinal() -> int:
+    """Starting value for the global handle counter: strictly past both the persisted
+    counter and the highest ordinal across loaded messages, so handles stay unique and
+    strictly monotonic across restarts and topic reaps. Ordinals start at 1."""
+    max_seen = max(
+        (m.ordinal for topic in TOPICS.values() for m in topic.messages),
+        default=0,
+    )
+    return max(_load_next_ordinal(), 1 + max_seen)
+
+
+# Daemon-global, monotonic message-handle counter (Phase C addendum). The lib stays
+# counter-agnostic; the daemon allocates an ordinal per post and passes it into
+# MessageTopic.post, so every channel/DM/reaction message gets a stable, globally
+# unique `#N` handle agents can pass back to react / message_status.
+_NEXT_ORDINAL: int = _init_next_ordinal()
+
+
+def _alloc_ordinal() -> int:
+    """Return the current global ordinal, then advance and persist it. Persisting the
+    advanced value keeps handles strictly monotonic across restarts and reaps."""
+    global _NEXT_ORDINAL
+    value = _NEXT_ORDINAL
+    _NEXT_ORDINAL += 1
+    storage.atomic_write(_next_ordinal_path(), str(_NEXT_ORDINAL))
+    return value
+
+
 GH: github_client.GitHubClient | None = None
 # Shared secret each relay must present (Authorization: Bearer <token>) to connect.
 # Computed once at startup; relays compute the same value from NOTIFICATIONS_DATA_DIR.
@@ -720,35 +765,56 @@ def _snippet(body: str) -> str:
     return flat[: REACTION_SNIPPET_MAX - 1].rstrip() + "…"
 
 
+def _msg_handle(message: message_topic.Message) -> str:
+    """The bare `#N` handle for a message, or `""` when its ordinal is unset (legacy)."""
+    return f"#{message.ordinal}" if message.ordinal else ""
+
+
+def _handle_prefix(message: message_topic.Message) -> str:
+    """The leading `#N ` a rendered line opens with, or `""` for an unset ordinal."""
+    handle = _msg_handle(message)
+    return f"{handle} " if handle else ""
+
+
 def _render_reaction(
     topic: message_topic.MessageTopic, message: message_topic.Message
 ) -> str:
     """Render a reaction against the message it targets, e.g.
-    `[#room] agent-b reacted "👍" to agent-a's "<snippet>"`. If the target has been
-    compacted out of the log, fall back to a generic `… to an earlier message`."""
+    `#150 [#room] agent-b reacted "👍" to #147 (agent-a's "<snippet>")`. The line leads
+    with the reaction's own handle and references the target's handle; if the target has
+    been compacted out of the log, fall back to a generic `… to an earlier message`."""
     prefix = _topic_prefix(topic)
+    lead = _handle_prefix(message)
     target = next((m for m in topic.messages if m.id == message.target), None)
     if target is None:
         return (
-            f'{prefix} {message.sender} reacted "{message.body}" to an earlier message'
+            f'{lead}{prefix} {message.sender} reacted "{message.body}" '
+            "to an earlier message"
         )
+    target_handle = _msg_handle(target)
+    ref = f"{target_handle} " if target_handle else ""
     return (
-        f'{prefix} {message.sender} reacted "{message.body}" to '
-        f'{target.sender}\'s "{_snippet(target.body)}"'
+        f'{lead}{prefix} {message.sender} reacted "{message.body}" to '
+        f'{ref}({target.sender}\'s "{_snippet(target.body)}")'
     )
 
 
 def _render_message(
     topic: message_topic.MessageTopic, message: message_topic.Message, addressed: bool
 ) -> str:
-    """The one-line rendering a recipient sees. DMs read `[dm] sender: body`; channels
-    read `[#name] sender: body`; an addressed (DM / mentioned / @here) message gets a
-    trailing ` (→ you)` marker so the recipient can tell it was aimed at them. A
-    reaction renders against its target instead (see `_render_reaction`)."""
+    """The one-line rendering a recipient sees. Every line leads with the message's
+    `#N` handle (omitted only for a legacy/unset ordinal). DMs read
+    `#N [dm] sender: body`; channels read `#N [#name] sender: body`; an addressed (DM /
+    mentioned / @here) message gets a trailing ` (→ you)` marker so the recipient can
+    tell it was aimed at them. A reaction renders against its target instead (see
+    `_render_reaction`)."""
     if message.intent == "reaction":
         return _render_reaction(topic, message)
     marker = " (→ you)" if addressed else ""
-    return f"{_topic_prefix(topic)} {message.sender}: {message.body}{marker}"
+    return (
+        f"{_handle_prefix(message)}{_topic_prefix(topic)} "
+        f"{message.sender}: {message.body}{marker}"
+    )
 
 
 def _wake_topic_members(topic: message_topic.MessageTopic) -> None:
@@ -907,6 +973,7 @@ async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
         intent=intent,
         severity=severity,
         mentions=tuple(msg.get("mentions") or ()),
+        ordinal=_alloc_ordinal(),
     )
     _persist_post(topic, session_id, message)
     _wake_topic_members(topic)
@@ -915,6 +982,7 @@ async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
         wsproto.POSTED,
         msg,
         id=message.id,
+        ordinal=message.ordinal,
         context=topic.key,
         members=len(topic.members),
     )
@@ -958,6 +1026,7 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
         body=msg.get("body") or "",
         intent=intent,
         severity=severity,
+        ordinal=_alloc_ordinal(),
     )
     _persist_post(topic, session_id, message)
     _wake_topic_members(topic)
@@ -966,6 +1035,7 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
         wsproto.POSTED,
         msg,
         id=message.id,
+        ordinal=message.ordinal,
         context=topic.key,
         members=len(topic.members),
     )
@@ -1063,17 +1133,52 @@ def _topic_for_message(message_id: str) -> message_topic.MessageTopic | None:
     return TOPICS.get(topic_key)
 
 
+def _message_by_ordinal(
+    n: int,
+) -> tuple[message_topic.MessageTopic, message_topic.Message] | None:
+    """The (topic, message) for global ordinal ``n``, found by scanning TOPICS. Ordinals
+    are globally unique, so there is at most one match; react/message_status are
+    low-frequency, so a scan beats maintaining a dedicated index."""
+    for topic in TOPICS.values():
+        for message in topic.messages:
+            if message.ordinal == n:
+                return topic, message
+    return None
+
+
+def _resolve_target(
+    s: str,
+) -> tuple[message_topic.MessageTopic, message_topic.Message] | None:
+    """Resolve an agent-supplied message reference to (topic, message).
+
+    Accepts a ``#N`` / ``N`` global handle (resolved by ordinal) or a full ``msg:`` id
+    (the always-available escape hatch). Returns None when nothing matches."""
+    ordinal = messaging.parse_handle(s)
+    if ordinal is not None:
+        return _message_by_ordinal(ordinal)
+    if s.startswith("msg:"):
+        topic = _topic_for_message(s)
+        if topic is None:
+            return None
+        message = next((m for m in topic.messages if m.id == s), None)
+        return (topic, message) if message is not None else None
+    return None
+
+
 async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
     session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     session_id = record.session_id  # narrow to str: a record always has a session
-    target = msg.get("target") or ""
+    raw_target = msg.get("target") or ""
     reaction = msg.get("reaction") or ""
-    topic = _topic_for_message(target)
-    if topic is None or not any(m.id == target for m in topic.messages):
-        await _send(websocket, wsproto.ERROR, msg, error=f"unknown message {target!r}")
+    resolved = _resolve_target(raw_target)
+    if resolved is None:
+        await _send(
+            websocket, wsproto.ERROR, msg, error=f"unknown message {raw_target!r}"
+        )
         return
+    topic, target_message = resolved
     if session_id not in topic.members:  # reacting does not auto-join
         await _send(
             websocket, wsproto.ERROR, msg, error=f"not a member of {topic.key!r}"
@@ -1084,15 +1189,18 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
     except messaging.MessagingError as exc:
         await _send(websocket, wsproto.ERROR, msg, error=str(exc))
         return
-    # A reaction is a real message (intent="reaction", target=<id>) on the normal post
-    # path: it persists, appears in scrollback/catch_up, and ships at ambient (forced by
-    # compute_level), so it is seen but never wakes — not even the target's author.
+    # A reaction is a real message (intent="reaction", target=<resolved id>) on the
+    # normal post path: it persists, appears in scrollback/catch_up, and ships at ambient
+    # (forced by compute_level), so it is seen but never wakes — not even the author. It
+    # gets its own handle too (uniform). target is the resolved full id so reactions_for
+    # / the render lookup key correctly even when the agent reacted via a #N handle.
     message = topic.post(
         record.name,
         now=time.time(),
         body=reaction,
         intent="reaction",
-        target=target,
+        target=target_message.id,
+        ordinal=_alloc_ordinal(),
     )
     _persist_post(topic, session_id, message)
     _wake_topic_members(topic)
@@ -1104,21 +1212,26 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
     if record is None:
         return
     session_id = record.session_id  # narrow to str: a record always has a session
-    target = msg.get("target") or ""
-    topic = _topic_for_message(target)
-    if topic is None:
-        await _send(websocket, wsproto.ERROR, msg, error=f"unknown message {target!r}")
+    raw_target = msg.get("target") or ""
+    resolved = _resolve_target(raw_target)
+    if resolved is None:
+        await _send(
+            websocket, wsproto.ERROR, msg, error=f"unknown message {raw_target!r}"
+        )
         return
+    topic, target_msg = resolved
     if session_id not in topic.members:
         await _send(
             websocket, wsproto.ERROR, msg, error=f"not a member of {topic.key!r}"
         )
         return
-    target_msg = next((m for m in topic.messages if m.id == target), None)
+    # delivery_status / reactions_for key on the resolved message's full id, regardless
+    # of whether the agent referenced it by #N handle or full id.
+    target = target_msg.id
     # The message's own author pre-acks its post, so excluding it keeps the receipt an
     # honest tally of *recipients*. Resolve the author's session to drop it from both
-    # lists; if the message has been compacted out, there is nothing to exclude.
-    author = _registry_by_name(target_msg.sender) if target_msg is not None else None
+    # lists (None when the author has since unregistered — then nothing is excluded).
+    author = _registry_by_name(target_msg.sender)
     author_sid = author.session_id if author is not None else None
 
     def _names(sids: list[str]) -> list[str]:

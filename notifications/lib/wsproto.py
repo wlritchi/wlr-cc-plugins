@@ -58,7 +58,7 @@ AGENT_LIST = "agent_list"  # {req_id, agents}      [record-dict + "connected": b
 CHANNEL_JOINED = (
     "channel_joined"  # {req_id, channel, members, topic, history: [msg...]}
 )
-POSTED = "posted"  # {req_id, id, context, members}
+POSTED = "posted"  # {req_id, id, ordinal, context, members}
 CHANNEL_LIST = (
     "channel_list"  # {req_id, channels: [{name, topic, members, last_activity}]}
 )

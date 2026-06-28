@@ -93,6 +93,23 @@ def should_surface(level: str, threshold: str) -> bool:
     return _LEVELS[level] >= _THRESHOLDS[threshold]
 
 
+def parse_handle(s: str) -> int | None:
+    """Parse an agent-facing message handle to its global ordinal.
+
+    Accepts ``"#147"`` or ``"147"`` (an optional leading ``#`` then a positive
+    integer) and returns the ordinal. Returns ``None`` for a full ``"msg:"`` id, an
+    empty/blank string, ``"#"``, ``"#0"`` / non-positive values, or anything
+    non-numeric — the caller then treats the input as a full message id. Pure.
+    """
+    s = s.strip()
+    if s.startswith("#"):
+        s = s[1:]
+    if not (s.isascii() and s.isdigit()):  # isascii guards against e.g. superscripts
+        return None
+    n = int(s)
+    return n if n > 0 else None
+
+
 def dm_key(names: list[str]) -> str:
     """Stable topic key for a DM among ``names``.
 

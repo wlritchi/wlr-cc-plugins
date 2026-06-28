@@ -39,6 +39,9 @@ class Message:
     mentions: tuple[str, ...] = ()
     created_at: float = 0.0
     target: str = ""  # reacted-to message id (Phase C); empty for normal messages
+    # Daemon-global, monotonic message handle (Phase C addendum). 0 == unset/legacy;
+    # the daemon allocates and passes it in, the lib stays counter-agnostic.
+    ordinal: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +54,7 @@ class Message:
             "mentions": list(self.mentions),
             "created_at": self.created_at,
             "target": self.target,
+            "ordinal": self.ordinal,
         }
 
     @classmethod
@@ -65,6 +69,7 @@ class Message:
             mentions=tuple(data.get("mentions", ())),
             created_at=float(data.get("created_at", 0.0)),
             target=data.get("target", ""),
+            ordinal=int(data.get("ordinal", 0)),
         )
 
 
@@ -111,12 +116,15 @@ class MessageTopic:
         severity: str = "normal",
         mentions: tuple[str, ...] = (),
         target: str = "",
+        ordinal: int = 0,
     ) -> Message:
         """Author a message: assign the next monotonic ``seq`` and the derived id
         ``msg:<key>:<seq>``, append it, and bump ``next_seq`` and ``last_activity``.
 
         ``target`` carries the reacted-to message id for a reaction (Phase C,
-        ``intent == "reaction"``); it is empty for an ordinary message."""
+        ``intent == "reaction"``); it is empty for an ordinary message. ``ordinal`` is
+        the daemon-allocated global message handle (0 leaves it unset — the lib does
+        not own the counter)."""
         seq = self.next_seq
         message = Message(
             id=f"msg:{self.key}:{seq}",
@@ -128,6 +136,7 @@ class MessageTopic:
             mentions=tuple(mentions),
             created_at=now,
             target=target,
+            ordinal=ordinal,
         )
         self.messages.append(message)
         self.next_seq = seq + 1

@@ -119,6 +119,28 @@ def test_channel_key() -> None:
         m.channel_key("Bad Name")
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("#147", 147),  # canonical handle
+        ("147", 147),  # bare ordinal
+        ("#1", 1),
+        ("  #147  ", 147),  # surrounding whitespace tolerated
+        ("msg:chan:room:3", None),  # a full id is not a handle
+        ("", None),
+        ("#", None),
+        ("#0", None),  # zero is non-positive
+        ("0", None),
+        ("-5", None),  # negatives are not ordinals
+        ("abc", None),
+        ("12x", None),  # not purely numeric
+        ("#12.5", None),
+    ],
+)
+def test_parse_handle(raw: str, expected: int | None) -> None:
+    assert m.parse_handle(raw) == expected
+
+
 @pytest.mark.parametrize("good", ["ab", "a1", "my-chan", "a-b-c", "x" * 64])
 def test_valid_channel_names(good: str) -> None:
     m.validate_channel_name(good)  # must not raise
@@ -201,6 +223,21 @@ def test_message_defaults() -> None:
     assert msg.mentions == ()
     assert msg.created_at == 0.0
     assert msg.target == ""  # normal messages carry no reaction target
+    assert msg.ordinal == 0  # 0 == unset/legacy; the daemon allocates the handle
+
+
+def test_message_ordinal_round_trips() -> None:
+    msg = Message(id="msg:chan:x:0", seq=0, sender="s", body="b", ordinal=147)
+    d = msg.to_dict()
+    assert d["ordinal"] == 147
+    assert Message.from_dict(d) == msg
+
+    # The field is always present in to_dict and defaults to 0; from_dict tolerates a
+    # legacy dict written before ordinals existed.
+    plain = Message(id="i", seq=0, sender="s", body="b")
+    assert plain.to_dict()["ordinal"] == 0
+    legacy = {k: v for k, v in plain.to_dict().items() if k != "ordinal"}
+    assert Message.from_dict(legacy).ordinal == 0
 
 
 def test_message_target_round_trips() -> None:
@@ -292,6 +329,15 @@ def test_post_assigns_increasing_seq_id_and_bumps_activity() -> None:
     assert b.sender == "s2"
     assert b.mentions == ("s1",)
     assert b.created_at == 20.0
+
+
+def test_post_stores_passed_ordinal() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    msg = topic.post("s1", now=1.0, body="hi", ordinal=147)
+    assert msg.ordinal == 147
+    # The lib does not own the counter: omitting the param leaves the ordinal unset.
+    plain = topic.post("s1", now=2.0, body="ho")
+    assert plain.ordinal == 0
 
 
 def test_history_tail() -> None:
