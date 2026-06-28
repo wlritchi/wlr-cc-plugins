@@ -151,3 +151,41 @@ Do not bump manually — `version-bump.yml` handles both manifests on push to ma
 Threads / `reply_to` / reply-to-author addressing, feeds, role-spawn, hook-based
 active/parked detection, a fixed reaction vocabulary. The `target` field is for
 reactions only; threading gets its own field later.
+
+## Addendum — global message handles (`#N`)
+
+`react`/`message_status` take a message id, but slice 2 left no agent-facing path
+that *surfaces* one, so the tools aren't usable until ids are discoverable.
+Decision: expose a **global per-message ordinal** rendered `#N` — chosen over
+git-style hash prefixes because it's stable, never ambiguous, and uniform across
+channels and DMs (the message-volume it leaks is meaningless in a single-user
+daemon, and "tracking handles" collapses to incrementing a counter).
+
+Design:
+
+- **Ordinal.** Every posted message (reactions included) gets a daemon-global
+  monotonic `ordinal: int` (from 1). `Message` gains the field
+  (`to_dict`/`from_dict`); `MessageTopic.post` gains an `ordinal` param — the lib
+  stays counter-agnostic, the daemon allocates.
+- **Counter.** Persisted at `<data_dir>/msg/.next_ordinal`; on startup
+  `next = max(file, 1 + max ordinal across loaded messages)` so it's strictly
+  monotonic across topic reaps and restarts; advanced + persisted per post.
+- **Resolution.** `_message_by_ordinal(n)` scans `TOPICS` for the message with
+  that ordinal (globally unique ⇒ ≤1 match; `react`/`message_status` are
+  low-frequency, so a scan beats maintaining an index). `_resolve_target(s)`
+  accepts `#N`, `N`, or a full `msg:` id and returns `(topic, message)`; the full
+  id is always an escape hatch. Authorization stays per-topic (caller must be a
+  member of the resolved message's topic).
+- **Surfacing.** Every rendered line leads with the handle, e.g.
+  `#147 [#room] agent-a: ship it (→ you)`; a reaction references its target's
+  handle: `#150 [#room] agent-b reacted "👍" to #147 (agent-a's "<snippet>")`.
+  `POSTED` gains `ordinal`, so `post`/`dm` replies read "… (#147)"; the join
+  history tail and `catch_up` render handles too.
+- **Tools.** `react`/`message_status` accept `#N` / `N` / full id (daemon resolves
+  via `_resolve_target`).
+
+Build: one vertical (lib field + daemon counter/resolver/render + relay reply &
+history rendering + the two tools) with unit tests (ordinal assignment,
+by-ordinal + handle-or-id resolution, render includes the handle) and e2e (react
+and message_status driven by a `#N` the agent reads from a post reply / channel
+line — the end-to-end usability this addendum exists to deliver).
