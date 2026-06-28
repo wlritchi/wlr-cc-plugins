@@ -23,7 +23,7 @@ ACK = "ack"  # {id}                              a delivered notification was ha
 LIST = "list"  # {req_id, session_id}
 SUBSCRIBE_PR = "subscribe_pr"  # {req_id, session_id, owner, repo, number}
 UNSUBSCRIBE_PR = "unsubscribe_pr"  # {req_id, session_id, owner, repo, number}
-LIST_SUBSCRIPTIONS = "list_subscriptions"  # {req_id, session_id}
+LIST_PR_SUBSCRIPTIONS = "list_pr_subscriptions"  # {req_id, session_id}
 # agent directory (Phase A)
 REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?}
 UNREGISTER_AGENT = "unregister_agent"  # {req_id, session_id}
@@ -37,9 +37,7 @@ DM = "dm"  # {req_id, session_id, to: [name...], body, intent?, severity?}
 SET_THRESHOLD = "set_threshold"  # {req_id, session_id, context, threshold}
 SET_CHANNEL_TOPIC = "set_channel_topic"  # {req_id, session_id, channel, topic}
 LIST_CHANNELS = "list_channels"  # {req_id, session_id}
-# NB: the bare "list_subscriptions" wire type is already the PR path (above), so the
-# messaging subscription list gets its own distinct type rather than colliding.
-LIST_MESSAGE_SUBSCRIPTIONS = "list_message_subscriptions"  # {req_id, session_id}
+LIST_SUBSCRIPTIONS = "list_subscriptions"  # {req_id, session_id}
 
 # daemon -> relay
 # NOTIFY meta optionally carries message-gating fields when kind=="message":

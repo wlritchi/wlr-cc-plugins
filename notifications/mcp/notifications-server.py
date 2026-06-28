@@ -660,7 +660,7 @@ async def list_github_pr_subscriptions() -> str:
     if not session_id:
         return "Session id unknown; cannot list PR subscriptions."
     reply = await _daemon_request(
-        {"type": wsproto.LIST_SUBSCRIPTIONS, "session_id": session_id}
+        {"type": wsproto.LIST_PR_SUBSCRIPTIONS, "session_id": session_id}
     )
     if isinstance(reply, str):
         return reply
@@ -1140,7 +1140,7 @@ async def list_subscriptions() -> str:
         return err
     session_id, _ = session_state.effective_session_id()
     reply = await _daemon_request(
-        {"type": wsproto.LIST_MESSAGE_SUBSCRIPTIONS, "session_id": session_id}
+        {"type": wsproto.LIST_SUBSCRIPTIONS, "session_id": session_id}
     )
     if isinstance(reply, str):
         return reply

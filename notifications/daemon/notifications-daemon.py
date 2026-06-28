@@ -375,8 +375,8 @@ async def _handle(websocket) -> None:
                 _handle_unsubscribe(conn, msg)
                 await _send(websocket, wsproto.UNSUBSCRIBED, msg, pr=_msg_key(msg))
 
-            elif kind == wsproto.LIST_SUBSCRIPTIONS:
-                await _handle_list_subscriptions(websocket, conn, msg)
+            elif kind == wsproto.LIST_PR_SUBSCRIPTIONS:
+                await _handle_list_pr_subscriptions(websocket, conn, msg)
 
             elif kind == wsproto.REGISTER_AGENT:
                 await _handle_register_agent(websocket, conn, msg)
@@ -411,8 +411,8 @@ async def _handle(websocket) -> None:
             elif kind == wsproto.LIST_CHANNELS:
                 await _handle_list_channels(websocket, conn, msg)
 
-            elif kind == wsproto.LIST_MESSAGE_SUBSCRIPTIONS:
-                await _handle_list_message_subscriptions(websocket, conn, msg)
+            elif kind == wsproto.LIST_SUBSCRIPTIONS:
+                await _handle_list_subscriptions(websocket, conn, msg)
     except ConnectionClosed:
         pass
     finally:
@@ -573,7 +573,7 @@ def _handle_unsubscribe(conn: Connection, msg: dict) -> None:
                 _remove_tracker(key)
 
 
-async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> None:
+async def _handle_list_pr_subscriptions(websocket, conn: Connection, msg: dict) -> None:
     session_id = conn.session_id or msg.get("session_id")
     items = [
         {
@@ -985,9 +985,7 @@ async def _handle_list_channels(websocket, conn: Connection, msg: dict) -> None:
     await _send(websocket, wsproto.CHANNEL_LIST, msg, channels=channels)
 
 
-async def _handle_list_message_subscriptions(
-    websocket, conn: Connection, msg: dict
-) -> None:
+async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> None:
     session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
