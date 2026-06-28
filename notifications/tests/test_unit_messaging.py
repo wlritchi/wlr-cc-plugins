@@ -34,6 +34,36 @@ def test_compute_level_matrix(severity: str, addressed: bool, expected: str) -> 
     assert m.compute_level(severity=severity, addressed=addressed) == expected
 
 
+def test_compute_level_default_intent_matches_explicit_fyi() -> None:
+    # The intent="fyi" default leaves every existing caller's result unchanged.
+    for severity in ("low", "normal", "high"):
+        for addressed in (True, False):
+            assert m.compute_level(
+                severity=severity, addressed=addressed
+            ) == m.compute_level(severity=severity, addressed=addressed, intent="fyi")
+
+
+@pytest.mark.parametrize(
+    "severity, addressed",
+    [
+        ("high", True),  # reaction beats @here...
+        ("high", False),
+        ("normal", True),  # ...and beats addressing
+        ("normal", False),
+        ("low", False),
+    ],
+)
+def test_compute_level_reaction_is_always_ambient(
+    severity: str, addressed: bool
+) -> None:
+    # A reaction never wakes anyone: it is ambient even when it would otherwise be
+    # urgent (high severity) or direct (addressed).
+    assert (
+        m.compute_level(severity=severity, addressed=addressed, intent="reaction")
+        == "ambient"
+    )
+
+
 def test_should_surface_full_matrix() -> None:
     levels = {"ambient": 0, "direct": 1, "urgent": 2}
     thresholds = {"all": 0, "direct": 1, "urgent": 2}
@@ -114,8 +144,29 @@ def test_invalid_thresholds(bad: str) -> None:
         m.validate_threshold(bad)
 
 
+@pytest.mark.parametrize("good", ["👍", "ok", "ack", "x", "y" * m.REACTION_MAX])
+def test_valid_reactions(good: str) -> None:
+    m.validate_reaction(good)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",  # empty
+        "   ",  # whitespace-only
+        "\t",  # whitespace-only
+        "x" * (m.REACTION_MAX + 1),  # too long
+        "a\nb",  # contains a newline
+        "\n",  # newline only
+    ],
+)
+def test_invalid_reactions(bad: str) -> None:
+    with pytest.raises(m.InvalidReaction):
+        m.validate_reaction(bad)
+
+
 def test_exception_hierarchy() -> None:
-    for exc in (m.InvalidChannelName, m.InvalidThreshold):
+    for exc in (m.InvalidChannelName, m.InvalidThreshold, m.InvalidReaction):
         assert issubclass(exc, m.MessagingError)
     assert issubclass(m.MessagingError, ValueError)
 
@@ -149,6 +200,29 @@ def test_message_defaults() -> None:
     assert msg.severity == "normal"
     assert msg.mentions == ()
     assert msg.created_at == 0.0
+    assert msg.target == ""  # normal messages carry no reaction target
+
+
+def test_message_target_round_trips() -> None:
+    # A reaction message: target points at the reacted-to message id.
+    reaction = Message(
+        id="msg:chan:x:5",
+        seq=5,
+        sender="s2",
+        body="👍",
+        intent="reaction",
+        target="msg:chan:x:2",
+    )
+    d = reaction.to_dict()
+    assert d["target"] == "msg:chan:x:2"
+    assert Message.from_dict(d) == reaction
+
+    # The field is always present in to_dict and defaults to "" for normal
+    # messages; from_dict tolerates a legacy dict without it.
+    plain = Message(id="i", seq=0, sender="s", body="b")
+    assert plain.to_dict()["target"] == ""
+    legacy = {k: v for k, v in plain.to_dict().items() if k != "target"}
+    assert Message.from_dict(legacy).target == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -226,6 +300,56 @@ def test_history_tail() -> None:
     assert topic.history_tail(2) == msgs[-2:]
     assert topic.history_tail(0) == []
     assert topic.history_tail(10) == msgs  # n larger than count -> all
+
+
+def test_delivery_status_partitions_members_by_acked() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    topic.join("s-a", now=0.0)
+    topic.join("s-b", now=0.0)
+    topic.join("s-c", now=0.0)
+    msg = _post(topic, "s-a", now=1.0)  # post-join, so unacked for everyone
+    # Two members have surfaced/acked it; s-b is still holding it (sub-threshold).
+    topic.acked["s-a"].add(msg.id)
+    topic.acked["s-c"].add(msg.id)
+
+    delivered, pending = topic.delivery_status(msg.id)
+    assert delivered == ["s-a", "s-c"]  # sorted
+    assert pending == ["s-b"]
+
+    # A message id nobody has acked -> everyone pending; result stays sorted.
+    delivered, pending = topic.delivery_status("msg:chan:general:999")
+    assert delivered == []
+    assert pending == ["s-a", "s-b", "s-c"]
+
+
+def test_reactions_for_filters_by_target_and_intent_in_order() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    target_x = _post(topic, "s1", now=1.0, body="hello")  # the reacted-to message
+    target_y = _post(topic, "s2", now=2.0, body="other")
+
+    def _react(sender: str, body: str, target: str, now: float) -> None:
+        seq = topic.next_seq
+        topic.messages.append(
+            Message(
+                id=f"msg:{topic.key}:{seq}",
+                seq=seq,
+                sender=sender,
+                body=body,
+                intent="reaction",
+                target=target,
+                created_at=now,
+            )
+        )
+        topic.next_seq = seq + 1
+
+    _react("s2", "👍", target_x.id, now=3.0)
+    _post(topic, "s3", now=4.0, body="a normal message, not a reaction")
+    _react("s3", "🎉", target_y.id, now=5.0)  # reacts to Y, must be excluded
+    _react("s4", "ack", target_x.id, now=6.0)
+
+    assert topic.reactions_for(target_x.id) == [("s2", "👍"), ("s4", "ack")]
+    assert topic.reactions_for(target_y.id) == [("s3", "🎉")]
+    assert topic.reactions_for("msg:chan:general:404") == []
 
 
 def test_reapable_member_present_is_false() -> None:

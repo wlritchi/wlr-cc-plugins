@@ -38,6 +38,7 @@ class Message:
     severity: str = "normal"
     mentions: tuple[str, ...] = ()
     created_at: float = 0.0
+    target: str = ""  # reacted-to message id (Phase C); empty for normal messages
 
     def to_dict(self) -> dict:
         return {
@@ -49,6 +50,7 @@ class Message:
             "severity": self.severity,
             "mentions": list(self.mentions),
             "created_at": self.created_at,
+            "target": self.target,
         }
 
     @classmethod
@@ -62,6 +64,7 @@ class Message:
             severity=data.get("severity", "normal"),
             mentions=tuple(data.get("mentions", ())),
             created_at=float(data.get("created_at", 0.0)),
+            target=data.get("target", ""),
         )
 
 
@@ -131,6 +134,30 @@ class MessageTopic:
         if n <= 0:
             return []
         return self.messages[-n:]
+
+    def delivery_status(self, message_id: str) -> tuple[list[str], list[str]]:
+        """Partition current members into ``(delivered_sids, pending_sids)`` by
+        whether they have acked ``message_id``. ``acked`` reflects ack-on-surface,
+        so a member with a held (sub-threshold) message reads as pending until it
+        drains. Both lists are sorted for determinism. Pure: a bogus ``message_id``
+        nobody has acked simply yields everyone as pending."""
+        delivered: list[str] = []
+        pending: list[str] = []
+        for sid in self.members:
+            if message_id in self.acked.get(sid, set()):
+                delivered.append(sid)
+            else:
+                pending.append(sid)
+        return sorted(delivered), sorted(pending)
+
+    def reactions_for(self, message_id: str) -> list[tuple[str, str]]:
+        """``(sender, body)`` for every logged reaction targeting ``message_id``,
+        in seq order (messages are already kept in seq order)."""
+        return [
+            (msg.sender, msg.body)
+            for msg in self.messages
+            if msg.intent == "reaction" and msg.target == message_id
+        ]
 
     def reapable(self, *, now: float, ttl: float) -> bool:
         """True once the topic has been both memberless and silent for ``ttl``

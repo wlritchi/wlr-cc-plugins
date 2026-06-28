@@ -32,6 +32,11 @@ _NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NAME_MIN = 2
 _NAME_MAX = 64
 
+# A reaction body is free-form but short (Phase C): a single emoji or a terse
+# token, no newlines. The bound keeps reactions visually second-class to real
+# messages and cheap to render inline.
+REACTION_MAX = 64
+
 
 class MessagingError(ValueError):
     """Base class for messaging errors; the daemon maps these to ERROR replies."""
@@ -53,14 +58,23 @@ class InvalidSeverity(MessagingError):
     """The severity is not one of {low, normal, high}."""
 
 
-def compute_level(*, severity: str, addressed: bool) -> str:
+class InvalidReaction(MessagingError):
+    """The reaction body is empty, too long, or contains a newline."""
+
+
+def compute_level(*, severity: str, addressed: bool, intent: str = "fyi") -> str:
     """Sender-side loudness for one recipient.
 
-    ``urgent`` when the message is an ``@here`` (``severity == "high"``); else
-    ``direct`` when the recipient is addressed (a DM recipient or ``@``-mentioned);
-    else ``ambient``. Intent is orthogonal — it carries reply/display semantics,
-    not loudness.
+    A ``reaction`` is always ``ambient`` — terminal and second-class, it never
+    wakes anyone, not even an addressed recipient or the target's author, and not
+    even at ``high`` severity. This is checked first. Otherwise: ``urgent`` when
+    the message is an ``@here`` (``severity == "high"``); else ``direct`` when the
+    recipient is addressed (a DM recipient or ``@``-mentioned); else ``ambient``.
+    Intent is otherwise orthogonal — it carries reply/display semantics, not
+    loudness.
     """
+    if intent == "reaction":
+        return "ambient"
     if severity == "high":
         return "urgent"
     if addressed:
@@ -123,3 +137,20 @@ def validate_severity(severity: str) -> None:
             f"invalid severity {severity!r}: must be one of "
             f"{', '.join(sorted(SEVERITIES))}"
         )
+
+
+def validate_reaction(reaction: str) -> None:
+    """Accept a short, single-line reaction body (1-``REACTION_MAX`` chars).
+
+    Rejects empty/whitespace-only bodies, anything longer than ``REACTION_MAX``,
+    and any body containing a newline — reactions are terse, inline tokens.
+    """
+    if not reaction.strip():
+        raise InvalidReaction("invalid reaction: must not be empty or whitespace-only")
+    if len(reaction) > REACTION_MAX:
+        raise InvalidReaction(
+            f"invalid reaction: must be at most {REACTION_MAX} chars "
+            f"(got {len(reaction)})"
+        )
+    if "\n" in reaction or "\r" in reaction:
+        raise InvalidReaction("invalid reaction: must not contain a newline")
