@@ -55,6 +55,7 @@ def daemon_env(
     poll_seconds: str = "1",
     warm_ttl: str | None = None,
     agent_ttl: str | None = None,
+    channel_ttl: str | None = None,
 ) -> dict:
     env = dict(os.environ)
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
@@ -64,6 +65,8 @@ def daemon_env(
         env["NOTIFICATIONS_PR_WARM_TTL_SECONDS"] = warm_ttl
     if agent_ttl is not None:
         env["NOTIFICATIONS_AGENT_TTL_SECONDS"] = agent_ttl
+    if channel_ttl is not None:
+        env["NOTIFICATIONS_CHANNEL_TTL_SECONDS"] = channel_ttl
     if graphql_url:
         env["GITHUB_GRAPHQL_URL"] = graphql_url
         env["GITHUB_TOKEN"] = "test-token"
