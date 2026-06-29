@@ -135,6 +135,22 @@ def test_token_env_overrides_file(tmp_path, monkeypatch):
     assert not (tmp_path / "token").exists()  # env path never touches the file
 
 
+def test_uri_builds_from_host_port_by_default(monkeypatch):
+    monkeypatch.delenv("NOTIFICATIONS_WS_URL", raising=False)
+    monkeypatch.setenv("NOTIFICATIONS_WS_HOST", "127.0.0.1")
+    monkeypatch.setenv("NOTIFICATIONS_WS_PORT", "8137")
+    assert wsproto.uri() == "ws://127.0.0.1:8137"
+
+
+def test_uri_full_url_override_wins(monkeypatch):
+    # A remote daemon behind a TLS-terminating ingress: the relay connects via wss://
+    # and the host/port are ignored entirely.
+    monkeypatch.setenv("NOTIFICATIONS_WS_HOST", "127.0.0.1")
+    monkeypatch.setenv("NOTIFICATIONS_WS_PORT", "8137")
+    monkeypatch.setenv("NOTIFICATIONS_WS_URL", "wss://notifications.d.example.com")
+    assert wsproto.uri() == "wss://notifications.d.example.com"
+
+
 # --------------------------------------------------------------------------- #
 # channel-load detection
 # --------------------------------------------------------------------------- #

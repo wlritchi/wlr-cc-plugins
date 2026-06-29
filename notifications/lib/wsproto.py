@@ -86,7 +86,13 @@ def port() -> int:
 
 
 def uri() -> str:
-    return f"ws://{host()}:{port()}"
+    """The URL the relay connects to. A full ``NOTIFICATIONS_WS_URL`` override wins
+    when set — e.g. ``wss://notifications.example.com`` for a remote daemon behind a
+    TLS-terminating ingress (scheme/host/port/path all honored). Otherwise it is built
+    from NOTIFICATIONS_WS_HOST/PORT. Only the relay (client) consults this; the daemon
+    binds via host()/port() and stays plain ``ws`` inside the pod (TLS terminates at
+    the ingress)."""
+    return os.environ.get("NOTIFICATIONS_WS_URL") or f"ws://{host()}:{port()}"
 
 
 def _data_dir() -> Path:
