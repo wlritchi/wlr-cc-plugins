@@ -1,0 +1,14 @@
+# The daemon image only COPYs daemon/ and lib/. Keep everything else out of the build
+# context so unrelated edits (tests, the relay, docs) don't bust the build cache.
+tests/
+mcp/
+commands/
+skills/
+.claude-plugin/
+README.md
+*.md
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
