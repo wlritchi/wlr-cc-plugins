@@ -40,6 +40,8 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     apt-get install -y --no-install-recommends tini && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 # Fixed uid/gid so a k8s PVC can be made writable via securityContext.fsGroup: 10001.
+# The passwd entry exists for tools that getpwuid(), but the final USER is NUMERIC so a
+# k8s runAsNonRoot:true admission check can verify non-root without a runAsUser override.
 RUN groupadd -g 10001 app && useradd -u 10001 -g 10001 -M -s /usr/sbin/nologin app
 COPY --from=build --chown=app:app /opt/venv /opt/venv
 # Preserve the daemon/lib sibling layout — the daemon adds ../lib to sys.path at runtime.
@@ -53,7 +55,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NOTIFICATIONS_WS_HOST=0.0.0.0 \
     NOTIFICATIONS_WS_PORT=8137 \
     NOTIFICATIONS_DATA_DIR=/data
-USER app
+USER 10001:10001
 EXPOSE 8137
 VOLUME ["/data"]
 # Plain `python`: deps live in the venv, so the PEP723 header is inert (no runtime uv resolve).
