@@ -323,6 +323,32 @@ def test_backoff_steady_state_is_about_30_min(relay):
     assert max(samples) <= 36 * 60
 
 
+def test_wait_connected_nudges_reconnect_when_disconnected(relay):
+    """The foreground path: a disconnected caller must NUDGE the reconnect loop
+    (set _reconnect_now) so it breaks its idle-tuned backoff and retries at once,
+    rather than passively waiting out the up-to-30-min sleep."""
+    client = relay.DaemonClient()
+    assert not client.connected  # fresh client, no socket
+
+    async def scenario():
+        return await client.wait_connected(timeout=0.2)  # no daemon → False, fast
+
+    assert anyio.run(scenario) is False
+    assert client._reconnect_now.is_set()  # the nudge was emitted
+
+
+def test_wait_connected_does_not_nudge_when_already_connected(relay):
+    """Already connected → nothing to reconnect, so no nudge is emitted."""
+    client = relay.DaemonClient()
+    client._ws = object()  # pretend connected
+
+    async def scenario():
+        return await client.wait_connected(timeout=0.2)
+
+    assert anyio.run(scenario) is True
+    assert not client._reconnect_now.is_set()
+
+
 # --------------------------------------------------------------------------- #
 # relay push-mode debounce / coalescing
 # --------------------------------------------------------------------------- #

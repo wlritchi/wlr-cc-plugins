@@ -135,6 +135,9 @@ class DaemonClient:
         self._pending: dict[int, object] = {}  # req_id -> memory send stream
         self._registered_session: str | None = None
         self._connected_once = False  # did the current attempt establish a connection?
+        # A foreground tool call sets this to break the reconnect backoff and force an
+        # immediate attempt, so an active agent never waits out an idle-tuned long sleep.
+        self._reconnect_now = anyio.Event()
         self._mode: str | None = (
             None  # None=detecting, "push" (channel), "pull" (catch_up)
         )
@@ -183,9 +186,15 @@ class DaemonClient:
         )
 
     async def wait_connected(self, timeout: float = 8.0) -> bool:
-        """Wait briefly for the connection (covers startup grace / reconnects)."""
+        """Wait briefly for the connection (covers startup grace / reconnects).
+
+        This is the foreground path — a tool the agent is actively invoking. Nudge the
+        reconnect loop to retry NOW instead of waiting out its idle-tuned backoff sleep,
+        then poll until connected or `timeout`. (Idle push delivery keeps the long
+        backoff; only an actively-waiting caller forces the immediate attempt.)"""
         if self.connected:
             return True
+        self._reconnect_now.set()  # an agent is actively waiting — break the backoff
         with anyio.move_on_after(timeout):
             while not self.connected:
                 await anyio.sleep(0.1)
@@ -423,7 +432,13 @@ class DaemonClient:
                 and (time.monotonic() - started) >= RECONNECT_STABLE_SECONDS
             )
             failures = 0 if stable else min(failures + 1, _RECONNECT_MAX_FAILURES)
-            await anyio.sleep(_reconnect_delay(failures))
+            # Interruptible backoff: wait the delay, but wake at once if a foreground
+            # call nudges us — the long backoff stays for the idle/asleep case while an
+            # actively-waiting agent reconnects immediately. anyio Events don't clear, so
+            # swap in a fresh one after each wait.
+            with anyio.move_on_after(_reconnect_delay(failures)):
+                await self._reconnect_now.wait()
+            self._reconnect_now = anyio.Event()
 
     async def _connect_once(self) -> None:
         headers = {"Authorization": f"Bearer {wsproto.token()}"}
