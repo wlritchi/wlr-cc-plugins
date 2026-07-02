@@ -347,12 +347,22 @@ class DaemonClient:
 
     async def detect_and_apply(self) -> None:
         start = time.time()
-        project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        # The harness keys its MCP log dir by the session *cwd*, which in a worktree
+        # session (<project>/.claude/worktrees/<name>) differs from CLAUDE_PROJECT_DIR
+        # (the main repo root). Probe the cwd first — it matches the harness keying —
+        # and fall back to CLAUDE_PROJECT_DIR; first non-UNKNOWN verdict wins.
+        candidates = [os.getcwd()]
+        env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+        if env_dir and env_dir not in candidates:
+            candidates.append(env_dir)
         detected = channel_detect.UNKNOWN
         while time.time() < start + CHANNEL_DETECT_TIMEOUT_SECONDS:
-            detected = channel_detect.detect_channel_mode(
-                SERVER_NAME, project_dir, newer_than=start - 5.0
-            )
+            for candidate in candidates:
+                detected = channel_detect.detect_channel_mode(
+                    SERVER_NAME, candidate, newer_than=start - 5.0
+                )
+                if detected != channel_detect.UNKNOWN:
+                    break
             if detected != channel_detect.UNKNOWN:
                 break
             await anyio.sleep(CHANNEL_DETECT_POLL_SECONDS)

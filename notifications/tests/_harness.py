@@ -47,6 +47,18 @@ def wait_port(port: int | str, timeout: float = 25.0) -> bool:
     return False
 
 
+# Env-var prefixes that could couple a test process to the machine's real setup:
+# NOTIFICATIONS_WS_URL/NOTIFICATIONS_TOKEN pointing relays at a live daemon (uri()
+# prefers the full-URL override, ignoring the test's host/port), real GitHub
+# credentials, and the live session's CLAUDE_* identity. Tests re-set exactly what
+# they need.
+_ISOLATE_PREFIXES = ("NOTIFICATIONS_", "GITHUB_", "CLAUDE_")
+
+
+def _isolated_environ() -> dict:
+    return {k: v for k, v in os.environ.items() if not k.startswith(_ISOLATE_PREFIXES)}
+
+
 def daemon_env(
     ws_port: int,
     data_dir: Path,
@@ -57,7 +69,7 @@ def daemon_env(
     agent_ttl: str | None = None,
     channel_ttl: str | None = None,
 ) -> dict:
-    env = dict(os.environ)
+    env = _isolated_environ()
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
     env["NOTIFICATIONS_DATA_DIR"] = str(data_dir)
     env["NOTIFICATIONS_PR_POLL_SECONDS"] = poll_seconds
@@ -83,7 +95,7 @@ def relay_env(
     project_dir: str | None = None,
     debounce_seconds: str = "0.5",
 ) -> dict:
-    env = dict(os.environ)
+    env = _isolated_environ()
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
     env["NOTIFICATIONS_DATA_DIR"] = str(data_dir)
     env["XDG_RUNTIME_DIR"] = str(xdg_dir)  # isolate the session-id state file lookup
@@ -100,6 +112,12 @@ def relay_env(
         # platform-independent, so the e2e suite can pass on macOS, where
         # _cache_root() would otherwise resolve to ~/Library/Caches and miss the seed.
         env["NOTIFICATIONS_MCP_LOG_CACHE_DIR"] = str(cache_dir)
+    else:
+        # Always pin the log-cache root, even for tests that seed no log: the relay
+        # probes its *cwd* (the real repo checkout, on a dev machine) as a detection
+        # candidate, and without this it could find the machine's real MCP log and
+        # wrongly detect push mode.
+        env["NOTIFICATIONS_MCP_LOG_CACHE_DIR"] = str(xdg_dir)
     if project_dir is not None:
         env["CLAUDE_PROJECT_DIR"] = project_dir
     return env

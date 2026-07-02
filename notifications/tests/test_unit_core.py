@@ -10,6 +10,7 @@ from pathlib import Path
 import anyio
 import pytest
 
+import _harness as h
 import channel_detect as cd
 import pr_monitor
 import scheduler
@@ -335,6 +336,42 @@ def test_wait_connected_nudges_reconnect_when_disconnected(relay):
 
     assert anyio.run(scenario) is False
     assert client._reconnect_now.is_set()  # the nudge was emitted
+
+
+def test_detect_prefers_worktree_cwd_log(relay, tmp_path, monkeypatch):
+    """A worktree session's MCP log is keyed by the session *cwd* (the worktree
+    path), while CLAUDE_PROJECT_DIR still names the main repo root. Detection must
+    probe the cwd first and find the real registration there, instead of reading
+    the (markerless) main-repo log dir and downgrading to pull."""
+    worktree = tmp_path / "proj" / ".claude" / "worktrees" / "wt"
+    worktree.mkdir(parents=True)
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path / "proj"))
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("NOTIFICATIONS_MCP_LOG_CACHE_DIR", str(cache))
+    h.seed_channel_log(cache, registered=True, project_dir=str(worktree))
+
+    client = relay.DaemonClient()
+    anyio.run(client.detect_and_apply)
+    assert client._mode == "push"
+
+
+def test_detect_falls_back_to_project_dir_log(relay, tmp_path, monkeypatch):
+    """When the cwd has no MCP log at all, the CLAUDE_PROJECT_DIR candidate must
+    still be probed (the pre-worktree behavior)."""
+    proj = tmp_path / "proj"
+    elsewhere = tmp_path / "elsewhere"
+    proj.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(proj))
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("NOTIFICATIONS_MCP_LOG_CACHE_DIR", str(cache))
+    h.seed_channel_log(cache, registered=True, project_dir=str(proj))
+
+    client = relay.DaemonClient()
+    anyio.run(client.detect_and_apply)
+    assert client._mode == "push"
 
 
 def test_wait_connected_does_not_nudge_when_already_connected(relay):
