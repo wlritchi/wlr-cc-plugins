@@ -386,6 +386,40 @@ def test_wait_connected_does_not_nudge_when_already_connected(relay):
     assert not client._reconnect_now.is_set()
 
 
+def test_run_survives_reconnect_exception_group(relay, monkeypatch):
+    """Regression (side-door daemon-roll crash): an abnormal WS close bubbles out of
+    _connect_once's task group as an anyio ExceptionGroup, which is neither an OSError
+    nor a WebSocketException. run() must swallow it as a failed attempt and keep
+    looping — NOT let it propagate and take the whole MCP server process down (every
+    notifications tool vanished until a manual /mcp reconnect). Pre-fix, the first
+    group escaped run() and this call raised instead of retrying."""
+    client = relay.DaemonClient()
+    calls = {"n": 0}
+
+    async def boom():
+        # Reproduce the real mechanism: _connect_once runs the recv/session tasks in
+        # an anyio task group; a child raising on an abnormal close makes anyio 4
+        # re-raise it wrapped in an ExceptionGroup (not an OSError/WebSocketException).
+        calls["n"] += 1
+        async with anyio.create_task_group() as tg:
+
+            async def child():
+                raise OSError("connection reset by peer")
+
+            tg.start_soon(child)
+
+    monkeypatch.setattr(relay, "STARTUP_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(relay, "_reconnect_delay", lambda failures: 0.01)
+    monkeypatch.setattr(client, "_connect_once", boom)
+
+    async def scenario():
+        with anyio.move_on_after(0.1):  # let it iterate, then stop the infinite loop
+            await client.run()
+
+    anyio.run(scenario)  # must NOT raise
+    assert calls["n"] >= 2  # kept retrying after the first ExceptionGroup
+
+
 # --------------------------------------------------------------------------- #
 # relay push-mode debounce / coalescing
 # --------------------------------------------------------------------------- #

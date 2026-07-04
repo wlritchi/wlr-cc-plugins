@@ -425,7 +425,21 @@ class DaemonClient:
                 WebSocketException,
                 ConnectionError,
             ):
-                pass
+                pass  # expected transient network failure — back off and retry
+            except Exception as exc:
+                # The reconnect loop is the resilience boundary and must never die.
+                # Any other failure is a bad attempt, not a crash. This notably
+                # catches the anyio task-group ExceptionGroup raised when a
+                # connection task ends on an abnormal close — a group is an
+                # Exception so it is caught here, while a shutdown CancelledError /
+                # BaseExceptionGroup is not, so cancellation still propagates.
+                # Without this, such a group escaped run() and took the whole MCP
+                # server down on a daemon roll (side-door relays vanished until a
+                # manual /mcp reconnect).
+                print(
+                    f"notifications relay: reconnect attempt failed ({exc!r}); retrying",
+                    file=sys.stderr,
+                )
             finally:
                 self._ws = None
                 self._registered_session = None
@@ -493,6 +507,13 @@ class DaemonClient:
                     stream = self._pending.get(msg.get("req_id"))
                     if stream is not None:
                         await stream.send(msg)
+        except (ConnectionClosed, WebSocketException, OSError):
+            # A dropped connection is the expected end of a session, not an error.
+            # Swallow it so it does not escape this task-group child as an anyio
+            # ExceptionGroup (which run()'s except tuple would miss, killing the
+            # server); the finally still tears down and run() reconnects on the
+            # clean return.
+            pass
         finally:
             tg.cancel_scope.cancel()  # connection ended; tear down and reconnect
 
