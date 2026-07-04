@@ -368,3 +368,68 @@ def test_reclaim_after_grace(tmp_path):
                 assert "A original" not in text
 
         anyio.run(scenario)
+
+
+def test_reclaim_key_bypasses_grace(tmp_path):
+    """With the DEFAULT reclaim grace (900s — far longer than the test), an offline
+    name is still protected against keyless registrants, but a successor presenting
+    the original reclaim_key takes it immediately: A registers 'worker' with a key
+    and disconnects; B is rejected without the key, then succeeds with it."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store)):
+
+        async def scenario():
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-A") as (
+                read_a,
+                write_a,
+            ):
+                text, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    2,
+                    "register_agent",
+                    {"name": "worker", "reclaim_key": "pod-1"},
+                )
+                assert "Registered as 'worker'" in text
+            # A is gone; grace would normally protect 'worker' for 900s.
+
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-B") as (
+                read_b,
+                write_b,
+            ):
+                # Gate on A actually showing offline: while A is still counted live
+                # even the right key must not displace it.
+                text, next_id = await _list_until(
+                    read_b, write_b, 2, lambda t: "offline" in t
+                )
+                assert "offline" in text
+
+                # (a) No key: today's semantics — the grace window still blocks B.
+                text, _ = await h.mcp_call(
+                    read_b, write_b, next_id, "register_agent", {"name": "worker"}
+                )
+                assert "Could not register as 'worker'" in text
+                assert "already taken" in text
+
+                # (b) Matching key: instant reclaim despite the grace window.
+                text, _ = await h.mcp_call(
+                    read_b,
+                    write_b,
+                    next_id + 1,
+                    "register_agent",
+                    {"name": "worker", "reclaim_key": "pod-1"},
+                )
+                assert "Registered as 'worker'" in text
+
+                text, _ = await h.mcp_call(
+                    read_b, write_b, next_id + 2, "list_agents", {}
+                )
+                assert "worker" in text
+                assert "connected" in text
+                assert "offline" not in text
+
+        anyio.run(scenario)

@@ -25,7 +25,7 @@ SUBSCRIBE_PR = "subscribe_pr"  # {req_id, session_id, owner, repo, number}
 UNSUBSCRIBE_PR = "unsubscribe_pr"  # {req_id, session_id, owner, repo, number}
 LIST_PR_SUBSCRIPTIONS = "list_pr_subscriptions"  # {req_id, session_id}
 # agent directory (Phase A)
-REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?}
+REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?, reclaim_key?}
 UNREGISTER_AGENT = "unregister_agent"  # {req_id, session_id}
 LIST_AGENTS = "list_agents"  # {req_id, session_id}
 SET_AVAILABILITY = "set_availability"  # {req_id, session_id, default_threshold}

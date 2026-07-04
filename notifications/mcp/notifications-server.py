@@ -725,6 +725,7 @@ async def register_agent(
     capabilities: str = "",
     working_dir: str = "",
     default_threshold: str | None = None,
+    reclaim_key: str | None = None,
 ) -> str:
     """Register this session in the shared agent directory under a self-chosen name.
 
@@ -738,6 +739,16 @@ async def register_agent(
     that is currently connected, or that disconnected only recently, is reserved and
     will be rejected; a long-abandoned name can be reclaimed.
 
+    Successor reclaim: pass an optional reclaim_key when registering. If a later
+    session presents the SAME key for a name whose holder is offline, it takes the
+    name immediately, bypassing the reclaim-grace window — handy for restartable
+    background agents that come back with a fresh session but the same identity.
+    A connected holder is never displaced, key or no key; a wrong or missing key
+    leaves the normal grace-window rules in force. The key itself is never stored,
+    only a hash of it. If reclaim_key is not given, the NOTIFICATIONS_RECLAIM_KEY
+    environment variable (if set) is used, so pods can configure it once via env
+    and prompts never need to carry the secret.
+
     Args:
         name: your directory name (lowercase kebab-case, 2-64 chars).
         description: one line on who you are or what you're working on.
@@ -746,6 +757,10 @@ async def register_agent(
         default_threshold: optional wake threshold ('all', 'direct', or 'urgent').
             Leave unset to keep your current setting (brand-new agents default to
             'direct'). See set_availability for what each level means.
+        reclaim_key: optional secret enabling a future session presenting the same
+            key to take this name from you once you're offline, without waiting
+            out the grace window. Defaults to $NOTIFICATIONS_RECLAIM_KEY when
+            unset. Leave both unset to keep any previously stored key.
     """
     session_id, _ = session_state.effective_session_id()
     if not session_id:
@@ -763,6 +778,14 @@ async def register_agent(
     # set earlier via set_availability just by re-registering.
     if default_threshold is not None:
         payload["default_threshold"] = default_threshold
+    # Same "omit when unset" contract for the reclaim key: a missing field leaves
+    # any previously stored key hash unchanged on a self-update. When the tool arg
+    # is None we fall back to NOTIFICATIONS_RECLAIM_KEY so containerized agents
+    # can configure the key once as pod env rather than in every prompt.
+    if reclaim_key is None:
+        reclaim_key = os.environ.get("NOTIFICATIONS_RECLAIM_KEY")
+    if reclaim_key is not None:
+        payload["reclaim_key"] = reclaim_key
     reply = await _daemon_request(payload)
     if isinstance(reply, str):
         return reply

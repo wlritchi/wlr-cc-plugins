@@ -666,6 +666,7 @@ async def _handle_register_agent(websocket, conn: Connection, msg: dict) -> None
             capabilities=msg.get("capabilities") or "",
             working_dir=msg.get("working_dir") or "",
             default_threshold=msg.get("default_threshold"),
+            reclaim_key=msg.get("reclaim_key"),
         )
     except agent_registry.AgentRegistryError as exc:
         await _send(websocket, wsproto.ERROR, msg, error=str(exc))

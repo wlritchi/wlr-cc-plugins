@@ -4,6 +4,7 @@
 round-trips. The clock is injected via explicit ``now`` values; nothing here
 touches wall-clock time."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -179,6 +180,174 @@ def test_zero_ttl_reclaims_immediately_when_offline(tmp_path: Path) -> None:
     assert rec.session_id == "intruder"
 
 
+# --- reclaim keys ------------------------------------------------------------
+
+
+def _register_owner_with_key(reg: ar.AgentRegistry) -> None:
+    reg.register(
+        "owner",
+        "shared",
+        now=1000.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+
+
+def test_reclaim_key_bypasses_grace_when_offline(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+    # Still well within the grace window (500 < 900), but the matching key wins.
+    rec = reg.register(
+        "successor",
+        "shared",
+        now=1500.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+    assert rec.session_id == "successor"
+    assert rec.registered_at == 1500.0  # fresh identity
+    assert reg.get_by_session("owner") is None
+    assert [r.name for r in reg.list()] == ["shared"]
+
+
+def test_wrong_reclaim_key_still_blocked_by_grace(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+    with pytest.raises(ar.NameTaken):
+        reg.register(
+            "successor",
+            "shared",
+            now=1500.0,
+            is_session_live=_never_live,
+            ttl=900.0,
+            reclaim_key="pod-2",
+        )
+    assert reg.get_by_session("owner").name == "shared"
+
+
+def test_no_key_supplied_grace_unchanged(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+    with pytest.raises(ar.NameTaken):
+        reg.register(
+            "successor", "shared", now=1500.0, is_session_live=_never_live, ttl=900.0
+        )
+    assert reg.get_by_session("owner").name == "shared"
+
+
+def test_key_supplied_but_holder_has_no_stored_hash(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    reg.register("owner", "shared", now=1000.0, is_session_live=_never_live, ttl=900.0)
+    with pytest.raises(ar.NameTaken):
+        reg.register(
+            "successor",
+            "shared",
+            now=1500.0,
+            is_session_live=_never_live,
+            ttl=900.0,
+            reclaim_key="pod-1",
+        )
+    assert reg.get_by_session("owner").name == "shared"
+
+
+def test_live_holder_never_displaced_even_with_matching_key(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+
+    def live(session_id: str) -> bool:
+        return session_id == "owner"
+
+    with pytest.raises(ar.NameTaken):
+        reg.register(
+            "successor",
+            "shared",
+            now=99999.0,  # even far beyond the grace window
+            is_session_live=live,
+            ttl=900.0,
+            reclaim_key="pod-1",
+        )
+    assert reg.get_by_session("owner").name == "shared"
+
+
+def test_self_update_none_preserves_hash_explicit_key_replaces(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+    original_hash = reg.get_by_session("owner").reclaim_key_hash
+    assert original_hash != ""
+
+    # None on a self-update leaves the stored hash untouched.
+    rec = reg.register(
+        "owner",
+        "shared",
+        now=1100.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        description="updated",
+    )
+    assert rec.reclaim_key_hash == original_hash
+
+    # An explicit key replaces it.
+    rec = reg.register(
+        "owner",
+        "shared",
+        now=1200.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-2",
+    )
+    assert rec.reclaim_key_hash != original_hash
+    assert rec.reclaim_key_hash == ar._hash_key("pod-2")
+
+
+def test_hash_not_plaintext_is_stored(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+    stored = reg.get_by_session("owner").reclaim_key_hash
+    assert stored == hashlib.sha256(b"pod-1").hexdigest()
+    assert stored != "pod-1"
+    assert "pod-1" not in _agent_path(tmp_path, "shared").read_text()
+
+
+def test_new_record_without_key_stores_empty_hash(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    rec = reg.register("s1", "aa", now=1.0, is_session_live=_never_live, ttl=900.0)
+    assert rec.reclaim_key_hash == ""
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "\t\n", "x" * 257])
+def test_invalid_reclaim_key(tmp_path: Path, bad: str) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    with pytest.raises(ar.InvalidReclaimKey):
+        reg.register(
+            "s1",
+            "aa",
+            now=1.0,
+            is_session_live=_never_live,
+            ttl=900.0,
+            reclaim_key=bad,
+        )
+
+
+def test_reclaim_key_hash_persistence_round_trip(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+
+    reloaded = ar.AgentRegistry(tmp_path)
+    assert reloaded.get_by_session("owner").reclaim_key_hash == ar._hash_key("pod-1")
+    # The reloaded registry honours the key: an in-grace reclaim still works.
+    rec = reloaded.register(
+        "successor",
+        "shared",
+        now=1500.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+    assert rec.session_id == "successor"
+
+
 # --- unregister --------------------------------------------------------------
 
 
@@ -262,7 +431,13 @@ def test_invalid_threshold_on_set_availability(tmp_path: Path) -> None:
 
 
 def test_exception_hierarchy() -> None:
-    for exc in (ar.NameTaken, ar.InvalidName, ar.InvalidThreshold, ar.NotRegistered):
+    for exc in (
+        ar.NameTaken,
+        ar.InvalidName,
+        ar.InvalidThreshold,
+        ar.NotRegistered,
+        ar.InvalidReclaimKey,
+    ):
         assert issubclass(exc, ar.AgentRegistryError)
     assert issubclass(ar.AgentRegistryError, ValueError)
 

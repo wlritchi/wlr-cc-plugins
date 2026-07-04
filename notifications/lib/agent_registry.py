@@ -8,6 +8,8 @@ spawning anything. Records persist one JSON file per agent under
 ``<data_dir>/agents/<safe_name>.json``.
 """
 
+import hashlib
+import hmac
 import json
 import re
 from collections.abc import Callable
@@ -21,6 +23,7 @@ _THRESHOLDS = frozenset({"all", "direct", "urgent"})
 _NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NAME_MIN = 2
 _NAME_MAX = 64
+_RECLAIM_KEY_MAX = 256
 
 
 class AgentRegistryError(ValueError):
@@ -43,6 +46,10 @@ class NotRegistered(AgentRegistryError):
     """The session owns no agent record."""
 
 
+class InvalidReclaimKey(AgentRegistryError):
+    """The supplied reclaim key is empty/whitespace-only or too long."""
+
+
 @dataclass
 class AgentRecord:
     name: str
@@ -53,6 +60,7 @@ class AgentRecord:
     default_threshold: str = DEFAULT_THRESHOLD
     registered_at: float = 0.0
     last_seen: float = 0.0
+    reclaim_key_hash: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -68,6 +76,7 @@ class AgentRecord:
             default_threshold=data.get("default_threshold", DEFAULT_THRESHOLD),
             registered_at=data.get("registered_at", 0.0),
             last_seen=data.get("last_seen", 0.0),
+            reclaim_key_hash=data.get("reclaim_key_hash", ""),
         )
 
 
@@ -76,6 +85,20 @@ def _validate_name(name: str) -> None:
         raise InvalidName(
             f"invalid agent name {name!r}: must be {_NAME_MIN}-{_NAME_MAX} "
             "chars, lowercase kebab-case (a-z, 0-9, hyphens; no leading/trailing hyphen)"
+        )
+
+
+def _hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _validate_reclaim_key(key: str) -> None:
+    stripped = key.strip()
+    if not stripped:
+        raise InvalidReclaimKey("reclaim key must not be empty or whitespace-only")
+    if len(stripped) > _RECLAIM_KEY_MAX:
+        raise InvalidReclaimKey(
+            f"reclaim key too long: max {_RECLAIM_KEY_MAX} characters"
         )
 
 
@@ -130,18 +153,30 @@ class AgentRegistry:
         capabilities: str = "",
         working_dir: str = "",
         default_threshold: str | None = None,
+        reclaim_key: str | None = None,
     ) -> AgentRecord:
         _validate_name(name)
         if default_threshold is not None:
             _validate_threshold(default_threshold)
+        if reclaim_key is not None:
+            _validate_reclaim_key(reclaim_key)
 
-        # Collision: the desired name is held by a *different* session. Reject
-        # while that owner is live or still within the reclaim-grace window;
-        # otherwise the stale holder is reclaimed (same slug, overwritten below).
+        # Collision: the desired name is held by a *different* session. A live
+        # owner is never displaced. An offline owner may be displaced right away
+        # by a registrant presenting the owner's reclaim key; otherwise the
+        # reclaim-grace window applies, after which the stale holder is
+        # reclaimed (same slug, overwritten below).
         holder = self._by_name.get(name)
         if holder is not None and holder.session_id != session_id:
+            if is_session_live(holder.session_id):
+                raise NameTaken(f"name {name!r} is already taken")
+            key_matches = (
+                reclaim_key is not None
+                and holder.reclaim_key_hash != ""
+                and hmac.compare_digest(holder.reclaim_key_hash, _hash_key(reclaim_key))
+            )
             within_grace = (now - holder.last_seen) < ttl
-            if is_session_live(holder.session_id) or within_grace:
+            if within_grace and not key_matches:
                 raise NameTaken(f"name {name!r} is already taken")
             self._remove(holder)
 
@@ -161,6 +196,11 @@ class AgentRegistry:
                 if default_threshold is not None
                 else prior.default_threshold
             )
+            key_hash = (
+                _hash_key(reclaim_key)
+                if reclaim_key is not None
+                else prior.reclaim_key_hash
+            )
         else:
             registered_at = now
             threshold = (
@@ -168,6 +208,7 @@ class AgentRegistry:
                 if default_threshold is not None
                 else DEFAULT_THRESHOLD
             )
+            key_hash = _hash_key(reclaim_key) if reclaim_key is not None else ""
 
         record = AgentRecord(
             name=name,
@@ -178,6 +219,7 @@ class AgentRegistry:
             default_threshold=threshold,
             registered_at=registered_at,
             last_seen=now,
+            reclaim_key_hash=key_hash,
         )
         self._persist(record)
         return record
