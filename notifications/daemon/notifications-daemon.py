@@ -42,6 +42,7 @@ import hmac
 import json
 import os
 import random
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -1455,13 +1456,37 @@ async def main() -> None:
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
     asyncio.create_task(_reaper_loop())
 
+    # Graceful shutdown. k8s terminates pods with SIGTERM, whose default Python
+    # disposition kills the process outright — the `async with serve(...)` block never
+    # unwinds, so connected relays see an abnormal close (1006) rather than a clean
+    # 1001 and (on pre-fix relays) crash instead of reconnecting. Install a handler that
+    # resolves `stop` so the block exits normally and serve()'s teardown closes every
+    # connection with 1001. SIGINT already unwinds via KeyboardInterrupt, but route it
+    # the same way so a `tini`-forwarded signal (the daemon runs as tini's non-PID-1
+    # child in the image) shuts down cleanly regardless of which signal arrives.
+    loop = asyncio.get_running_loop()
+    stop = loop.create_future()
+
+    def _request_stop() -> None:
+        if not stop.done():
+            stop.set_result(None)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            pass  # e.g. Windows: no signal handlers — fall back to default disposition
+
     host, port = wsproto.host(), wsproto.port()
     try:
         async with serve(_handle, host, port):
             print(
                 f"notifications daemon listening on ws://{host}:{port}", file=sys.stderr
             )
-            await asyncio.get_running_loop().create_future()  # run forever
+            await stop  # run until a shutdown signal resolves this
+        print(
+            "notifications daemon: shutting down (connections closed)", file=sys.stderr
+        )
     except OSError as exc:
         print(
             f"notifications daemon: cannot bind {host}:{port} (already running?): {exc}",

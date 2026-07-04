@@ -4,6 +4,7 @@
 These spawn the real daemon and relay via `uv run` and drive them with a raw MCP
 client over stdio. No network: scheduled callbacks need no GitHub."""
 
+import signal
 import time
 
 import anyio
@@ -154,6 +155,33 @@ def test_rejects_unauthenticated_connection(tmp_path):
                     with pytest.raises(ConnectionClosed):
                         await client.recv()
                     assert client.close_code == 1008
+
+        anyio.run(scenario)
+
+
+def test_daemon_sigterm_closes_connections_cleanly(tmp_path):
+    """A SIGTERM (what k8s sends to roll a pod) must close connected relays with a
+    clean 1001 'going away', not an abnormal 1006. A 1006 is what tripped the relay
+    reconnect-loop crash (fixed in the relay in 1.3.1); closing cleanly means even a
+    pre-fix relay just reconnects. Regression for the daemon shutdown handler — without
+    it, the default SIGTERM disposition kills the process and clients see 1006."""
+    store = tmp_path / "store"
+    store.mkdir()
+    ws = h.free_port()
+    uri = f"ws://127.0.0.1:{ws}"
+    env = h.daemon_env(ws, store)
+    env["NOTIFICATIONS_TOKEN"] = "test-token"
+    with h.daemon_process(env) as proc:
+
+        async def scenario():
+            async with connect(
+                uri, additional_headers={"Authorization": "Bearer test-token"}
+            ) as client:
+                await anyio.sleep(0.2)  # let the server register the connection
+                proc.send_signal(signal.SIGTERM)
+                with pytest.raises(ConnectionClosed):
+                    await client.recv()
+                assert client.close_code == 1001
 
         anyio.run(scenario)
 
