@@ -40,6 +40,7 @@ Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
 import asyncio
 import hmac
 import json
+import logging
 import os
 import random
 import signal
@@ -1447,6 +1448,37 @@ async def _send(websocket, msg_type: str, request: dict, **fields: object) -> No
         pass
 
 
+def _caused_by_eof(exc: BaseException | None) -> bool:
+    """True if `exc` or anything in its cause/context chain is an EOFError."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, EOFError):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+class _ProbeHandshakeFilter(logging.Filter):
+    """Silence the benign 'opening handshake failed' tracebacks that k8s tcpSocket
+    liveness/readiness probes produce: a probe opens a bare TCP connection to the
+    WS-only port and closes it without sending the HTTP upgrade, so websockets fails
+    the handshake (InvalidMessage caused by EOFError) and logs it at ERROR every probe
+    cycle. A genuine handshake failure (malformed upgrade, bad headers) carries no
+    EOFError in its chain, and auth rejections happen after a successful handshake, so
+    filtering only the EOF-caused case drops the probe noise without hiding real errors.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.getMessage() == "opening handshake failed"
+            and record.exc_info
+            and _caused_by_eof(record.exc_info[1])
+        ):
+            return False  # drop
+        return True
+
+
 async def main() -> None:
     global GH, TOKEN
     TOKEN = wsproto.token()  # auto-creates <NOTIFICATIONS_DATA_DIR>/token if needed
@@ -1476,6 +1508,9 @@ async def main() -> None:
             loop.add_signal_handler(sig, _request_stop)
         except NotImplementedError:
             pass  # e.g. Windows: no signal handlers — fall back to default disposition
+
+    # Quiet the per-probe-cycle handshake-failed traceback k8s tcpSocket probes cause.
+    logging.getLogger("websockets.server").addFilter(_ProbeHandshakeFilter())
 
     host, port = wsproto.host(), wsproto.port()
     try:

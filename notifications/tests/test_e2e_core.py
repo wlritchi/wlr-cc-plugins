@@ -5,6 +5,8 @@ These spawn the real daemon and relay via `uv run` and drive them with a raw MCP
 client over stdio. No network: scheduled callbacks need no GitHub."""
 
 import signal
+import socket
+import subprocess
 import time
 
 import anyio
@@ -184,6 +186,45 @@ def test_daemon_sigterm_closes_connections_cleanly(tmp_path):
                 assert client.close_code == 1001
 
         anyio.run(scenario)
+
+
+def test_daemon_quiets_tcp_probe_handshake_noise(tmp_path):
+    """k8s tcpSocket liveness/readiness probes open a bare TCP connection to the WS
+    port and close it without a handshake; websockets logs an 'opening handshake
+    failed' EOFError traceback for each, spamming the log every probe cycle. The daemon
+    filters that specific benign case (handshake failure caused by an EOF). A real WS
+    connection still works, and non-EOF handshake errors are unaffected."""
+    store = tmp_path / "store"
+    store.mkdir()
+    ws = h.free_port()
+    env = h.daemon_env(ws, store)
+    env["NOTIFICATIONS_TOKEN"] = "test-token"
+    proc = subprocess.Popen(
+        ["uv", "run", "-qs", h.DAEMON],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert h.wait_port(ws)
+        for _ in range(3):  # simulate three probe cycles
+            socket.create_connection(("127.0.0.1", ws), timeout=2).close()
+            time.sleep(0.05)
+
+        async def real():
+            async with connect(
+                f"ws://127.0.0.1:{ws}",
+                additional_headers={"Authorization": "Bearer test-token"},
+            ) as client:
+                assert client.state.name == "OPEN"
+
+        anyio.run(real)
+        time.sleep(0.2)
+    finally:
+        proc.terminate()
+        _, err = proc.communicate(timeout=10)
+    assert "opening handshake failed" not in err
 
 
 def scheduler_pending(store, session_id) -> int:
