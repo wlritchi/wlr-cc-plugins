@@ -22,9 +22,11 @@ around the time the server declares its capability) to decide whether to push to
 the channel or fall back to a pull-based catch_up tool. stdlib only.
 """
 
+import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 REGISTERED = "registered"  # loaded as a channel
@@ -88,3 +90,65 @@ def detect_channel_mode(
     if registered_at < 0 and skipped_at < 0:
         return UNKNOWN
     return REGISTERED if registered_at > skipped_at else SKIPPED
+
+
+def _iso_epoch(ts: object, fallback: float) -> float:
+    """Parse a Claude Code log ``timestamp`` (ISO-8601, trailing 'Z') to epoch seconds,
+    falling back to the file mtime when it is missing/unparseable, so markers across
+    files sort chronologically."""
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return fallback
+
+
+def detect_channel_mode_by_session(server_name: str, session_id: str | None) -> str:
+    """REGISTERED / SKIPPED / UNKNOWN by matching the marker to THIS session's id across
+    every project-keyed mcp-log dir under the cache root.
+
+    Claude Code keys each MCP log dir by the *session* cwd. For a worktree session — or
+    any bg agent whose process cwd differs from the session cwd — that dir is not the
+    relay's ``os.getcwd()``, so the cwd-scoped probe (``detect_channel_mode``) reads the
+    wrong dir and misses the marker (persistent pull-mode misdetection). The marker line
+    carries the session id, which is globally unique, so matching on it finds the right
+    log regardless of which cwd dir it landed in, and never picks up a *different*
+    session's marker (e.g. a claimed-spare sharing the workspace cwd). No freshness gate
+    is needed: the id is the disambiguator, and the latest marker for this id wins (so a
+    resume that re-registers as a channel, or flips to skipped, is honored)."""
+    if not session_id:
+        return UNKNOWN
+    root = _cache_root() / "claude-cli-nodejs"
+    if not root.is_dir():
+        return UNKNOWN
+    best_key: float | None = None
+    best_verdict = UNKNOWN
+    for logdir in root.glob("*/mcp-logs-*"):
+        if server_name not in logdir.name or not logdir.is_dir():
+            continue
+        for log in logdir.glob("*.jsonl"):
+            try:
+                text = log.read_text(errors="replace")
+                mtime = log.stat().st_mtime
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if session_id not in line:  # cheap prefilter before the JSON parse
+                    continue
+                if _REGISTERED_MARK in line:
+                    verdict = REGISTERED
+                elif _SKIPPED_MARK in line:
+                    verdict = SKIPPED
+                else:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if obj.get("sessionId") != session_id:
+                    continue  # id was incidental (substring), not the field value
+                key = _iso_epoch(obj.get("timestamp"), mtime)
+                if best_key is None or key >= best_key:
+                    best_key, best_verdict = key, verdict
+    return best_verdict

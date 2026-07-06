@@ -292,6 +292,91 @@ class TestChannelDetect:
         )
         assert cd.detect_channel_mode("notifications", self.PROJECT) == cd.REGISTERED
 
+    def test_by_session_matches_across_cwd_dirs(self, tmp_path, monkeypatch):
+        # Regression (flux's worktree pull-mode bug): Claude Code keys the marker log by
+        # the *session* cwd (here a worktree path), which is not the relay's process cwd.
+        # A cwd-scoped probe of the process cwd misses it; sessionId matching finds it.
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            "/home/u/proj/.claude/worktrees/wt",  # session (worktree) cwd, not proc cwd
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"debug":"Channel notifications registered","sessionId":"sess-A",'
+            '"timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        # the pre-fix path (probe the process cwd) reads /home/u/proj and sees nothing
+        assert cd.detect_channel_mode("notifications", "/home/u/proj") == cd.UNKNOWN
+        # sessionId matching finds it regardless of which cwd dir it landed under
+        assert (
+            cd.detect_channel_mode_by_session("notifications", "sess-A")
+            == cd.REGISTERED
+        )
+
+    def test_by_session_ignores_other_sessions_marker(self, tmp_path, monkeypatch):
+        # A claimed-spare session's marker sharing the workspace cwd must not be
+        # misattributed to my session (flux's 7e459fc3 case).
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            "/home/u/workspace",
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"debug":"Channel notifications registered","sessionId":"spare-1",'
+            '"timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        # my session has no marker anywhere -> UNKNOWN, not the spare's REGISTERED
+        assert (
+            cd.detect_channel_mode_by_session("notifications", "mine-2") == cd.UNKNOWN
+        )
+        # the spare's own id still resolves to its marker
+        assert (
+            cd.detect_channel_mode_by_session("notifications", "spare-1")
+            == cd.REGISTERED
+        )
+
+    def test_by_session_latest_marker_wins(self, tmp_path, monkeypatch):
+        # Latest marker for the id wins by line timestamp (a resume that flips a session
+        # from channel to non-channel is honored), across different cwd dirs.
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            "/home/u/a",
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"debug":"Channel notifications registered","sessionId":"s",'
+            '"timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        _write_log(
+            tmp_path,
+            "/home/u/b",
+            self.SERVER_DIR,
+            "2026-06-26T01-00-00Z",
+            '{"debug":"Channel notifications skipped: x","sessionId":"s",'
+            '"timestamp":"2026-06-26T01:00:00.000Z"}\n',
+        )
+        assert cd.detect_channel_mode_by_session("notifications", "s") == cd.SKIPPED
+
+    def test_by_session_requires_real_id_field(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        assert cd.detect_channel_mode_by_session("notifications", None) == cd.UNKNOWN
+        assert (
+            cd.detect_channel_mode_by_session("notifications", "sess-A") == cd.UNKNOWN
+        )  # no dir yet
+        # a line that only MENTIONS the id in free text (not as the sessionId field)
+        # must not match — else a log referencing another session could misfire.
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"debug":"Channel notifications registered for sess-A","sessionId":"other",'
+            '"timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        assert (
+            cd.detect_channel_mode_by_session("notifications", "sess-A") == cd.UNKNOWN
+        )
+
 
 # --------------------------------------------------------------------------- #
 # relay reconnect backoff
