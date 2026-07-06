@@ -68,6 +68,7 @@ def daemon_env(
     warm_ttl: str | None = None,
     agent_ttl: str | None = None,
     channel_ttl: str | None = None,
+    settle: str | None = None,
 ) -> dict:
     env = _isolated_environ()
     env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
@@ -79,6 +80,8 @@ def daemon_env(
         env["NOTIFICATIONS_AGENT_TTL_SECONDS"] = agent_ttl
     if channel_ttl is not None:
         env["NOTIFICATIONS_CHANNEL_TTL_SECONDS"] = channel_ttl
+    if settle is not None:
+        env["NOTIFICATIONS_RECLAIM_SETTLE_SECONDS"] = settle
     if graphql_url:
         env["GITHUB_GRAPHQL_URL"] = graphql_url
         env["GITHUB_TOKEN"] = "test-token"

@@ -149,6 +149,7 @@ class AgentRegistry:
         now: float,
         is_session_live: Callable[[str], bool],
         ttl: float,
+        settle: float = 0.0,
         description: str = "",
         capabilities: str = "",
         working_dir: str = "",
@@ -162,10 +163,11 @@ class AgentRegistry:
             _validate_reclaim_key(reclaim_key)
 
         # Collision: the desired name is held by a *different* session. A live
-        # owner is never displaced. An offline owner may be displaced right away
-        # by a registrant presenting the owner's reclaim key; otherwise the
-        # reclaim-grace window applies, after which the stale holder is
-        # reclaimed (same slug, overwritten below).
+        # owner is never displaced. An offline owner may be displaced by a
+        # registrant presenting the owner's reclaim key once the owner has been
+        # quiet for at least `settle` (see below); otherwise the reclaim-grace
+        # window applies, after which the stale holder is reclaimed (same slug,
+        # overwritten below).
         holder = self._by_name.get(name)
         if holder is not None and holder.session_id != session_id:
             if is_session_live(holder.session_id):
@@ -175,8 +177,19 @@ class AgentRegistry:
                 and holder.reclaim_key_hash != ""
                 and hmac.compare_digest(holder.reclaim_key_hash, _hash_key(reclaim_key))
             )
-            within_grace = (now - holder.last_seen) < ttl
-            if within_grace and not key_matches:
+            offline_for = now - holder.last_seen
+            within_grace = offline_for < ttl
+            # A matching reclaim key normally bypasses the grace so a resumed agent
+            # retakes its name immediately. But a holder that went quiet only moments
+            # ago may be a live agent whose WebSocket briefly dropped during a roll —
+            # and a same-key sibling (e.g. a bg spare cloned with the same pod-wide
+            # reclaim key) would otherwise hijack it in that blip. Require the holder to
+            # have been offline at least `settle` before the key may bypass the grace.
+            # STOPGAP for the spare-collision race (pending a holistic reclaim-key
+            # redesign): closes the race for blips up to `settle`, not for rolls that
+            # keep the holder offline longer.
+            reclaimable = key_matches and offline_for >= settle
+            if within_grace and not reclaimable:
                 raise NameTaken(f"name {name!r} is already taken")
             self._remove(holder)
 

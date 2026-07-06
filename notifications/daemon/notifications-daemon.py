@@ -74,6 +74,10 @@ WARM_TTL_DEFAULT_SECONDS = 1800.0
 # How long an offline agent keeps its directory name reserved before a colliding
 # register_agent may reclaim it. <=0 reclaims immediately once the session is gone.
 AGENT_TTL_DEFAULT_SECONDS = 900.0
+# How long a name's offline holder must stay quiet before a matching reclaim_key may
+# bypass the grace — long enough to outlast a roll's reconnect blip so a same-key bg
+# spare can't hijack a live agent that only briefly dropped. STOPGAP; see agent_registry.
+RECLAIM_SETTLE_DEFAULT_SECONDS = 60.0
 # How long a memberless+silent message topic (channel or DM) is kept before the
 # reaper deletes it, and how many recent messages a join reply renders as scrollback.
 CHANNEL_TTL_DEFAULT_SECONDS = 86400.0
@@ -107,6 +111,16 @@ def _agent_ttl_seconds() -> float:
         except ValueError:
             pass
     return AGENT_TTL_DEFAULT_SECONDS
+
+
+def _reclaim_settle_seconds() -> float:
+    raw = os.environ.get("NOTIFICATIONS_RECLAIM_SETTLE_SECONDS")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return RECLAIM_SETTLE_DEFAULT_SECONDS
 
 
 def _channel_ttl_seconds() -> float:
@@ -664,6 +678,7 @@ async def _handle_register_agent(websocket, conn: Connection, msg: dict) -> None
             now=time.time(),
             is_session_live=_session_live,
             ttl=_agent_ttl_seconds(),
+            settle=_reclaim_settle_seconds(),
             description=msg.get("description") or "",
             capabilities=msg.get("capabilities") or "",
             working_dir=msg.get("working_dir") or "",

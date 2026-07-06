@@ -380,7 +380,8 @@ def test_reclaim_key_bypasses_grace(tmp_path):
     xdg.mkdir()
     ws = h.free_port()
 
-    with h.daemon_process(h.daemon_env(ws, store)):
+    # settle=0 isolates the key-bypass-grace behavior from the reconnect-blip settle.
+    with h.daemon_process(h.daemon_env(ws, store, settle="0")):
 
         async def scenario():
             async with h.agent_session(tmp_path, ws, store, xdg, "sid-A") as (
@@ -431,5 +432,56 @@ def test_reclaim_key_bypasses_grace(tmp_path):
                 assert "worker" in text
                 assert "connected" in text
                 assert "offline" not in text
+
+        anyio.run(scenario)
+
+
+def test_reclaim_key_settle_blocks_recent_holder(tmp_path):
+    """Spare-collision fix, wired end-to-end: with a long settle window a matching key
+    does NOT reclaim a holder that only just went offline (a live agent mid-reconnect
+    during a roll). A registers 'worker' with a key and disconnects; B, presenting the
+    same key while A is only seconds-offline, is rejected — the name stays A's."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    # Long settle so B's reclaim lands well inside the window; grace stays the default.
+    with h.daemon_process(h.daemon_env(ws, store, settle="3600")):
+
+        async def scenario():
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-A") as (
+                read_a,
+                write_a,
+            ):
+                text, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    2,
+                    "register_agent",
+                    {"name": "worker", "reclaim_key": "pod-1"},
+                )
+                assert "Registered as 'worker'" in text
+            # A just disconnected; its last_seen is seconds ago — inside the settle.
+
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-B") as (
+                read_b,
+                write_b,
+            ):
+                # Wait until A is actually offline, so it's the settle — not the
+                # live-holder guard — that blocks the reclaim.
+                text, next_id = await _list_until(
+                    read_b, write_b, 2, lambda t: "offline" in t
+                )
+                assert "offline" in text
+                text, _ = await h.mcp_call(
+                    read_b,
+                    write_b,
+                    next_id,
+                    "register_agent",
+                    {"name": "worker", "reclaim_key": "pod-1"},
+                )
+                assert "Could not register as 'worker'" in text
+                assert "already taken" in text
 
         anyio.run(scenario)

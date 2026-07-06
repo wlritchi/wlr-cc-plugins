@@ -237,6 +237,59 @@ def test_no_key_supplied_grace_unchanged(tmp_path: Path) -> None:
     assert reg.get_by_session("owner").name == "shared"
 
 
+def test_settle_blocks_key_reclaim_of_recently_seen_holder(tmp_path: Path) -> None:
+    # Spare-collision fix: a matching key must NOT reclaim a holder that went quiet only
+    # moments ago (a live agent mid-reconnect during a roll). owner last_seen=1000, the
+    # sibling registers 5s later with the same key — inside the settle window -> blocked.
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)
+    with pytest.raises(ar.NameTaken):
+        reg.register(
+            "spare",
+            "shared",
+            now=1005.0,
+            is_session_live=_never_live,
+            ttl=900.0,
+            settle=60.0,
+            reclaim_key="pod-1",
+        )
+    assert reg.get_by_session("owner").name == "shared"
+
+
+def test_settle_allows_key_reclaim_after_window(tmp_path: Path) -> None:
+    # Past the settle window (100 >= 60) but still within grace: a genuine successor
+    # presenting the key reclaims fast, as intended.
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)  # last_seen=1000
+    rec = reg.register(
+        "successor",
+        "shared",
+        now=1100.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        settle=60.0,
+        reclaim_key="pod-1",
+    )
+    assert rec.session_id == "successor"
+    assert reg.get_by_session("owner") is None
+
+
+def test_settle_default_zero_preserves_immediate_key_reclaim(tmp_path: Path) -> None:
+    # The lib default settle=0 keeps the original "matching key bypasses grace
+    # immediately" behavior, so callers that don't opt in are unaffected.
+    reg = ar.AgentRegistry(tmp_path)
+    _register_owner_with_key(reg)  # last_seen=1000
+    rec = reg.register(
+        "successor",
+        "shared",
+        now=1000.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",  # no settle -> 0 -> immediate
+    )
+    assert rec.session_id == "successor"
+
+
 def test_key_supplied_but_holder_has_no_stored_hash(tmp_path: Path) -> None:
     reg = ar.AgentRegistry(tmp_path)
     reg.register("owner", "shared", now=1000.0, is_session_live=_never_live, ttl=900.0)
