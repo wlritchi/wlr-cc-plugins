@@ -24,6 +24,11 @@ LIST = "list"  # {req_id, session_id}
 SUBSCRIBE_PR = "subscribe_pr"  # {req_id, session_id, owner, repo, number}
 UNSUBSCRIBE_PR = "unsubscribe_pr"  # {req_id, session_id, owner, repo, number}
 LIST_PR_SUBSCRIPTIONS = "list_pr_subscriptions"  # {req_id, session_id}
+# Forgejo/Gitea PR subscriptions (additive; parallel a separate REST poller). Reuse the
+# SUBSCRIBED / UNSUBSCRIBED / SUBSCRIPTIONS_RESULT reply frames — same shapes as GitHub.
+SUBSCRIBE_FORGEJO_PR = "subscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number}
+UNSUBSCRIBE_FORGEJO_PR = "unsubscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number}
+LIST_FORGEJO_PR_SUBSCRIPTIONS = "list_forgejo_pr_subscriptions"  # {req_id, session_id}
 # agent directory (Phase A)
 REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?, reclaim_key?}
 UNREGISTER_AGENT = "unregister_agent"  # {req_id, session_id}

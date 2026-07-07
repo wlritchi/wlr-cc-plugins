@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -46,6 +47,17 @@ _PR_REF_RE = re.compile(r"^\s*([^/\s]+)/([^/#\s]+)#(\d+)\s*$")
 
 def pr_key(owner: str, repo: str, number: int | str) -> str:
     return f"{owner}/{repo}#{number}"
+
+
+def storage_key(provider: str, owner: str, repo: str, number: int | str) -> str:
+    """The TRACKERS-dict / on-disk key. GitHub stays UNPREFIXED (byte-identical to the
+    historical key, so existing trackers, dirs, and notification ids are unchanged);
+    other providers get a "<provider>:" prefix so a Forgejo owner/repo#n cannot collide
+    with a GitHub one. Only the storage key carries the prefix — the human-facing
+    ``PRTracker.key`` (used in event text and tool replies) stays "owner/repo#number".
+    ``_safe`` maps the ':' and '/' to '_', so the dir names stay distinct on disk."""
+    key = pr_key(owner, repo, number)
+    return key if provider == "github" else f"{provider}:{key}"
 
 
 def parse_pr_ref(ref: str) -> tuple[str, str, int] | None:
@@ -117,6 +129,136 @@ def snapshot_from_api(data: dict) -> dict:
     for s in (data.get("status") or {}).get("statuses") or []:
         snap["statuses"][s.get("context")] = {
             "state": s.get("state"),
+            "url": s.get("target_url"),
+            "desc": s.get("description"),
+        }
+    return snap
+
+
+# Gitea/Forgejo review states -> the canonical states diff()/summarize() understand.
+# PENDING (and REQUEST_REVIEW) are unsubmitted — excluded entirely, like GitHub's
+# PENDING. Normalizing HERE keeps the snapshot provider-agnostic so the diff never
+# learns a provider dialect.
+_FORGEJO_REVIEW_STATE = {
+    "APPROVED": "APPROVED",
+    "REQUEST_CHANGES": "CHANGES_REQUESTED",
+    "COMMENT": "COMMENTED",
+    "DISMISSED": "DISMISSED",
+}
+_FORGEJO_REVIEW_SKIP = {"PENDING", "REQUEST_REVIEW", "", None}
+
+
+def snapshot_from_forgejo(data: dict) -> dict:
+    """Normalize a Forgejo/Gitea REST fetch into the same comparable snapshot that
+    ``snapshot_from_graphql``/``snapshot_from_api`` produce, so the transport-agnostic
+    ``diff()`` is unchanged. ``data`` is what ``forgejo_client.fetch_pr`` returns:
+    ``{pr, reviews, review_comments, issue_comments, statuses}`` (raw Gitea JSON).
+
+    Gitea field -> canonical snapshot mapping (the thing you can't re-derive without
+    the Gitea swagger open):
+
+      pr.state ("open"/"closed")              -> state
+      pr.merged (bool)                        -> merged
+      pr.merged_by.login                      -> merged_by (a login string, or None)
+      pr.mergeable (bool | absent)            -> mergeable_state: True->"clean",
+                                                 False->"dirty", None/absent->"unknown"
+      pr.head.sha                             -> head_sha
+      pr.title / pr.html_url                  -> title / url
+      pr.draft (bool)                         -> draft
+      pr.labels[].name                        -> labels (sorted)
+      pr.requested_reviewers[].login          -> requested_reviewers (sorted)
+      reviews[] (state via _FORGEJO_REVIEW_STATE; PENDING/REQUEST_REVIEW dropped)
+        {id, state, user.login, body, html_url}-> reviews[id] = {state,user,body,url}
+      review_comments[] (Gitea PullReviewComment; inline)
+        {id, user.login, body, path, position, original_position, diff_hunk, html_url}
+                                              -> review_comments[id] = {user, body, path,
+                                                 line(=position), original_line, start_line,
+                                                 original_start_line, diff_hunk, url}
+        + comment.resolver (User set when the thread is resolved)
+                                              -> review_threads[id] = {resolved, path, line}
+      issue_comments[] {id, user.login, body, html_url}
+                                              -> issue_comments[id] = {user, body, url}
+      statuses[] (Gitea CommitStatus)
+        {context, status, target_url, description}
+                                              -> statuses[context] = {state, url, desc}
+
+    Not populated for v1 (Gitea REST doesn't expose them): check_runs (Forgejo Actions
+    "check runs" live behind a separate endpoint) and the timeline facets (labels/
+    reviewer/draft/force-push changes — Gitea has no timeline). Those keys are present
+    but empty; ``diff()`` .get()s them, so they simply produce no events. ``timeline``
+    is intentionally an (empty) key so ``load_trackers`` doesn't treat the snapshot as a
+    stale pre-timeline shape and drop it. review_threads is synthesized per inline
+    comment (Gitea has no thread id), so a same-conversation multi-comment resolve emits
+    one pr_thread event per comment — acceptable for v1.
+    """
+    pr = data.get("pr") or {}
+    m = pr.get("mergeable")
+    snap: dict = {
+        "state": pr.get("state"),
+        "merged": bool(pr.get("merged")),
+        "merged_by": (pr.get("merged_by") or {}).get("login"),
+        "mergeable_state": "unknown" if m is None else ("clean" if m else "dirty"),
+        "head_sha": (pr.get("head") or {}).get("sha"),
+        "title": pr.get("title"),
+        "url": pr.get("html_url"),
+        "draft": bool(pr.get("draft")),
+        "labels": sorted(
+            str(label["name"]) for label in (pr.get("labels") or []) if label.get("name")
+        ),
+        "requested_reviewers": sorted(
+            r["login"] for r in (pr.get("requested_reviewers") or []) if (r or {}).get("login")
+        ),
+        "reviews": {},
+        "review_comments": {},
+        "issue_comments": {},
+        "check_runs": {},
+        "statuses": {},
+        "review_threads": {},
+        "timeline": {},
+    }
+    for r in data.get("reviews") or []:
+        state = r.get("state")
+        if state in _FORGEJO_REVIEW_SKIP:
+            continue
+        snap["reviews"][str(r.get("id"))] = {
+            "state": _FORGEJO_REVIEW_STATE.get(state, state),
+            "user": (r.get("user") or {}).get("login"),
+            "body": r.get("body") or "",
+            "url": r.get("html_url"),
+        }
+    for c in data.get("review_comments") or []:
+        cid = str(c.get("id"))
+        # Gitea uses diff-relative `position`, not a file line; it feeds
+        # _inline_comment_event's line/original_line the same way GitHub's do.
+        line = c.get("position")
+        snap["review_comments"][cid] = {
+            "user": (c.get("user") or {}).get("login"),
+            "body": c.get("body") or "",
+            "path": c.get("path"),
+            "line": line,
+            "original_line": c.get("original_position"),
+            "start_line": None,
+            "original_start_line": None,
+            "diff_hunk": c.get("diff_hunk"),
+            "url": c.get("html_url"),
+        }
+        # A non-null resolver means the thread is resolved. Synthesize a per-comment
+        # review-thread so diff()'s resolve/unresolve rule fires on the transition; the
+        # provider-neutral event kind matches a future GitHub `resolved` field.
+        snap["review_threads"][cid] = {
+            "resolved": bool(c.get("resolver")),
+            "path": c.get("path"),
+            "line": line,
+        }
+    for c in data.get("issue_comments") or []:
+        snap["issue_comments"][str(c.get("id"))] = {
+            "user": (c.get("user") or {}).get("login"),
+            "body": c.get("body") or "",
+            "url": c.get("html_url"),
+        }
+    for s in data.get("statuses") or []:
+        snap["statuses"][s.get("context")] = {
+            "state": s.get("status"),
             "url": s.get("target_url"),
             "desc": s.get("description"),
         }
@@ -771,11 +913,27 @@ def _status_event(ctx: str, s: dict, key: str, epoch: int) -> dict:
 class PRTracker:
     """Mutable per-PR state. The daemon owns the polling/delivery around it."""
 
-    def __init__(self, owner: str, repo: str, number: int, client) -> None:
+    def __init__(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        client,
+        provider: str = "github",
+        base_url: str | None = None,
+    ) -> None:
         self.owner = owner
         self.repo = repo
         self.number = number
-        self.key = pr_key(owner, repo, number)
+        self.provider = provider
+        # For Forgejo, the instance API base URL this PR lives on. Persisted so a future
+        # multi-instance setup can tell provenance from the record (builder's steer);
+        # unused in the single-instance v1 (the daemon's one ForgejoClient serves all).
+        self.base_url = base_url
+        self.key = pr_key(owner, repo, number)  # human-facing ref (event text, replies)
+        self.storage_key = storage_key(
+            provider, owner, repo, number
+        )  # TRACKERS-dict / on-disk key; provider-prefixed for non-github
         self.client = client
         self.subscribers: set[str] = set()
         self.acked: dict[str, set[str]] = {}  # session id -> set of acked event ids
@@ -817,17 +975,23 @@ class PRTracker:
                 self.terminal_id = event_id
         return added
 
+    def _snapshot(self, raw: dict) -> dict:
+        """Normalize a provider's raw fetch into the transport-agnostic snapshot."""
+        if self.provider == "forgejo":
+            return snapshot_from_forgejo(raw)
+        return snapshot_from_graphql(raw)
+
     async def initial_poll(self) -> str:
         """Establish the baseline snapshot (no events) and return a status summary."""
         pr = await self.client.fetch_pr(self.owner, self.repo, self.number)
-        self.snapshot = snapshot_from_graphql(pr)
+        self.snapshot = self._snapshot(pr)
         self.merged = self.snapshot["merged"]
         return summarize(self.snapshot)
 
     async def poll_once(self) -> list[dict]:
         """Fetch, diff against the last snapshot, and return the raw diff events."""
         pr = await self.client.fetch_pr(self.owner, self.repo, self.number)
-        new = snapshot_from_graphql(pr)
+        new = self._snapshot(pr)
         events = diff(self.snapshot, new, self.key)
         self.snapshot = new
         if new["merged"]:
@@ -866,12 +1030,14 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def save_state(t: PRTracker) -> None:
     _atomic_write(
-        _tracker_dir(t.key) / "state.json",
+        _tracker_dir(t.storage_key) / "state.json",
         json.dumps(
             {
                 "owner": t.owner,
                 "repo": t.repo,
                 "number": t.number,
+                "provider": t.provider,
+                "base_url": t.base_url,
                 "snapshot": t.snapshot,
                 "consecutive_no_update": t.consecutive_no_update,
                 "next_poll_at": t.next_poll_at,
@@ -889,7 +1055,7 @@ def append_events(t: PRTracker, events: list[dict]) -> None:
     """Append new events to the JSONL log; compact + prune if the log grows large."""
     if not events:
         return
-    directory = _tracker_dir(t.key)
+    directory = _tracker_dir(t.storage_key)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "events.jsonl").open("a") as f:
         for e in events:
@@ -915,7 +1081,7 @@ def append_events(t: PRTracker, events: list[dict]) -> None:
 
 def save_subscriber(t: PRTracker, session_id: str) -> None:
     _atomic_write(
-        _tracker_dir(t.key) / f"sub-{_safe(session_id)}.json",
+        _tracker_dir(t.storage_key) / f"sub-{_safe(session_id)}.json",
         json.dumps(
             {
                 "session_id": session_id,
@@ -928,7 +1094,7 @@ def save_subscriber(t: PRTracker, session_id: str) -> None:
 
 def delete_subscriber(t: PRTracker, session_id: str) -> None:
     try:
-        (_tracker_dir(t.key) / f"sub-{_safe(session_id)}.json").unlink()
+        (_tracker_dir(t.storage_key) / f"sub-{_safe(session_id)}.json").unlink()
     except OSError:
         pass
 
@@ -937,7 +1103,11 @@ def delete_tracker(key: str) -> None:
     shutil.rmtree(_tracker_dir(key), ignore_errors=True)
 
 
-def load_trackers(client) -> list[PRTracker]:
+def load_trackers(clients) -> list[PRTracker]:
+    # Accept either a {provider: client} map or a single client (treated as github —
+    # back-compat for existing callers and tests).
+    if not isinstance(clients, dict):
+        clients = {"github": clients}
     base = pr_store_dir()
     if not base.is_dir():
         return []
@@ -950,7 +1120,27 @@ def load_trackers(client) -> list[PRTracker]:
             state = json.loads(state_path.read_text())
         except (OSError, ValueError):
             continue
-        t = PRTracker(state["owner"], state["repo"], int(state["number"]), client)
+        provider = state.get("provider", "github")  # absent -> github (legacy dirs)
+        # Skip a tracker whose provider isn't wired on this daemon (e.g. a forgejo
+        # tracker on disk but no ForgejoClient configured) so it can't crash the poll
+        # loop. Membership — not truthiness — is the test: a caller may deliberately
+        # map a provider to None (the storage-roundtrip tests pass a single None client).
+        if provider not in clients:
+            print(
+                f"notifications: skipping PR tracker {directory.name!r} — no client for "
+                f"provider {provider!r} (is it configured on this daemon?)",
+                file=sys.stderr,
+            )
+            continue
+        client = clients[provider]
+        t = PRTracker(
+            state["owner"],
+            state["repo"],
+            int(state["number"]),
+            client,
+            provider=provider,
+            base_url=state.get("base_url"),
+        )
         snapshot = state.get("snapshot")
         # A snapshot from before the timeline-identity switch has a different
         # shape/ID space; drop it so the next poll re-baselines silently instead of

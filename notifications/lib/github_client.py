@@ -27,6 +27,8 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
+import pr_errors
+
 _USER_AGENT = "wlr-notifications-daemon"
 
 # A brief GitHub blip (5xx / network) shouldn't cost a whole poll interval, so a
@@ -38,27 +40,28 @@ _FETCH_ATTEMPTS = 3
 _FETCH_BASE_DELAY = 1.0
 
 
-class GitHubError(Exception):
-    """Base for classified GitHub failures."""
+class GitHubError(pr_errors.PRError):
+    """Base for classified GitHub failures. Subclasses the provider-agnostic PR-fetch
+    taxonomy (pr_errors) so the daemon's tracker loop catches GitHub and Forgejo
+    failures through the same base classes; the GitHub* names stay for existing
+    call sites and tests."""
 
 
-class GitHubAuthError(GitHubError):
+class GitHubAuthError(GitHubError, pr_errors.PRAuthError):
     """Bad/insufficient credentials (401/403 non-rate-limit, GraphQL FORBIDDEN)."""
 
 
-class GitHubNotFound(GitHubError):
+class GitHubNotFound(GitHubError, pr_errors.PRNotFound):
     """The PR/repo does not exist or the token can't see it (404, GraphQL NOT_FOUND)."""
 
 
-class GitHubRateLimited(GitHubError):
-    """Rate limit hit; `reset_at` is the epoch seconds to wait until."""
+class GitHubRateLimited(GitHubError, pr_errors.PRRateLimited):
+    """Rate limit hit; `reset_at` is the epoch seconds to wait until.
 
-    def __init__(self, reset_at: float, message: str = "rate limited") -> None:
-        super().__init__(message)
-        self.reset_at = reset_at
+    Inherits PRRateLimited.__init__(reset_at, message), which stores `reset_at`."""
 
 
-class GitHubTransient(GitHubError):
+class GitHubTransient(GitHubError, pr_errors.PRTransient):
     """Server/network error worth retrying with backoff (5xx, timeouts)."""
 
 

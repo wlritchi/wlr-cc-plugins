@@ -12,6 +12,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 import anyio
@@ -52,7 +53,7 @@ def wait_port(port: int | str, timeout: float = 25.0) -> bool:
 # prefers the full-URL override, ignoring the test's host/port), real GitHub
 # credentials, and the live session's CLAUDE_* identity. Tests re-set exactly what
 # they need.
-_ISOLATE_PREFIXES = ("NOTIFICATIONS_", "GITHUB_", "CLAUDE_")
+_ISOLATE_PREFIXES = ("NOTIFICATIONS_", "GITHUB_", "FORGEJO_", "CLAUDE_")
 
 
 def _isolated_environ() -> dict:
@@ -64,6 +65,7 @@ def daemon_env(
     data_dir: Path,
     *,
     graphql_url: str | None = None,
+    forgejo_url: str | None = None,
     poll_seconds: str = "1",
     warm_ttl: str | None = None,
     agent_ttl: str | None = None,
@@ -85,6 +87,10 @@ def daemon_env(
     if graphql_url:
         env["GITHUB_GRAPHQL_URL"] = graphql_url
         env["GITHUB_TOKEN"] = "test-token"
+    if forgejo_url:
+        # Point the spawned daemon's ForgejoClient at the fake (client appends /api/v1).
+        env["FORGEJO_API_URL"] = forgejo_url
+        env["FORGEJO_TOKEN"] = "test-token"
     return env
 
 
@@ -424,6 +430,227 @@ class FakeGitHub:
 
 
 # --------------------------------------------------------------------------- #
+# Fake Forgejo/Gitea REST endpoint (the REST parallel to FakeGitHub)
+# --------------------------------------------------------------------------- #
+
+
+def forgejo_pr(number: int, **override) -> dict:
+    """A raw Gitea pull-request core object (the /pulls/{n} response), with sane
+    defaults. Mutate the returned dict (or the copy stored on a FakeForgejo) between
+    polls the way FakeGitHub tests mutate `gh.pr`."""
+    pr = {
+        "number": number,
+        "title": "Add feature",
+        "html_url": f"https://fj/owner/repo/pulls/{number}",
+        "state": "open",  # Gitea uses lowercase "open"/"closed"
+        "merged": False,
+        "merged_by": None,
+        "mergeable": True,  # bool | None (None -> "unknown")
+        "draft": False,
+        "head": {"sha": "a" * 40},
+        "labels": [],
+        "requested_reviewers": [],
+    }
+    pr.update(override)
+    return pr
+
+
+class FakeForgejo:
+    """A tiny Gitea-style REST endpoint serving the five GETs forgejo_client.fetch_pr
+    issues, driven by a mutable in-memory model you update between polls (mirrors
+    FakeGitHub's mutability + set_fault fault injection).
+
+    Endpoints (all under the client-appended /api/v1):
+      GET /repos/{o}/{r}/pulls/{n}                       -> self.pr (or extra), 404 if absent
+      GET /repos/{o}/{r}/pulls/{n}/reviews               -> self.reviews (paginated)
+      GET /repos/{o}/{r}/pulls/{n}/reviews/{id}/comments -> self.review_comments[id]
+      GET /repos/{o}/{r}/issues/{n}/comments             -> self.issue_comments (paginated)
+      GET /repos/{o}/{r}/commits/{sha}/status            -> {"statuses": self.statuses}
+
+    List endpoints honor ?page=&limit=; `api_url` is the instance root (the client
+    appends /api/v1). A single fake can serve several PRs via `extra` (the daemon has
+    one FORGEJO_API_URL)."""
+
+    def __init__(
+        self,
+        number: int,
+        pr: dict,
+        *,
+        page_size: int = 50,
+        extra: dict[int, dict] | None = None,
+    ) -> None:
+        self.number = number
+        self.pr = pr
+        self.extra: dict[int, dict] = dict(extra or {})
+        self.page_size = page_size
+        # Sub-resources, keyed by PR number. reviews/issue_comments/statuses are lists;
+        # review_comments maps a review id -> its inline comments.
+        self.reviews: dict[int, list[dict]] = {}
+        self.review_comments: dict[int, dict[int, list[dict]]] = {}
+        self.issue_comments: dict[int, list[dict]] = {}
+        self.statuses: dict[int, list[dict]] = {}
+        self._server: http.server.ThreadingHTTPServer | None = None
+        # Fault injection, identical semantics to FakeGitHub.set_fault.
+        self.fault_status: int | None = None
+        self.fault_headers: dict[str, str] = {}
+        self.fault_count: int | None = None
+
+    # --- fault injection (cross-thread, same contract as FakeGitHub) ------------- #
+    def set_fault(
+        self,
+        status: int,
+        *,
+        headers: dict[str, str] | None = None,
+        count: int | None = None,
+    ) -> None:
+        self.fault_status = status
+        self.fault_headers = dict(headers or {})
+        self.fault_count = count
+
+    def clear_fault(self) -> None:
+        self.fault_status = None
+        self.fault_headers = {}
+        self.fault_count = None
+
+    # --- model helpers ----------------------------------------------------------- #
+    def _pr_for(self, number: int) -> dict | None:
+        if number == self.number:
+            return self.pr
+        return self.extra.get(number)
+
+    def set_reviews(self, reviews: list[dict], *, number: int | None = None) -> None:
+        self.reviews[number if number is not None else self.number] = reviews
+
+    def set_review_comments(
+        self, review_id: int, comments: list[dict], *, number: int | None = None
+    ) -> None:
+        n = number if number is not None else self.number
+        self.review_comments.setdefault(n, {})[review_id] = comments
+
+    def set_issue_comments(
+        self, comments: list[dict], *, number: int | None = None
+    ) -> None:
+        self.issue_comments[number if number is not None else self.number] = comments
+
+    def set_statuses(self, statuses: list[dict], *, number: int | None = None) -> None:
+        self.statuses[number if number is not None else self.number] = statuses
+
+    def set_pr(self, *, number: int | None = None, **fields) -> None:
+        """Mutate PR-core fields (mergeable, merged, state, head, merged_by, ...)."""
+        pr = self._pr_for(number if number is not None else self.number)
+        assert pr is not None
+        for k, v in fields.items():
+            pr[k] = v
+
+    # --- server ------------------------------------------------------------------ #
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return self._server.server_address[1]
+
+    @property
+    def api_url(self) -> str:
+        """The instance root; the ForgejoClient appends /api/v1 itself."""
+        return f"http://127.0.0.1:{self.port}"
+
+    def _slice(self, items: list[dict], query: str) -> list[dict]:
+        """Return the page of `items` selected by ?page=&limit= in the query string."""
+        params = urllib.parse.parse_qs(query)
+        page = int((params.get("page") or ["1"])[0])
+        limit = int((params.get("limit") or [str(self.page_size)])[0])
+        start = (page - 1) * limit
+        return items[start : start + limit]
+
+    def _next_response(self, path: str, query: str) -> tuple[int, object, dict]:
+        """(status, json-body, extra-headers) for one GET, applying any injected fault
+        first (so both the live server and a MockTransport share fault semantics)."""
+        if self.fault_status is not None:
+            status = self.fault_status
+            headers = dict(self.fault_headers)
+            if self.fault_count is not None:
+                self.fault_count -= 1
+                if self.fault_count <= 0:
+                    self.clear_fault()  # auto-recover after the burst
+            return status, {"message": "fault"}, headers
+        status, body = self._resolve(path, query)
+        return status, body, {}
+
+    def _resolve(self, path: str, query: str) -> tuple[int, object]:
+        """Map a request path to (status, json-body). 404 with {} body for unknown PRs
+        or missing sub-resources — the client swallows sub-resource 404s to []."""
+        # /api/v1/repos/{o}/{r}/pulls/{n}[/reviews[/{id}/comments]]
+        # /api/v1/repos/{o}/{r}/issues/{n}/comments
+        # /api/v1/repos/{o}/{r}/commits/{sha}/status
+        m = re.match(r"^/api/v1/repos/[^/]+/[^/]+/pulls/(\d+)$", path)
+        if m:
+            pr = self._pr_for(int(m.group(1)))
+            return (200, pr) if pr is not None else (404, {})
+        m = re.match(r"^/api/v1/repos/[^/]+/[^/]+/pulls/(\d+)/reviews$", path)
+        if m:
+            n = int(m.group(1))
+            if self._pr_for(n) is None:
+                return (404, {})
+            return (200, self._slice(self.reviews.get(n, []), query))
+        m = re.match(
+            r"^/api/v1/repos/[^/]+/[^/]+/pulls/(\d+)/reviews/(\d+)/comments$", path
+        )
+        if m:
+            n, rid = int(m.group(1)), int(m.group(2))
+            comments = (self.review_comments.get(n) or {}).get(rid)
+            if comments is None:
+                return (404, {})
+            return (200, self._slice(comments, query))
+        m = re.match(r"^/api/v1/repos/[^/]+/[^/]+/issues/(\d+)/comments$", path)
+        if m:
+            n = int(m.group(1))
+            if self._pr_for(n) is None:
+                return (404, {})
+            return (200, self._slice(self.issue_comments.get(n, []), query))
+        m = re.match(r"^/api/v1/repos/[^/]+/[^/]+/commits/([^/]+)/status$", path)
+        if m:
+            sha = m.group(1)
+            for n, pr in [(self.number, self.pr), *self.extra.items()]:
+                if pr is not None and (pr.get("head") or {}).get("sha") == sha:
+                    return (200, {"statuses": self.statuses.get(n, [])})
+            return (200, {"statuses": []})  # unknown sha -> empty combined status
+        return (404, {})
+
+    def __enter__(self) -> "FakeForgejo":
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # silence
+                pass
+
+            def do_GET(self) -> None:
+                parsed = urllib.parse.urlparse(self.path)
+                status, body, extra = outer._next_response(parsed.path, parsed.query)
+                self._reply(status, body, extra)
+
+            def _reply(
+                self, status: int, body: object, extra: dict | None = None
+            ) -> None:
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("X-RateLimit-Remaining", "4999")
+                self.send_header("X-RateLimit-Reset", str(int(time.time()) + 3600))
+                for name, value in (extra or {}).items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(data)
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+
+
+# --------------------------------------------------------------------------- #
 # raw MCP-over-stdio client helpers (run inside an anyio scope)
 # --------------------------------------------------------------------------- #
 
@@ -592,8 +819,10 @@ async def agent_session(
 __all__ = [
     "DAEMON",
     "RELAY",
+    "FakeForgejo",
     "FakeGitHub",
     "agent_session",
+    "forgejo_pr",
     "daemon_env",
     "daemon_process",
     "free_port",

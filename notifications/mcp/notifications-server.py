@@ -731,6 +731,124 @@ async def list_github_pr_subscriptions() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Forgejo/Gitea PR subscription tools (a parallel REST poller in the daemon)
+# --------------------------------------------------------------------------- #
+
+_FORGEJO_UNSUPPORTED_MESSAGE = (
+    "This daemon build doesn't support Forgejo PR subscriptions yet. The daemon is "
+    "deployed independently of relays and must ship the Forgejo poller first "
+    "(daemon-first). If it was just updated, retry shortly; otherwise the running "
+    "daemon predates this feature."
+)
+
+
+async def _forgejo_daemon_request(payload: dict) -> dict | str:
+    """Like _daemon_request, but degrades a request timeout OR an 'unknown message type'
+    ERROR to a clear 'daemon doesn't support Forgejo yet' message. An older daemon
+    silently drops a verb it doesn't know (its dispatch has no branch for it), so the
+    relay's request times out; a daemon new enough to have the terminal-else replies
+    ERROR. Either way the caller gets a clear message instead of a hang or a generic
+    'unreachable'."""
+    if not await DAEMON.wait_connected():
+        return _daemon_unreachable_message()
+    try:
+        reply = await DAEMON.request(payload)
+    except TimeoutError:
+        return _FORGEJO_UNSUPPORTED_MESSAGE
+    except ConnectionError:
+        return _daemon_unreachable_message()
+    if reply.get("type") == wsproto.ERROR and "unknown message type" in str(
+        reply.get("error") or ""
+    ):
+        return _FORGEJO_UNSUPPORTED_MESSAGE
+    return reply
+
+
+@mcp.tool()
+async def subscribe_forgejo_pr(pr: str) -> str:
+    """Subscribe this session to notifications for a Forgejo/Gitea PR, as owner/repo#number.
+
+    The Forgejo counterpart of subscribe_github_pr, for a self-hosted Forgejo/Gitea
+    instance the daemon is configured to poll (instance URL + token). The daemon polls
+    the PR (reviews, inline + conversation comments, commit status, mergeability, new
+    commits) and delivers updates as <channel> events. Subscriptions persist in the
+    daemon; a merged PR auto-unsubscribes you.
+    """
+    match = _PR_REF_RE.match(pr or "")
+    if not match:
+        return "Invalid PR reference. Use owner/repo#number, e.g. wlritchi/scry#4."
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot subscribe: this relay does not yet know its session id."
+    owner, repo, number = match.group(1), match.group(2), int(match.group(3))
+    reply = await _forgejo_daemon_request(
+        {
+            "type": wsproto.SUBSCRIBE_FORGEJO_PR,
+            "session_id": session_id,
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not subscribe to {owner}/{repo}#{number}: {reply.get('error')}"
+    if reply.get("closed"):
+        return f"{reply.get('pr')} is already closed/merged ({reply.get('summary')}); not subscribing."
+    return f"Subscribed to {reply.get('pr')} (Forgejo). Current status: {reply.get('summary')}. {DAEMON.delivery_hint()}"
+
+
+@mcp.tool()
+async def unsubscribe_forgejo_pr(pr: str) -> str:
+    """Unsubscribe this session from a Forgejo/Gitea PR, given as owner/repo#number."""
+    match = _PR_REF_RE.match(pr or "")
+    if not match:
+        return "Invalid PR reference. Use owner/repo#number, e.g. wlritchi/scry#4."
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot unsubscribe: this relay does not yet know its session id."
+    owner, repo, number = match.group(1), match.group(2), int(match.group(3))
+    reply = await _forgejo_daemon_request(
+        {
+            "type": wsproto.UNSUBSCRIBE_FORGEJO_PR,
+            "session_id": session_id,
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+        }
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not unsubscribe from {owner}/{repo}#{number}: {reply.get('error')}"
+    return f"Unsubscribed from {reply.get('pr')}."
+
+
+@mcp.tool()
+async def list_forgejo_pr_subscriptions() -> str:
+    """List this session's active Forgejo/Gitea PR subscriptions (queried from the daemon)."""
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Session id unknown; cannot list PR subscriptions."
+    reply = await _forgejo_daemon_request(
+        {"type": wsproto.LIST_FORGEJO_PR_SUBSCRIPTIONS, "session_id": session_id}
+    )
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not list Forgejo PR subscriptions: {reply.get('error')}"
+    items = reply.get("items", [])
+    if not items:
+        return "No active Forgejo PR subscriptions for this session."
+    lines = ["Forgejo PR subscriptions:"]
+    for item in items:
+        state = " (merged)" if item.get("merged") else ""
+        lines.append(f"  {item.get('pr')}{state}  pending={item.get('pending', 0)}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # agent directory tools (Phase A)
 # --------------------------------------------------------------------------- #
 

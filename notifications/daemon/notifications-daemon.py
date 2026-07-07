@@ -55,9 +55,11 @@ from websockets.exceptions import ConnectionClosed
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import agent_registry  # noqa: E402
+import forgejo_client  # noqa: E402
 import github_client  # noqa: E402
 import messaging  # noqa: E402
 import message_topic  # noqa: E402
+import pr_errors  # noqa: E402
 import pr_monitor  # noqa: E402
 import pr_schedule  # noqa: E402
 import scheduler  # noqa: E402
@@ -234,6 +236,25 @@ def _alloc_ordinal() -> int:
 
 
 GH: github_client.GitHubClient | None = None
+# The Forgejo/Gitea client, built in main() only when FORGEJO_API_URL is configured;
+# None means this daemon does not serve Forgejo PR subscriptions.
+FJ: forgejo_client.ForgejoClient | None = None
+
+
+def _pr_client(provider: str):
+    """The PR client for a provider, or None if that provider isn't wired here."""
+    return FJ if provider == "forgejo" else GH
+
+
+def _pr_clients() -> dict:
+    """The {provider: client} map for load_trackers — only configured providers, so a
+    tracker whose provider is unconfigured is skipped rather than loaded with no client."""
+    clients: dict = {"github": GH}
+    if FJ is not None and FJ.configured:
+        clients["forgejo"] = FJ
+    return clients
+
+
 # Shared secret each relay must present (Authorization: Bearer <token>) to connect.
 # Computed once at startup; relays compute the same value from NOTIFICATIONS_DATA_DIR.
 TOKEN = ""
@@ -359,7 +380,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                 # away, surface a one-time "history truncated" notice ahead of the
                 # surviving events, so they know to check the PR for what was lost.
                 missed = tracker.missed.get(session_id, 0)
-                trunc_id = f"trunc:{tracker.key}:{session_id}"
+                trunc_id = f"trunc:{tracker.storage_key}:{session_id}"
                 if missed > 0 and trunc_id not in conn.inflight:
                     content = (
                         f"⚠️ {tracker.key}: {missed} earlier update(s) were dropped "
@@ -388,7 +409,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                     event_id = event["id"]
                     if event_id in acked:
                         continue
-                    nid = f"pr:{tracker.key}:{event_id}"
+                    nid = f"pr:{tracker.storage_key}:{event_id}"
                     if nid in conn.inflight:
                         continue
                     payload = {
@@ -481,6 +502,16 @@ async def _handle(websocket) -> None:
             elif kind == wsproto.LIST_PR_SUBSCRIPTIONS:
                 await _handle_list_pr_subscriptions(websocket, conn, msg)
 
+            elif kind == wsproto.SUBSCRIBE_FORGEJO_PR:
+                await _handle_subscribe(websocket, conn, msg, provider="forgejo")
+
+            elif kind == wsproto.UNSUBSCRIBE_FORGEJO_PR:
+                _handle_unsubscribe(conn, msg, provider="forgejo")
+                await _send(websocket, wsproto.UNSUBSCRIBED, msg, pr=_msg_key(msg))
+
+            elif kind == wsproto.LIST_FORGEJO_PR_SUBSCRIPTIONS:
+                await _handle_list_pr_subscriptions(websocket, conn, msg, provider="forgejo")
+
             elif kind == wsproto.REGISTER_AGENT:
                 await _handle_register_agent(websocket, conn, msg)
 
@@ -522,6 +553,17 @@ async def _handle(websocket) -> None:
 
             elif kind == wsproto.MESSAGE_STATUS:
                 await _handle_message_status(websocket, conn, msg)
+
+            else:
+                # No silent drops: an unknown type means a newer relay is speaking a verb
+                # this daemon predates. Reply ERROR so the skew fails loudly on the relay
+                # (which otherwise blocks on a reply that never comes) instead of hanging.
+                await _send(
+                    websocket,
+                    wsproto.ERROR,
+                    msg,
+                    error=f"unknown message type: {kind}",
+                )
     except ConnectionClosed:
         pass
     finally:
@@ -555,9 +597,10 @@ def _handle_ack(conn: Connection, msg: dict) -> None:
     if not nid:
         return
     if isinstance(nid, str) and nid.startswith("trunc:"):
-        # trunc:{key}:{sid} — key holds '/' and '#' but never ':', so rpartition on
-        # ':' cleanly splits the trailing session id off the key. Acking the notice
-        # clears the missed counter until the next truncation drops more events.
+        # trunc:{storage_key}:{sid} — the trailing session id never contains ':', so
+        # rpartition(':') peels it off cleanly, leaving the storage key (which may carry
+        # a "<provider>:" prefix for non-github PRs, plus '/' and '#') intact for lookup.
+        # Acking the notice clears the missed counter until the next truncation.
         key, _, session_id = nid[len("trunc:") :].rpartition(":")
         tracker = TRACKERS.get(key)
         if tracker is not None and session_id in tracker.subscribers:
@@ -602,7 +645,15 @@ def _msg_key(msg: dict) -> str:
     return pr_monitor.pr_key(msg.get("owner"), msg.get("repo"), msg.get("number"))
 
 
-async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
+def _msg_storage_key(msg: dict, provider: str) -> str:
+    return pr_monitor.storage_key(
+        provider, msg.get("owner"), msg.get("repo"), msg.get("number")
+    )
+
+
+async def _handle_subscribe(
+    websocket, conn: Connection, msg: dict, provider: str = "github"
+) -> None:
     session_id = conn.session_id or msg.get("session_id")
     owner, repo, number = msg.get("owner"), msg.get("repo"), msg.get("number")
     if not session_id or not owner or not repo or number is None:
@@ -610,11 +661,29 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
             websocket, wsproto.ERROR, msg, error="missing session id or PR reference"
         )
         return
-    key = pr_monitor.pr_key(owner, repo, number)
-    tracker = TRACKERS.get(key)
+    client = _pr_client(provider)
+    if client is None or (provider == "forgejo" and not client.configured):
+        await _send(
+            websocket,
+            wsproto.ERROR,
+            msg,
+            error="Forgejo PR monitoring is not configured on this daemon "
+            "(set FORGEJO_API_URL / FORGEJO_TOKEN).",
+        )
+        return
+    key = pr_monitor.pr_key(owner, repo, number)  # display ref for replies/errors
+    skey = pr_monitor.storage_key(provider, owner, repo, number)  # TRACKERS/dir key
+    tracker = TRACKERS.get(skey)
 
     if tracker is None:
-        tracker = pr_monitor.PRTracker(owner, repo, int(number), GH)
+        tracker = pr_monitor.PRTracker(
+            owner,
+            repo,
+            int(number),
+            client,
+            provider=provider,
+            base_url=client.base_url if provider == "forgejo" else None,
+        )
         try:
             summary = await tracker.initial_poll()
         except Exception as exc:  # noqa: BLE001 - report any fetch failure to the agent
@@ -622,7 +691,7 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
                 websocket, wsproto.ERROR, msg, error=f"could not fetch {key}: {exc}"
             )
             return
-        TRACKERS[key] = tracker
+        TRACKERS[skey] = tracker
         tracker.next_poll_at = time.time() + _poll_delay(
             tracker
         )  # baseline done; schedule first real poll
@@ -666,10 +735,10 @@ async def _handle_subscribe(websocket, conn: Connection, msg: dict) -> None:
     )
 
 
-def _handle_unsubscribe(conn: Connection, msg: dict) -> None:
+def _handle_unsubscribe(conn: Connection, msg: dict, provider: str = "github") -> None:
     session_id = conn.session_id or msg.get("session_id")
-    key = _msg_key(msg)
-    tracker = TRACKERS.get(key)
+    skey = _msg_storage_key(msg, provider)
+    tracker = TRACKERS.get(skey)
     if tracker is not None and session_id in tracker.subscribers:
         tracker.subscribers.discard(session_id)
         tracker.acked.pop(session_id, None)
@@ -684,19 +753,21 @@ def _handle_unsubscribe(conn: Connection, msg: dict) -> None:
                 tracker.idle_since = time.time()
                 pr_monitor.save_state(tracker)
             else:
-                _remove_tracker(key)
+                _remove_tracker(skey)
 
 
-async def _handle_list_pr_subscriptions(websocket, conn: Connection, msg: dict) -> None:
+async def _handle_list_pr_subscriptions(
+    websocket, conn: Connection, msg: dict, provider: str = "github"
+) -> None:
     session_id = conn.session_id or msg.get("session_id")
     items = [
         {
-            "pr": key,
+            "pr": t.key,  # human-facing ref (owner/repo#number), not the storage key
             "merged": t.merged,
             "pending": len(t.unacked_for(session_id)),
         }
-        for key, t in TRACKERS.items()
-        if session_id in t.subscribers
+        for t in TRACKERS.values()
+        if session_id in t.subscribers and t.provider == provider
     ]
     await _send(websocket, wsproto.SUBSCRIPTIONS_RESULT, msg, items=items)
 
@@ -1409,7 +1480,7 @@ def _finalize_terminal(tracker: pr_monitor.PRTracker, session_id: str) -> None:
         tracker.missed.pop(session_id, None)
         pr_monitor.delete_subscriber(tracker, session_id)
         if not tracker.subscribers:
-            _remove_tracker(tracker.key)
+            _remove_tracker(tracker.storage_key)
 
 
 def _poll_delay(tracker: pr_monitor.PRTracker) -> float:
@@ -1503,7 +1574,7 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             tracker.consecutive_no_update = (
                 0 if added else tracker.consecutive_no_update + 1
             )
-        except github_client.GitHubNotFound as exc:
+        except pr_errors.PRNotFound as exc:
             _emit(
                 tracker,
                 pr_monitor.synthetic_event(
@@ -1517,22 +1588,30 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             )
             pr_monitor.save_state(tracker)
             return
-        except github_client.GitHubRateLimited as exc:
+        except pr_errors.PRRateLimited as exc:
             wait = max(1.0, exc.reset_at - time.time())
             print(
                 f"notifications daemon: {tracker.key} rate limited; waiting {int(wait)}s",
                 file=sys.stderr,
             )
             delay = wait + random.uniform(1.0, 15.0)  # defer; not a "no update"
-        except github_client.GitHubAuthError as exc:
+        except pr_errors.PRAuthError as exc:
             if not tracker.auth_notified:
+                label = {"github": "GitHub", "forgejo": "Forgejo"}.get(
+                    tracker.provider, tracker.provider
+                )
+                token_env = {
+                    "github": "GITHUB_TOKEN",
+                    "forgejo": "FORGEJO_TOKEN",
+                }.get(tracker.provider, "the provider token")
                 _emit(
                     tracker,
                     pr_monitor.synthetic_event(
                         "pr_auth_error",
                         "high",
-                        f"GitHub access to {tracker.key} failed ({exc}). Polling is paused until "
-                        "the daemon's GITHUB_TOKEN is fixed (restart the daemon with a valid token).",
+                        f"{label} access to {tracker.key} failed ({exc}). Polling is paused "
+                        f"until the daemon's {token_env} is fixed (restart the daemon with a "
+                        "valid token).",
                         tracker.key,
                         f"auth_error:{tracker.key}",
                     ),
@@ -1554,7 +1633,11 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
 
         if delay is None:
             delay = _poll_delay(tracker)
-            throttle_until = GH.should_throttle() if GH is not None else None
+            throttle_until = (
+                tracker.client.should_throttle()
+                if tracker.client is not None
+                else None
+            )
             if throttle_until is not None:
                 delay = max(
                     delay, throttle_until - time.time() + random.uniform(1.0, 15.0)
@@ -1607,11 +1690,17 @@ class _ProbeHandshakeFilter(logging.Filter):
 
 
 async def main() -> None:
-    global GH, TOKEN
+    global GH, FJ, TOKEN
     TOKEN = wsproto.token()  # auto-creates <NOTIFICATIONS_DATA_DIR>/token if needed
     GH = github_client.GitHubClient()
-    for tracker in pr_monitor.load_trackers(GH):
-        TRACKERS[tracker.key] = tracker
+    # Forgejo is optional: only served when an instance URL is configured. A daemon
+    # without it rejects forgejo_* subscriptions (and skips any forgejo trackers on
+    # disk) rather than failing to start.
+    FJ = forgejo_client.ForgejoClient()
+    if not FJ.configured:
+        FJ = None
+    for tracker in pr_monitor.load_trackers(_pr_clients()):
+        TRACKERS[tracker.storage_key] = tracker
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
     asyncio.create_task(_reaper_loop())
 

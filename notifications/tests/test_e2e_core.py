@@ -27,6 +27,7 @@ EXPECTED_TOOLS = [
     "leave_channel",
     "list_agents",
     "list_channels",
+    "list_forgejo_pr_subscriptions",
     "list_github_pr_subscriptions",
     "list_scheduled_notifications",
     "list_subscriptions",
@@ -38,8 +39,10 @@ EXPECTED_TOOLS = [
     "set_availability",
     "set_channel_topic",
     "set_threshold",
+    "subscribe_forgejo_pr",
     "subscribe_github_pr",
     "unregister_agent",
+    "unsubscribe_forgejo_pr",
     "unsubscribe_github_pr",
 ]
 
