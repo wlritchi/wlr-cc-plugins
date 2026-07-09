@@ -61,6 +61,11 @@ class AgentRecord:
     registered_at: float = 0.0
     last_seen: float = 0.0
     reclaim_key_hash: str = ""
+    # Which holder of this name this record represents (name = service, session =
+    # process; docs/specs/2026-07-09). Bumps every time the name transfers to a
+    # DIFFERENT session; a same-session re-register keeps it. Audit + relay-side
+    # supersession detection; never part of message addressing.
+    generation: int = 1
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -77,6 +82,7 @@ class AgentRecord:
             registered_at=data.get("registered_at", 0.0),
             last_seen=data.get("last_seen", 0.0),
             reclaim_key_hash=data.get("reclaim_key_hash", ""),
+            generation=int(data.get("generation", 1)),
         )
 
 
@@ -161,6 +167,7 @@ class AgentRegistry:
             _validate_threshold(default_threshold)
         if reclaim_key is not None:
             _validate_reclaim_key(reclaim_key)
+        succeeds_generation: int | None = None  # set when displacing an offline holder
 
         # Collision: the desired name is held by a *different* session. A live
         # owner is never displaced. An offline owner may be displaced by a
@@ -191,6 +198,9 @@ class AgentRegistry:
             reclaimable = key_matches and offline_for >= settle
             if within_grace and not reclaimable:
                 raise NameTaken(f"name {name!r} is already taken")
+            # The name transfers to a new session: the successor's record continues
+            # the holder's generation sequence (name = service, session = process).
+            succeeds_generation = holder.generation
             self._remove(holder)
 
         # One identity per session: if this session already owns a *different*
@@ -214,6 +224,7 @@ class AgentRegistry:
                 if reclaim_key is not None
                 else prior.reclaim_key_hash
             )
+            generation = prior.generation  # same holder: not a succession
         else:
             registered_at = now
             threshold = (
@@ -222,6 +233,9 @@ class AgentRegistry:
                 else DEFAULT_THRESHOLD
             )
             key_hash = _hash_key(reclaim_key) if reclaim_key is not None else ""
+            generation = (
+                succeeds_generation + 1 if succeeds_generation is not None else 1
+            )
 
         record = AgentRecord(
             name=name,
@@ -233,6 +247,7 @@ class AgentRegistry:
             registered_at=registered_at,
             last_seen=now,
             reclaim_key_hash=key_hash,
+            generation=generation,
         )
         self._persist(record)
         return record

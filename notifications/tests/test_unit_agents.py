@@ -572,3 +572,104 @@ def test_atomic_write_creates_parents_and_leaves_no_tmp(tmp_path: Path) -> None:
 def test_safe_name_slugs_unsafe_chars(tmp_path: Path) -> None:
     assert storage.safe_name("a b/c") == "a_b_c"
     assert storage.safe_name("ok-name.json") == "ok-name.json"
+
+
+# --------------------------------------------------------------------------- #
+# generations (docs/specs/2026-07-09 slice b)
+# --------------------------------------------------------------------------- #
+
+
+def test_generation_starts_at_one_and_survives_reregister(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    rec = reg.register(
+        "s1", "worker", now=1000.0, is_session_live=_never_live, ttl=900.0
+    )
+    assert rec.generation == 1
+    # Same-session idempotent update: not a succession.
+    rec = reg.register(
+        "s1",
+        "worker",
+        now=1100.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        description="updated",
+    )
+    assert rec.generation == 1
+
+
+def test_generation_increments_on_keyed_reclaim(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    reg.register(
+        "s1",
+        "worker",
+        now=1000.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+    rec = reg.register(
+        "s2",
+        "worker",
+        now=1100.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+    assert rec.generation == 2
+    rec = reg.register(
+        "s3",
+        "worker",
+        now=1200.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+    assert rec.generation == 3
+
+
+def test_generation_increments_on_grace_expiry_takeover(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    reg.register("s1", "worker", now=1000.0, is_session_live=_never_live, ttl=900.0)
+    rec = reg.register(
+        "s2", "worker", now=2000.0, is_session_live=_never_live, ttl=900.0
+    )
+    assert rec.generation == 2
+
+
+def test_generation_persists_and_legacy_records_default_to_one(
+    tmp_path: Path,
+) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    reg.register(
+        "s1",
+        "worker",
+        now=1000.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+    reg.register(
+        "s2",
+        "worker",
+        now=1100.0,
+        is_session_live=_never_live,
+        ttl=900.0,
+        reclaim_key="pod-1",
+    )
+    reloaded = ar.AgentRegistry(tmp_path)  # round-trips through the record files
+    assert reloaded.get_by_session("s2").generation == 2
+    # A record dict without the field (written by an older daemon) reads as gen 1.
+    rec = ar.AgentRecord.from_dict({"name": "old", "session_id": "sX"})
+    assert rec.generation == 1
+
+
+def test_unregister_then_register_restarts_generation(tmp_path: Path) -> None:
+    # Explicit unregister deletes the record: the name's service history ends, so
+    # a later holder starts a fresh line at gen 1.
+    reg = ar.AgentRegistry(tmp_path)
+    reg.register("s1", "worker", now=1000.0, is_session_live=_never_live, ttl=900.0)
+    reg.unregister("s1")
+    rec = reg.register(
+        "s2", "worker", now=1100.0, is_session_live=_never_live, ttl=900.0
+    )
+    assert rec.generation == 1

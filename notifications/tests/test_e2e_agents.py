@@ -485,3 +485,91 @@ def test_reclaim_key_settle_blocks_recent_holder(tmp_path):
                 assert "already taken" in text
 
         anyio.run(scenario)
+
+
+def test_succession_announces_and_notifies_predecessor(tmp_path):
+    """A name transfer (docs/specs/2026-07-09 slice d) surfaces two ways: an ambient
+    '⟳ succession' post in the well-known #system channel, and a direct 'an heir has
+    appeared' notice to the superseded session when it next reconnects. list_agents
+    shows the successor's bumped generation."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store, settle="0")):
+
+        async def scenario():
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-w") as (
+                read_w,
+                write_w,
+            ):
+                # An observer joins #system at threshold 'all' so the ambient
+                # succession post surfaces as a pushed channel event.
+                text, _ = await h.mcp_call(
+                    read_w, write_w, 2, "register_agent", {"name": "watcher"}
+                )
+                assert "Registered as 'watcher'" in text
+                text, _ = await h.mcp_call(
+                    read_w,
+                    write_w,
+                    3,
+                    "join_channel",
+                    {"channel": "system", "threshold": "all"},
+                )
+                assert "Joined #system" in text
+
+                # First holder of 'worker' registers, then goes away.
+                async with h.agent_session(tmp_path, ws, store, xdg, "sid-old") as (
+                    read_a,
+                    write_a,
+                ):
+                    text, _ = await h.mcp_call(
+                        read_a,
+                        write_a,
+                        2,
+                        "register_agent",
+                        {"name": "worker", "reclaim_key": "pod-1"},
+                    )
+                    assert "Registered as 'worker'" in text
+
+                # Successor reclaims: the watcher sees the #system announcement.
+                async with h.agent_session(tmp_path, ws, store, xdg, "sid-new") as (
+                    read_b,
+                    write_b,
+                ):
+                    text, next_id = await _list_until(
+                        read_b, write_b, 2, lambda t: "offline" in t
+                    )
+                    text, _ = await h.mcp_call(
+                        read_b,
+                        write_b,
+                        next_id,
+                        "register_agent",
+                        {"name": "worker", "reclaim_key": "pod-1"},
+                    )
+                    assert "Registered as 'worker'" in text
+                    event = await h.mcp_await_channel_with(
+                        read_w, "succession: worker gen 1→2", timeout=20
+                    )
+                    assert event is not None
+                    assert "[#system]" in event.params["content"]
+
+                    # The successor's generation is visible in the directory.
+                    listing, _ = await h.mcp_call(
+                        read_b, write_b, next_id + 1, "list_agents"
+                    )
+                    assert "worker (gen 2)" in listing
+
+                    # The superseded session reconnects and gets the heir notice.
+                    async with h.agent_session(tmp_path, ws, store, xdg, "sid-old") as (
+                        read_back,
+                        write_back,
+                    ):
+                        notice = await h.mcp_await_channel_with(
+                            read_back, "an heir has appeared", timeout=20
+                        )
+                        assert notice is not None
+                        assert "'worker' is now gen 2" in notice.params["content"]
+
+        anyio.run(scenario)

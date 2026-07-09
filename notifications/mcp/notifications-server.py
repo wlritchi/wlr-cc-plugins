@@ -883,7 +883,9 @@ async def list_agents() -> str:
             presence = (
                 f"offline (last seen {_format_last_seen(agent.get('last_seen', 0.0))})"
             )
-        lines.append(f"- {agent.get('name', '?')} — {presence}")
+        gen = agent.get("generation")
+        gen_tag = f" (gen {gen})" if gen and gen > 1 else ""
+        lines.append(f"- {agent.get('name', '?')}{gen_tag} — {presence}")
         if agent.get("description"):
             lines.append(f"    description: {agent['description']}")
         if agent.get("capabilities"):
@@ -1318,12 +1320,35 @@ async def message_status(message_id: str) -> str:
     delivered = reply.get("delivered", [])
     pending = reply.get("pending", [])
     reactions = reply.get("reactions", [])
+    recipients = reply.get("recipients", {})
+
+    def _annotate(name: str) -> str:
+        """Append liveness so 'delivered' can't be misread as 'processed': a
+        disconnected or long-idle recipient may have the message sitting in a
+        context nobody is running."""
+        info = recipients.get(name)
+        if not isinstance(info, dict):
+            return name  # older daemon: no annotation available
+        if info.get("connected"):
+            return name
+        last_seen = info.get("last_seen")
+        if last_seen:
+            idle = max(0.0, time.time() - float(last_seen))
+            if idle >= 3600:
+                ago = f"{idle / 3600:.1f}h ago"
+            elif idle >= 60:
+                ago = f"{int(idle / 60)}m ago"
+            else:
+                ago = f"{int(idle)}s ago"
+            return f"{name} (offline, last seen {ago})"
+        return f"{name} (offline)"
+
     total = len(delivered) + len(pending)
     parts = [f"Delivered to {len(delivered)} of {total}"]
     if delivered:
-        parts[0] += ": " + ", ".join(delivered)
+        parts[0] += ": " + ", ".join(_annotate(n) for n in delivered)
     if pending:
-        parts.append("pending: " + ", ".join(pending))
+        parts.append("pending: " + ", ".join(_annotate(n) for n in pending))
     if reactions:
         parts.append(
             "reactions: "

@@ -852,3 +852,49 @@ def test_dm_sent_while_name_offline_reaches_successor(tmp_path):
                     assert "(→ you)" in event.params["content"]
 
         anyio.run(scenario)
+
+
+def test_message_status_annotates_offline_recipient(tmp_path):
+    """message_status marks a non-connected recipient '(offline, last seen …)' so
+    'delivered/pending' can't be misread as 'a running session has it'
+    (docs/specs/2026-07-09 slice c)."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store)):
+
+        async def scenario():
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-s") as (
+                read_s,
+                write_s,
+            ):
+                ids_s = count(2)
+                await _register(read_s, write_s, ids_s, "sender")
+                async with h.agent_session(tmp_path, ws, store, xdg, "sid-t") as (
+                    read_t,
+                    write_t,
+                ):
+                    ids_t = count(2)
+                    await _register(read_t, write_t, ids_t, "target")
+                # target's session is gone; DM its name and inspect the receipt.
+                text, _ = await h.mcp_call(
+                    read_s,
+                    write_s,
+                    next(ids_s),
+                    "dm",
+                    {"to": ["target"], "body": "anyone home?"},
+                )
+                assert "Sent DM to target" in text
+                status = await _poll_call_until(
+                    read_s,
+                    write_s,
+                    ids_s,
+                    "message_status",
+                    lambda t: "(offline" in t,
+                    arguments={"message_id": "#1"},
+                )
+                assert "pending: target (offline" in status
+
+        anyio.run(scenario)

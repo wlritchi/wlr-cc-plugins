@@ -145,6 +145,10 @@ def _channel_history_n() -> int:
 
 # session id -> its current connection
 CONNECTIONS: dict[str, "Connection"] = {}
+# superseded session id -> {name, generation}: a pending "an heir has appeared"
+# notice, shipped if/when that session reconnects (docs/specs/2026-07-09 slice d).
+# In-memory only: a ceremony, not a delivery contract.
+SUPERSEDED: dict[str, dict] = {}
 # "owner/repo#number" -> PRTracker
 TRACKERS: dict[str, pr_monitor.PRTracker] = {}
 # The agent directory (Phase A): names -> records, persisted under <data_dir>/agents.
@@ -440,6 +444,10 @@ async def _handle(websocket) -> None:
                             tracker.wake.set()  # resume polling for this session's PRs
                     if dispatch_task is None:
                         dispatch_task = asyncio.create_task(_dispatch_loop(conn))
+                    if new_sid in SUPERSEDED:
+                        # A session whose name was taken over while it was away:
+                        # tell it an heir exists before it wonders why it's deaf.
+                        await _send_heir_notice(conn, new_sid)
 
             elif kind == wsproto.SCHEDULE:
                 await _handle_schedule(websocket, conn, msg)
@@ -707,6 +715,7 @@ async def _handle_register_agent(websocket, conn: Connection, msg: dict) -> None
     if not name:
         await _send(websocket, wsproto.ERROR, msg, error="missing agent name")
         return
+    prior = _registry_by_name(name)  # pre-register holder, for succession detection
     try:
         record = REGISTRY.register(
             session_id,
@@ -729,7 +738,67 @@ async def _handle_register_agent(websocket, conn: Connection, msg: dict) -> None
     # surfaced — are deliverable NOW. Nudge this session's dispatch loop; without
     # this, a successor would wait for the next unrelated wake.
     _wake(record.session_id)
+    if prior is not None and prior.session_id != record.session_id:
+        await _announce_succession(record, prior.session_id)
     await _send(websocket, wsproto.AGENT_OK, msg, agent=record.to_dict())
+
+
+async def _announce_succession(
+    record: agent_registry.AgentRecord, prior_sid: str
+) -> None:
+    """Surface a name transfer (docs/specs/2026-07-09 slice d): a fleet-visible,
+    ambient post in the well-known #system channel — knowing a handoff happened
+    explains behavior the way knowing a pod rolled explains a cold cache — plus a
+    direct heir notice to the superseded session if it is still connected, enabling
+    an explicit predecessor->heir handoff (the predecessor can DM the name it used
+    to hold; delivery-time resolution routes that to the heir)."""
+    gen = record.generation
+    topic = _get_or_create_topic("chan:system", "channel")
+    message = topic.post(
+        "system",
+        now=time.time(),
+        body=f"⟳ succession: {record.name} gen {gen - 1}→{gen}",
+        intent="fyi",
+        severity="low",
+        ordinal=_alloc_ordinal(),
+    )
+    # Not _persist_post: "system" is an author, not a member — pre-acking it would
+    # write a sub file that load_topic would resurrect as a phantom member.
+    message_topic.append_messages(_data_dir(), topic, [message])
+    message_topic.save_state(_data_dir(), topic)
+    _wake_topic_members(topic)
+    # Queue the heir notice for the superseded session. A live holder is never
+    # displaced, so the predecessor is by definition NOT connected at succession
+    # time — the notice is held and shipped if/when that session reconnects (a
+    # briefly-dropped predecessor coming back is exactly the case that needs it).
+    SUPERSEDED[prior_sid] = {"name": record.name, "generation": gen}
+    conn = CONNECTIONS.get(prior_sid)
+    if conn is not None:  # belt: ship now if a connection somehow still exists
+        await _send_heir_notice(conn, prior_sid)
+
+
+async def _send_heir_notice(conn: Connection, session_id: str) -> None:
+    """Tell a superseded session that an heir holds its old name, enabling an
+    explicit predecessor->heir handoff. One-shot: dropped from SUPERSEDED once
+    sent (a daemon restart also clears it — this is a ceremony, not a contract)."""
+    entry = SUPERSEDED.get(session_id)
+    if entry is None:
+        return
+    name, gen = entry["name"], entry["generation"]
+    payload = {
+        "type": wsproto.NOTIFY,
+        "id": f"succession:{name}:{gen}",
+        "content": (
+            f"⟳ an heir has appeared: '{name}' is now gen {gen}, held by another "
+            "session. You no longer hold this name — you cannot send or ack as it, "
+            "and a DM to it reaches your successor. To hand off in-flight work, "
+            "re-register under a different name and message your old one."
+        ),
+        "meta": {"kind": "succession", "level": "direct", "threshold": "direct"},
+    }
+    if await _safe_send(conn, payload):
+        conn.inflight.add(payload["id"])
+        SUPERSEDED.pop(session_id, None)
 
 
 async def _handle_unregister_agent(websocket, conn: Connection, msg: dict) -> None:
@@ -1288,12 +1357,29 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
     # author pre-acks its post, so excluding it keeps the receipt an honest tally of
     # *recipients*.
     delivered_names, pending_names = topic.delivery_status(target)
+    delivered = [n for n in delivered_names if n != target_msg.sender]
+    pending = [n for n in pending_names if n != target_msg.sender]
+
+    def _recipient_info(names: list[str]) -> dict:
+        """Per-recipient liveness so the sender can tell 'delivered into a running
+        session' from 'delivered to an agent idle since X' (docs/specs/2026-07-09
+        slice c). Additive field: old relays render the plain name lists."""
+        info: dict = {}
+        for n in names:
+            rec = _registry_by_name(n)
+            info[n] = {
+                "connected": rec is not None and rec.session_id in CONNECTIONS,
+                "last_seen": rec.last_seen if rec is not None else None,
+            }
+        return info
+
     await _send(
         websocket,
         wsproto.MESSAGE_STATUS_RESULT,
         msg,
-        delivered=[n for n in delivered_names if n != target_msg.sender],
-        pending=[n for n in pending_names if n != target_msg.sender],
+        delivered=delivered,
+        pending=pending,
+        recipients=_recipient_info(delivered + pending),
         reactions=[{"by": s, "reaction": b} for s, b in topic.reactions_for(target)],
     )
 
