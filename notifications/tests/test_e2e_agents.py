@@ -573,3 +573,73 @@ def test_succession_announces_and_notifies_predecessor(tmp_path):
                         assert "'worker' is now gen 2" in notice.params["content"]
 
         anyio.run(scenario)
+
+
+def test_superseded_session_told_to_stand_down(tmp_path):
+    """Relay-side supersession detection (docs/specs/2026-07-09, relay half): the
+    relay persists (name, generation, session_id) on successful registration; when
+    a register later fails with 'already taken' and the stored identity proves THIS
+    session held the name, the agent gets an explicit SUPERSEDED verdict instead of
+    a generic failure — durable across daemon restarts, unlike the heir notice."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with h.daemon_process(h.daemon_env(ws, store, settle="0")):
+
+        async def scenario():
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-old") as (
+                read_a,
+                write_a,
+            ):
+                text, _ = await h.mcp_call(
+                    read_a,
+                    write_a,
+                    2,
+                    "register_agent",
+                    {"name": "worker", "reclaim_key": "pod-1"},
+                )
+                assert "Registered as 'worker'" in text
+            # sid-old's identity file now records it held 'worker' gen 1.
+            import json as _json
+
+            identity = _json.loads((xdg / "agent-identity-sid-old.json").read_text())
+            assert identity["name"] == "worker"
+            assert identity["generation"] == 1
+            assert identity["session_id"] == "sid-old"
+
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-new") as (
+                read_b,
+                write_b,
+            ):
+                text, next_id = await _list_until(
+                    read_b, write_b, 2, lambda t: "offline" in t
+                )
+                text, _ = await h.mcp_call(
+                    read_b,
+                    write_b,
+                    next_id,
+                    "register_agent",
+                    {"name": "worker", "reclaim_key": "pod-1"},
+                )
+                assert "Registered as 'worker'" in text
+
+                # The displaced session comes back while the successor is LIVE and
+                # tries to retake its name: it must get the stand-down verdict.
+                async with h.agent_session(tmp_path, ws, store, xdg, "sid-old") as (
+                    read_back,
+                    write_back,
+                ):
+                    text, _ = await h.mcp_call(
+                        read_back,
+                        write_back,
+                        2,
+                        "register_agent",
+                        {"name": "worker", "reclaim_key": "pod-1"},
+                    )
+                    assert "SUPERSEDED" in text
+                    assert "gen 1" in text
+                    assert "dm 'worker'" in text
+
+        anyio.run(scenario)

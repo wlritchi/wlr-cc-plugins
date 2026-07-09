@@ -123,6 +123,12 @@ def relay_env(
         env["NOTIFICATIONS_MCP_LOG_CACHE_DIR"] = str(xdg_dir)
     if project_dir is not None:
         env["CLAUDE_PROJECT_DIR"] = project_dir
+    # Per-session identity file (in prod: one per pod at ~/.claude/). Keyed by
+    # session id so each harness session models its own pod's persistent storage,
+    # and a re-opened session with the same id sees its earlier registrations.
+    env["NOTIFICATIONS_IDENTITY_FILE"] = str(
+        Path(xdg_dir) / f"agent-identity-{session_id}.json"
+    )
     return env
 
 

@@ -749,6 +749,47 @@ def _format_last_seen(last_seen: float) -> str:
     return f"~{int(round(hours / 24.0))}d ago"
 
 
+def _identity_path() -> Path:
+    """Where this host persists its last-assumed agent identity (name, generation,
+    session id) — pod-lifecycle state that survives daemon restarts, so a session
+    can durably tell 'my name moved on without me' (SUPERSEDED) from 'the daemon
+    forgot me' (docs/specs/2026-07-09 slice b, relay side)."""
+    override = os.environ.get("NOTIFICATIONS_IDENTITY_FILE")
+    if override:
+        return Path(override)
+    return Path.home() / ".claude" / "agent-identity.json"
+
+
+def _load_identity() -> dict | None:
+    try:
+        data = json.loads(_identity_path().read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _store_identity(name: str, generation: int, session_id: str) -> None:
+    path = _identity_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "generation": generation,
+                    "session_id": session_id,
+                    "updated_at": time.time(),
+                }
+            )
+        )
+        tmp.replace(path)
+    except OSError as exc:  # bookkeeping must never fail a registration
+        print(
+            f"notifications: could not persist agent identity: {exc}", file=sys.stderr
+        )
+
+
 @mcp.tool()
 async def register_agent(
     name: str,
@@ -821,12 +862,64 @@ async def register_agent(
     if isinstance(reply, str):
         return reply
     if reply.get("type") == wsproto.ERROR:
-        return f"Could not register as '{name}': {reply.get('error')}"
+        error = str(reply.get("error") or "")
+        stored = _load_identity()
+        if (
+            "already taken" in error
+            and stored is not None
+            and stored.get("name") == name
+            and stored.get("session_id") == session_id
+        ):
+            # The durable half of supersession detection: our own bookkeeping says
+            # this session held the name, but another session holds it now. The
+            # daemon's heir notice covers the fresh case; this file survives daemon
+            # restarts. Tell the agent to stand down rather than retry-register.
+            held_gen = stored.get("generation")
+            print(
+                f"notifications: SUPERSEDED — '{name}' is held by another session; "
+                f"this session held gen {held_gen}",
+                file=sys.stderr,
+            )
+            return (
+                f"SUPERSEDED: this session previously held '{name}' (gen {held_gen}), "
+                "but the name is now held by another live session. Do not retry — "
+                "your successor has inherited the name's threads and messages. To "
+                f"hand off in-flight work, register under a different name and dm "
+                f"'{name}'."
+            )
+        return f"Could not register as '{name}': {error}"
     agent = reply.get("agent") or {}
     threshold = agent.get("default_threshold", "direct")
+    reg_name = str(agent.get("name") or name)
+    generation = int(agent.get("generation") or 1)
+    stored = _load_identity()
+    succession_note = ""
+    if (
+        stored is not None
+        and stored.get("name") == reg_name
+        and stored.get("session_id") != session_id
+        and int(stored.get("generation") or 1) < generation
+    ):
+        # Normal succession on this host: a predecessor session registered here
+        # before us. Membership is name-keyed, so its threads and any unsurfaced
+        # backlog are already ours.
+        succession_note = (
+            f" You are gen {generation}, succeeding a previous session of this name."
+        )
+        print(
+            f"notifications: assumed '{reg_name}' gen {generation}, superseding "
+            f"session {stored.get('session_id')}",
+            file=sys.stderr,
+        )
+    if stored is None or (
+        stored.get("name"),
+        stored.get("generation"),
+        stored.get("session_id"),
+    ) != (reg_name, generation, session_id):
+        _store_identity(reg_name, generation, session_id)
     return (
-        f"Registered as '{agent.get('name', name)}' (wake threshold: {threshold}). "
-        "Other agents can find you with list_agents."
+        f"Registered as '{reg_name}' (wake threshold: {threshold})."
+        f"{succession_note} Other agents can find you with list_agents."
     )
 
 
