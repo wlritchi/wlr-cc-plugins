@@ -9,9 +9,16 @@ the PR tracker it has no daemon/WebSocket dependency: the clock is injected
 ordering, retention, and the per-subscriber acked sets are fully testable without
 spawning anything.
 
+Member keys are opaque strings owned by the caller. Historically they were session
+ids; as of the name-keyed identity model (docs/specs/2026-07-09) the daemon keys
+members by agent NAME and resolves name -> live session only at delivery time, so a
+successor session inherits its predecessor's membership/acked state by construction.
+This module is agnostic either way — ``rekey_member`` supports the daemon's one-time
+sid->name migration of pre-existing topics.
+
 Persistence mirrors ``pr_monitor``'s split layout under
 ``<data_dir>/msg/<safe_key>/``: ``state.json`` (kind/topic/members/next_seq/
-last_activity), an append-only ``messages.jsonl``, and one ``sub-<sid>.json`` per
+last_activity), an append-only ``messages.jsonl``, and one ``sub-<member>.json`` per
 member (acked id set, missed count, optional per-topic threshold override). The
 message log compacts past ``MAX_CACHED_MESSAGES``, bumping each subscriber's
 ``missed`` by the count of dropped messages it had not yet acked — exactly the PR
@@ -81,9 +88,9 @@ class MessageTopic:
         self.kind: str = kind
         self.topic: str = topic
         self.members: set[str] = set()
-        self.acked: dict[str, set[str]] = {}  # session id -> set of acked message ids
-        self.missed: dict[str, int] = {}  # session id -> dropped-while-unacked count
-        self.thresholds: dict[str, str] = {}  # session id -> per-topic override
+        self.acked: dict[str, set[str]] = {}  # member key -> set of acked message ids
+        self.missed: dict[str, int] = {}  # member key -> dropped-while-unacked count
+        self.thresholds: dict[str, str] = {}  # member key -> per-topic override
         self.messages: list[Message] = []
         self.next_seq: int = 0
         self.last_activity: float = 0.0
@@ -173,6 +180,27 @@ class MessageTopic:
             if msg.intent == "reaction" and msg.target == message_id
         ]
 
+    def rekey_member(self, old: str, new: str) -> None:
+        """Move one member's state (membership, acked set, missed count, threshold
+        override) from key ``old`` to key ``new`` — the daemon's one-time sid->name
+        migration primitive. If ``new`` is already a member its state wins and
+        ``old``'s is discarded (the live entry is fresher by construction); the caller
+        persists (save_subscriber under ``new``, delete_subscriber of ``old``,
+        save_state)."""
+        if old not in self.members or old == new:
+            return
+        self.members.discard(old)
+        acked = self.acked.pop(old, set())
+        missed = self.missed.pop(old, 0)
+        threshold = self.thresholds.pop(old, None)
+        if new in self.members:
+            return
+        self.members.add(new)
+        self.acked[new] = acked
+        self.missed[new] = missed
+        if threshold is not None:
+            self.thresholds[new] = threshold
+
     def reapable(self, *, now: float, ttl: float) -> bool:
         """True once the topic has been both memberless and silent for ``ttl``
         seconds. ``ttl <= 0`` makes it reapable as soon as it is memberless and
@@ -246,23 +274,25 @@ def append_messages(
             save_subscriber(data_dir, topic, sid)  # persists the bumped missed too
 
 
-def save_subscriber(data_dir: Path, topic: MessageTopic, session_id: str) -> None:
+def save_subscriber(data_dir: Path, topic: MessageTopic, member: str) -> None:
+    # "member" is the current field; "session_id" is read for back-compat with sub
+    # files written before the name-keyed identity model (see load_topic).
     record: dict = {
-        "session_id": session_id,
-        "acked": sorted(topic.acked.get(session_id, set())),
-        "missed": topic.missed.get(session_id, 0),
+        "member": member,
+        "acked": sorted(topic.acked.get(member, set())),
+        "missed": topic.missed.get(member, 0),
     }
-    override = topic.thresholds.get(session_id)
+    override = topic.thresholds.get(member)
     if override is not None:
         record["threshold"] = override
     storage.atomic_write(
-        _topic_dir(data_dir, topic.key) / f"sub-{storage.safe_name(session_id)}.json",
+        _topic_dir(data_dir, topic.key) / f"sub-{storage.safe_name(member)}.json",
         json.dumps(record),
     )
 
 
-def delete_subscriber(data_dir: Path, topic: MessageTopic, session_id: str) -> None:
-    path = _topic_dir(data_dir, topic.key) / f"sub-{storage.safe_name(session_id)}.json"
+def delete_subscriber(data_dir: Path, topic: MessageTopic, member: str) -> None:
+    path = _topic_dir(data_dir, topic.key) / f"sub-{storage.safe_name(member)}.json"
     path.unlink(missing_ok=True)
 
 
@@ -313,15 +343,16 @@ def load_topic(directory: Path) -> MessageTopic | None:
             sub = json.loads(sub_path.read_text())
         except (OSError, ValueError):
             continue
-        sid = sub.get("session_id")
-        if not sid:
+        # "member" is the current field; pre-name-keyed sub files wrote "session_id".
+        member = sub.get("member") or sub.get("session_id")
+        if not member:
             continue
-        topic.members.add(sid)
-        topic.acked[sid] = set(sub.get("acked", []))
-        topic.missed[sid] = int(sub.get("missed", 0))
+        topic.members.add(member)
+        topic.acked[member] = set(sub.get("acked", []))
+        topic.missed[member] = int(sub.get("missed", 0))
         threshold = sub.get("threshold")
         if threshold is not None:
-            topic.thresholds[sid] = threshold
+            topic.thresholds[member] = threshold
     return topic
 
 

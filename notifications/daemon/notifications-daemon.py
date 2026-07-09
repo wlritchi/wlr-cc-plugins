@@ -156,6 +156,37 @@ TOPICS: dict[str, message_topic.MessageTopic] = {
 }
 
 
+def _migrate_topic_members() -> None:
+    """One-time member re-keying for topics that predate the name-keyed identity
+    model (docs/specs/2026-07-09): member keys written by older daemons are session
+    ids. A key matching a registry record's session_id is renamed to that record's
+    name; a key that is already a registered name is kept; anything else is a ghost
+    (a session that died without a name holder to inherit its state) and is dropped
+    — its acked state is meaningless without a successor. Runs at startup, before
+    any connection is served, and persists what it changes."""
+    sid_to_name = {r.session_id: r.name for r in REGISTRY.list()}
+    names = set(sid_to_name.values())
+    for topic in TOPICS.values():
+        changed = False
+        for member in sorted(topic.members):
+            if member in names:
+                continue
+            new = sid_to_name.get(member)
+            if new is not None:
+                topic.rekey_member(member, new)
+                message_topic.delete_subscriber(_data_dir(), topic, member)
+                message_topic.save_subscriber(_data_dir(), topic, new)
+            else:
+                topic.leave(member)
+                message_topic.delete_subscriber(_data_dir(), topic, member)
+            changed = True
+        if changed:
+            message_topic.save_state(_data_dir(), topic)
+
+
+_migrate_topic_members()
+
+
 def _next_ordinal_path() -> Path:
     """Where the global message-handle counter is persisted: a single int file under
     the message root, so it survives topic reaps (which delete per-topic dirs)."""
@@ -539,10 +570,15 @@ def _handle_ack(conn: Connection, msg: dict) -> None:
         # peels the seq off and the remainder (after the "msg:" prefix) is the key.
         topic_key, _, _seq = nid[len("msg:") :].rpartition(":")
         topic = TOPICS.get(topic_key)
-        if topic is not None and conn.session_id and conn.session_id in topic.members:
-            topic.acked.setdefault(conn.session_id, set()).add(nid)
+        # Membership is keyed by agent NAME (name = service, session = process), so
+        # the acking session is resolved to its registered name first. A session that
+        # has been displaced from its name resolves to no record and cannot ack —
+        # that is the generation fencing falling out of delivery-time resolution.
+        record = REGISTRY.get_by_session(conn.session_id) if conn.session_id else None
+        if topic is not None and record is not None and record.name in topic.members:
+            topic.acked.setdefault(record.name, set()).add(nid)
             conn.inflight.discard(nid)
-            message_topic.save_subscriber(_data_dir(), topic, conn.session_id)
+            message_topic.save_subscriber(_data_dir(), topic, record.name)
     else:
         if conn.session_id:
             scheduler.delete(conn.session_id, nid)
@@ -688,6 +724,11 @@ async def _handle_register_agent(websocket, conn: Connection, msg: dict) -> None
     except agent_registry.AgentRegistryError as exc:
         await _send(websocket, wsproto.ERROR, msg, error=str(exc))
         return
+    # Taking a name grants its topic memberships (membership is name-keyed), so any
+    # messages the name accrued while unheld — or that a displaced predecessor never
+    # surfaced — are deliverable NOW. Nudge this session's dispatch loop; without
+    # this, a successor would wait for the next unrelated wake.
+    _wake(record.session_id)
     await _send(websocket, wsproto.AGENT_OK, msg, agent=record.to_dict())
 
 
@@ -757,13 +798,10 @@ def _registry_by_name(name: str) -> agent_registry.AgentRecord | None:
 
 
 def _member_names(topic: message_topic.MessageTopic) -> list[str]:
-    """Resolve a topic's member session ids to their current directory names (falling
-    back to the raw session id if a member has since unregistered)."""
-    names: list[str] = []
-    for sid in sorted(topic.members):
-        record = REGISTRY.get_by_session(sid)
-        names.append(record.name if record is not None else sid)
-    return names
+    """A topic's member names, sorted. Membership is keyed by agent name (a pre-
+    migration session-id key would render raw, but startup migration converts or
+    drops those)."""
+    return sorted(topic.members)
 
 
 def _channel_name(topic: message_topic.MessageTopic) -> str:
@@ -837,9 +875,13 @@ def _render_message(
 
 def _wake_topic_members(topic: message_topic.MessageTopic) -> None:
     """Nudge every member's dispatch loop after a new message is appended, so each
-    delivers it on the next pass (mirrors _wake_subscribers for PR trackers)."""
-    for sid in topic.members:
-        _wake(sid)
+    delivers it on the next pass (mirrors _wake_subscribers for PR trackers).
+    Members are names; each is resolved to whichever session currently holds it —
+    delivery-time resolution is what routes a thread to a name's successor."""
+    for name in topic.members:
+        record = _registry_by_name(name)
+        if record is not None:
+            _wake(record.session_id)
 
 
 async def _deliver_messages(conn: Connection, session_id: str) -> bool:
@@ -851,14 +893,14 @@ async def _deliver_messages(conn: Connection, session_id: str) -> bool:
     eagerly, exactly as the PR path does. Returns False if the send failed (so the
     dispatch loop tears down), True otherwise."""
     record = REGISTRY.get_by_session(session_id)
-    if record is None:  # member that has since unregistered: nothing to address it as
+    if record is None:  # unregistered session: no name, so no memberships
         return True
     for topic in list(TOPICS.values()):
-        if session_id not in topic.members:
+        if record.name not in topic.members:
             continue
-        acked = topic.acked.get(session_id, set())
+        acked = topic.acked.get(record.name, set())
         threshold = messaging.effective_threshold(
-            topic.thresholds.get(session_id), record.default_threshold
+            topic.thresholds.get(record.name), record.default_threshold
         )
         is_dm = topic.kind == "dm"
         for message in topic.messages:
@@ -916,9 +958,9 @@ async def _handle_join_channel(websocket, conn: Connection, msg: dict) -> None:
     requested_topic = msg.get("topic")
     if requested_topic and (created or not topic.messages):
         topic.topic = requested_topic
-    topic.join(session_id, now=time.time(), threshold=threshold)
+    topic.join(record.name, now=time.time(), threshold=threshold)
     message_topic.save_state(_data_dir(), topic)
-    message_topic.save_subscriber(_data_dir(), topic, session_id)
+    message_topic.save_subscriber(_data_dir(), topic, record.name)
     await _send(
         websocket,
         wsproto.CHANNEL_JOINED,
@@ -940,9 +982,9 @@ async def _handle_leave_channel(websocket, conn: Connection, msg: dict) -> None:
         await _send(websocket, wsproto.ERROR, msg, error=str(exc))
         return
     topic = TOPICS.get(key)
-    if topic is not None and session_id in topic.members:
-        topic.leave(session_id)
-        message_topic.delete_subscriber(_data_dir(), topic, session_id)
+    if topic is not None and record.name in topic.members:
+        topic.leave(record.name)
+        message_topic.delete_subscriber(_data_dir(), topic, record.name)
         message_topic.save_state(_data_dir(), topic)
     await _send(websocket, wsproto.AGENT_OK, msg)
 
@@ -958,22 +1000,21 @@ def _validate_message_fields(msg: dict, default_intent: str) -> tuple[str, str]:
 
 def _persist_post(
     topic: message_topic.MessageTopic,
-    sender_sid: str,
+    sender_name: str,
     message: message_topic.Message,
 ) -> None:
     """Common persistence after authoring a message: the sender pre-acks its own post
     (no self-delivery), the log is appended, and state/subscriber are flushed."""
-    topic.acked.setdefault(sender_sid, set()).add(message.id)
+    topic.acked.setdefault(sender_name, set()).add(message.id)
     message_topic.append_messages(_data_dir(), topic, [message])
     message_topic.save_state(_data_dir(), topic)
-    message_topic.save_subscriber(_data_dir(), topic, sender_sid)
+    message_topic.save_subscriber(_data_dir(), topic, sender_name)
 
 
 async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
     session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
-    session_id = record.session_id  # narrow to str: a record always has a session
     try:
         key = messaging.channel_key(msg.get("channel") or "")
         intent, severity = _validate_message_fields(msg, "fyi")
@@ -982,8 +1023,8 @@ async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
         return
     now = time.time()
     topic = _get_or_create_topic(key, "channel")
-    if session_id not in topic.members:  # posting auto-joins the sender
-        topic.join(session_id, now=now)
+    if record.name not in topic.members:  # posting auto-joins the sender
+        topic.join(record.name, now=now)
     message = topic.post(
         record.name,
         now=now,
@@ -993,7 +1034,7 @@ async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
         mentions=tuple(msg.get("mentions") or ()),
         ordinal=_alloc_ordinal(),
     )
-    _persist_post(topic, session_id, message)
+    _persist_post(topic, record.name, message)
     _wake_topic_members(topic)
     await _send(
         websocket,
@@ -1010,7 +1051,6 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
     session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
-    session_id = record.session_id  # narrow to str: a record always has a session
     to = msg.get("to")
     to = [to] if isinstance(to, str) else list(to or [])
     try:
@@ -1034,10 +1074,10 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
     key = messaging.dm_key(participants)
     now = time.time()
     topic = _get_or_create_topic(key, "dm")
-    for sid in {session_id, *(r.session_id for r in recipients)}:
-        if sid not in topic.members:  # a DM thread's members are its participants
-            topic.join(sid, now=now)
-            message_topic.save_subscriber(_data_dir(), topic, sid)
+    for name in participants:  # a DM thread's members are its participant NAMES
+        if name not in topic.members:
+            topic.join(name, now=now)
+            message_topic.save_subscriber(_data_dir(), topic, name)
     message = topic.post(
         record.name,
         now=now,
@@ -1046,7 +1086,7 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
         severity=severity,
         ordinal=_alloc_ordinal(),
     )
-    _persist_post(topic, session_id, message)
+    _persist_post(topic, record.name, message)
     _wake_topic_members(topic)
     await _send(
         websocket,
@@ -1071,11 +1111,11 @@ async def _handle_set_threshold(websocket, conn: Connection, msg: dict) -> None:
         return
     context = msg.get("context") or ""
     topic = TOPICS.get(context)
-    if topic is None or session_id not in topic.members:
+    if topic is None or record.name not in topic.members:
         await _send(websocket, wsproto.ERROR, msg, error=f"not a member of {context!r}")
         return
-    topic.thresholds[session_id] = threshold
-    message_topic.save_subscriber(_data_dir(), topic, session_id)
+    topic.thresholds[record.name] = threshold
+    message_topic.save_subscriber(_data_dir(), topic, record.name)
     await _send(websocket, wsproto.AGENT_OK, msg)
 
 
@@ -1125,11 +1165,11 @@ async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> 
             "context": topic.key,
             "kind": topic.kind,
             "threshold": messaging.effective_threshold(
-                topic.thresholds.get(session_id), record.default_threshold
+                topic.thresholds.get(record.name), record.default_threshold
             ),
         }
         for topic in TOPICS.values()
-        if session_id in topic.members
+        if record.name in topic.members
     ]
     await _send(websocket, wsproto.SUBSCRIPTION_LIST, msg, subscriptions=subscriptions)
 
@@ -1187,7 +1227,6 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
     session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
-    session_id = record.session_id  # narrow to str: a record always has a session
     raw_target = msg.get("target") or ""
     reaction = msg.get("reaction") or ""
     resolved = _resolve_target(raw_target)
@@ -1197,7 +1236,7 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
         )
         return
     topic, target_message = resolved
-    if session_id not in topic.members:  # reacting does not auto-join
+    if record.name not in topic.members:  # reacting does not auto-join
         await _send(
             websocket, wsproto.ERROR, msg, error=f"not a member of {topic.key!r}"
         )
@@ -1220,7 +1259,7 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
         target=target_message.id,
         ordinal=_alloc_ordinal(),
     )
-    _persist_post(topic, session_id, message)
+    _persist_post(topic, record.name, message)
     _wake_topic_members(topic)
     await _send(websocket, wsproto.AGENT_OK, msg, id=message.id)
 
@@ -1229,7 +1268,6 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
     session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
-    session_id = record.session_id  # narrow to str: a record always has a session
     raw_target = msg.get("target") or ""
     resolved = _resolve_target(raw_target)
     if resolved is None:
@@ -1238,7 +1276,7 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
         )
         return
     topic, target_msg = resolved
-    if session_id not in topic.members:
+    if record.name not in topic.members:
         await _send(
             websocket, wsproto.ERROR, msg, error=f"not a member of {topic.key!r}"
         )
@@ -1246,28 +1284,16 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
     # delivery_status / reactions_for key on the resolved message's full id, regardless
     # of whether the agent referenced it by #N handle or full id.
     target = target_msg.id
-    # The message's own author pre-acks its post, so excluding it keeps the receipt an
-    # honest tally of *recipients*. Resolve the author's session to drop it from both
-    # lists (None when the author has since unregistered — then nothing is excluded).
-    author = _registry_by_name(target_msg.sender)
-    author_sid = author.session_id if author is not None else None
-
-    def _names(sids: list[str]) -> list[str]:
-        out: list[str] = []
-        for sid in sids:
-            if sid == author_sid:
-                continue
-            rec = REGISTRY.get_by_session(sid)
-            out.append(rec.name if rec is not None else sid)
-        return out
-
-    delivered_sids, pending_sids = topic.delivery_status(target)
+    # Members are names, so delivery_status already yields names. The message's own
+    # author pre-acks its post, so excluding it keeps the receipt an honest tally of
+    # *recipients*.
+    delivered_names, pending_names = topic.delivery_status(target)
     await _send(
         websocket,
         wsproto.MESSAGE_STATUS_RESULT,
         msg,
-        delivered=_names(delivered_sids),
-        pending=_names(pending_sids),
+        delivered=[n for n in delivered_names if n != target_msg.sender],
+        pending=[n for n in pending_names if n != target_msg.sender],
         reactions=[{"by": s, "reaction": b} for s, b in topic.reactions_for(target)],
     )
 

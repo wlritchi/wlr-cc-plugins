@@ -513,3 +513,82 @@ def test_delete_topic_and_subscriber(tmp_path: Path) -> None:
     mt.delete_topic(tmp_path, "chan:gone")
     assert mt.load_all_topics(tmp_path) == []
     mt.delete_subscriber(tmp_path, topic, "s1")  # idempotent, must not raise
+
+
+# --------------------------------------------------------------------------- #
+# name-keyed membership: rekey_member + legacy sub-file compat
+# --------------------------------------------------------------------------- #
+
+
+def test_rekey_member_moves_all_state() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    topic.join("sid-old", now=1.0, threshold="urgent")
+    a = _post(topic, "someone", now=2.0)
+    topic.acked["sid-old"].add(a.id)
+    topic.missed["sid-old"] = 2
+
+    topic.rekey_member("sid-old", "worker")
+    assert topic.members == {"worker"}
+    assert topic.acked["worker"] == {a.id}
+    assert topic.missed["worker"] == 2
+    assert topic.thresholds == {"worker": "urgent"}
+    assert "sid-old" not in topic.acked
+    assert "sid-old" not in topic.missed
+    assert "sid-old" not in topic.thresholds
+
+
+def test_rekey_member_existing_target_state_wins() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    a = _post(topic, "someone", now=1.0)
+    topic.join("worker", now=2.0)  # live name entry: pre-acks `a`
+    topic.join("sid-old", now=2.0)
+    topic.missed["sid-old"] = 5
+
+    topic.rekey_member("sid-old", "worker")
+    assert topic.members == {"worker"}
+    # The existing name-keyed entry is fresher by construction; the old sid's
+    # state (its missed count, its acked set) is discarded, not merged.
+    assert topic.acked["worker"] == {a.id}
+    assert topic.missed["worker"] == 0
+
+
+def test_rekey_member_noops() -> None:
+    topic = MessageTopic("chan:general", "channel")
+    topic.join("worker", now=1.0)
+    topic.rekey_member("absent", "worker")  # old key not a member
+    topic.rekey_member("worker", "worker")  # old == new
+    assert topic.members == {"worker"}
+    assert topic.acked["worker"] == set()
+
+
+def test_load_topic_reads_legacy_session_id_sub_field(tmp_path: Path) -> None:
+    """Sub files written before the name-keyed identity model carry a
+    ``session_id`` field instead of ``member``; loading honors both."""
+    topic = MessageTopic("chan:general", "channel")
+    topic.join("sid-legacy", now=1.0)
+    mt.save_state(tmp_path, topic)
+    directory = tmp_path / "msg" / "chan_general"
+    (directory / "sub-sid-legacy.json").write_text(
+        '{"session_id": "sid-legacy", "acked": ["x"], "missed": 4, "threshold": "all"}'
+    )
+
+    loaded = mt.load_topic(directory)
+    assert loaded is not None
+    assert loaded.members == {"sid-legacy"}
+    assert loaded.acked["sid-legacy"] == {"x"}
+    assert loaded.missed["sid-legacy"] == 4
+    assert loaded.thresholds["sid-legacy"] == "all"
+
+
+def test_save_subscriber_writes_member_field(tmp_path: Path) -> None:
+    import json as _json
+
+    topic = MessageTopic("chan:general", "channel")
+    topic.join("worker", now=1.0)
+    mt.save_state(tmp_path, topic)
+    mt.save_subscriber(tmp_path, topic, "worker")
+    data = _json.loads(
+        (tmp_path / "msg" / "chan_general" / "sub-worker.json").read_text()
+    )
+    assert data["member"] == "worker"
+    assert "session_id" not in data

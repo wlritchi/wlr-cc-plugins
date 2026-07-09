@@ -780,3 +780,75 @@ def test_invalid_reaction_rejected(tmp_path):
                 assert "reactions:" not in status
 
         anyio.run(scenario)
+
+
+def test_dm_sent_while_name_offline_reaches_successor(tmp_path):
+    """The mid-reclaim message-loss regression test (docs/specs/2026-07-09): a DM
+    addressed to a NAME whose holder has gone offline must reach the name's next
+    holder, even though that successor is a different session. Membership is keyed
+    by name and resolved to a live session only at delivery time, so the successor
+    inherits the thread — before that change, the message queued against the dead
+    session id and stranded forever."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    # settle=0 lets the successor's keyed reclaim take the name immediately; the
+    # loss window under test is name->dead-session addressing, not reclaim timing.
+    with h.daemon_process(h.daemon_env(ws, store, settle="0")):
+
+        async def scenario():
+            async with h.agent_session(tmp_path, ws, store, xdg, "sid-sender") as (
+                read_s,
+                write_s,
+            ):
+                ids_s = count(2)
+                await _register(read_s, write_s, ids_s, "sender")
+
+                # First holder of 'worker' registers, then its session ends.
+                async with h.agent_session(tmp_path, ws, store, xdg, "sid-old") as (
+                    read_a,
+                    write_a,
+                ):
+                    text, _ = await h.mcp_call(
+                        read_a,
+                        write_a,
+                        2,
+                        "register_agent",
+                        {"name": "worker", "reclaim_key": "pod-1"},
+                    )
+                    assert "Registered as 'worker'" in text
+
+                # DM the name while it has no live session: queued for the NAME.
+                text, _ = await h.mcp_call(
+                    read_s,
+                    write_s,
+                    next(ids_s),
+                    "dm",
+                    {"to": ["worker"], "body": "for whoever holds the name"},
+                )
+                assert "Sent DM to worker" in text
+
+                # A successor session reclaims the name and must receive the DM.
+                async with h.agent_session(tmp_path, ws, store, xdg, "sid-new") as (
+                    read_b,
+                    write_b,
+                ):
+                    ids_b = count(2)
+                    text, _ = await h.mcp_call(
+                        read_b,
+                        write_b,
+                        next(ids_b),
+                        "register_agent",
+                        {"name": "worker", "reclaim_key": "pod-1"},
+                    )
+                    assert "Registered as 'worker'" in text
+                    event = await h.mcp_await_channel_with(
+                        read_b, "for whoever holds the name", timeout=20
+                    )
+                    assert event is not None
+                    assert "[dm] sender:" in event.params["content"]
+                    assert "(→ you)" in event.params["content"]
+
+        anyio.run(scenario)
