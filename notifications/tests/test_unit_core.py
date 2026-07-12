@@ -377,6 +377,57 @@ class TestChannelDetect:
             cd.detect_channel_mode_by_session("notifications", "sess-A") == cd.UNKNOWN
         )
 
+    def test_ex_cwd_probe_extracts_skip_reason(self, tmp_path, monkeypatch):
+        # The reason is the harness's own text after 'skipped:' — surfaced so a
+        # session stuck in pull mode (e.g. a respawn that lost --channels from its
+        # argv, the neon-eviction incident) can self-announce WHY.
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"message":"Channel notifications skipped: server not in --channels'
+            ' list for this session"}\n',
+        )
+        verdict, reason = cd.detect_channel_mode_ex("notifications", self.PROJECT)
+        assert verdict == cd.SKIPPED
+        assert reason == "server not in --channels list for this session"
+
+    def test_ex_registered_has_no_reason(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"message":"Channel notifications registered"}\n',
+        )
+        assert cd.detect_channel_mode_ex("notifications", self.PROJECT) == (
+            cd.REGISTERED,
+            None,
+        )
+
+    def test_by_session_ex_extracts_reason_and_stops_at_quote(
+        self, tmp_path, monkeypatch
+    ):
+        # Extraction must stop at the JSON string's closing quote — trailing fields
+        # on the same line (sessionId, timestamp) must not leak into the reason.
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"debug":"Channel notifications skipped: not in --channels list",'
+            '"sessionId":"sess-R","timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        verdict, reason = cd.detect_channel_mode_by_session_ex(
+            "notifications", "sess-R"
+        )
+        assert verdict == cd.SKIPPED
+        assert reason == "not in --channels list"
+
 
 # --------------------------------------------------------------------------- #
 # relay reconnect backoff

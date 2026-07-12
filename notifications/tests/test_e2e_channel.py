@@ -44,12 +44,18 @@ def test_pull_mode_buffers_then_catch_up(tmp_path):
                 text, _ = await h.mcp_call(read, write, 4, "get_session_id")
                 assert "catch_up to pull" in text
 
-                # catch_up returns the buffered notification, then acks it.
+                # catch_up returns the buffered notification, then acks it — and
+                # self-announces pull mode with the harness's own skip reason (the
+                # neon-eviction lesson: silent pull must not look healthy).
                 text, _ = await h.mcp_call(read, write, 5, "catch_up")
                 assert "Pending notifications" in text and "sid-A" in text
+                assert "Live push is disabled" in text
+                assert "not in --channels list" in text
 
-                # second catch_up is empty (it was acked / drained).
+                # second catch_up is empty (it was acked / drained) but still
+                # carries the pull-mode note.
                 text, _ = await h.mcp_call(read, write, 6, "catch_up")
                 assert "No pending notifications" in text
+                assert "Live push is disabled" in text
 
         anyio.run(scenario)

@@ -141,6 +141,12 @@ class DaemonClient:
         self._mode: str | None = (
             None  # None=detecting, "push" (channel), "pull" (catch_up)
         )
+        # Why pull mode, when known: the harness's own reason from its 'Channel
+        # notifications skipped: <reason>' log line (e.g. "server not in --channels
+        # list"), or a detection-timeout note. Surfaced in catch_up so a session
+        # that SHOULD have been a channel self-announces instead of sitting in
+        # silent pull mode until someone notices it never pushes.
+        self._mode_detail: str | None = None
         self._buffer: dict[
             str, dict
         ] = {}  # notification id -> {content, meta}; held until acked
@@ -173,9 +179,10 @@ class DaemonClient:
         """How updates reach the agent, phrased for the current channel mode — so a
         subscribe confirmation doesn't promise <channel> events to a pull-mode session."""
         if self._mode == "pull":
+            detail = f" ({self._mode_detail})" if self._mode_detail else ""
             return (
-                "This session was not loaded as a channel, so updates won't arrive "
-                "automatically — call catch_up to retrieve them."
+                f"This session was not loaded as a channel{detail}, so updates won't "
+                "arrive automatically — call catch_up to retrieve them."
             )
         if self._mode == "push":
             return "Updates will arrive as <channel> events."
@@ -360,15 +367,15 @@ class DaemonClient:
         env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
         if env_dir and env_dir not in candidates:
             candidates.append(env_dir)
-        detected = channel_detect.UNKNOWN
+        detected, reason = channel_detect.UNKNOWN, None
         while time.time() < start + CHANNEL_DETECT_TIMEOUT_SECONDS:
             session_id, _ = session_state.effective_session_id()
-            detected = channel_detect.detect_channel_mode_by_session(
+            detected, reason = channel_detect.detect_channel_mode_by_session_ex(
                 SERVER_NAME, session_id
             )
             if detected == channel_detect.UNKNOWN:
                 for candidate in candidates:
-                    detected = channel_detect.detect_channel_mode(
+                    detected, reason = channel_detect.detect_channel_mode_ex(
                         SERVER_NAME, candidate, newer_than=start - 5.0
                     )
                     if detected != channel_detect.UNKNOWN:
@@ -376,6 +383,12 @@ class DaemonClient:
             if detected != channel_detect.UNKNOWN:
                 break
             await anyio.sleep(CHANNEL_DETECT_POLL_SECONDS)
+        if detected == channel_detect.SKIPPED:
+            self._mode_detail = reason or "harness reported the channel as skipped"
+        elif detected == channel_detect.UNKNOWN:
+            self._mode_detail = (
+                "no channel marker was found for this session (detection timed out)"
+            )
         await self.apply_mode(detected)
 
     async def drain_buffer(self) -> str:
@@ -400,9 +413,23 @@ class DaemonClient:
                 parts.append(item.get("content", ""))
                 await self._ack(item["id"])
             sections.append("\n\n".join(parts))
-        if not sections:
-            return "No pending notifications."
-        return "\n\n".join(sections)
+        body = "\n\n".join(sections) if sections else "No pending notifications."
+        if self._mode == "pull":
+            # Self-announce silent-pull: a session that was MEANT to be a channel
+            # (e.g. a respawn that lost --channels from its argv) otherwise looks
+            # perfectly healthy from inside — tools work, catch_up works — and the
+            # disabled push is only discovered when someone messages it and gets
+            # silence. Say so, with the harness's own reason, on every drain.
+            note = "⚠️ Live push is disabled — this session is not loaded as a channel"
+            if self._mode_detail:
+                note += f" ({self._mode_detail})"
+            note += (
+                ". Nothing will interrupt this session on its own: messages arrive "
+                "only when catch_up is called. If this session was supposed to be a "
+                "channel, a fresh session with the channel loaded restores push."
+            )
+            return f"{note}\n\n{body}"
+        return body
 
     async def request(self, payload: dict) -> dict:
         """Send a request to the daemon and await its correlated reply."""

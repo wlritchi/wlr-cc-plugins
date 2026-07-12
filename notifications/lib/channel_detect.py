@@ -68,28 +68,52 @@ def _log_dir(server_name: str, project_dir: str) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
+def _reason_after(text: str, pos: int) -> str | None:
+    """Extract the harness's reason string following a skipped-mark at `pos`.
+
+    The mark is followed by ': <reason>' inside a JSON string value; take up to the
+    string's closing quote (or an escape/newline), length-capped. Best-effort — a
+    None reason never blocks a verdict."""
+    tail = text[pos + len(_SKIPPED_MARK) :][:200].lstrip(":").lstrip()
+    for stop in ('"', "\\", "\n"):
+        idx = tail.find(stop)
+        if idx != -1:
+            tail = tail[:idx]
+    return tail.strip() or None
+
+
 def detect_channel_mode(
     server_name: str, project_dir: str | None, *, newer_than: float = 0.0
 ) -> str:
     """REGISTERED / SKIPPED / UNKNOWN from the latest MCP log written at/after `newer_than`."""
+    return detect_channel_mode_ex(server_name, project_dir, newer_than=newer_than)[0]
+
+
+def detect_channel_mode_ex(
+    server_name: str, project_dir: str | None, *, newer_than: float = 0.0
+) -> tuple[str, str | None]:
+    """Like ``detect_channel_mode`` but also returns the harness's skip reason (the
+    text after 'Channel notifications skipped:'), or None when not skipped/unknown."""
     if not project_dir:
-        return UNKNOWN
+        return UNKNOWN, None
     directory = _log_dir(server_name, project_dir)
     if directory is None:
-        return UNKNOWN
+        return UNKNOWN, None
     logs = [p for p in directory.glob("*.jsonl") if p.stat().st_mtime >= newer_than]
     if not logs:
-        return UNKNOWN
+        return UNKNOWN, None
     latest = max(logs, key=lambda p: p.stat().st_mtime)
     try:
         text = latest.read_text(errors="replace")
     except OSError:
-        return UNKNOWN
+        return UNKNOWN, None
     registered_at = text.rfind(_REGISTERED_MARK)
     skipped_at = text.rfind(_SKIPPED_MARK)
     if registered_at < 0 and skipped_at < 0:
-        return UNKNOWN
-    return REGISTERED if registered_at > skipped_at else SKIPPED
+        return UNKNOWN, None
+    if registered_at > skipped_at:
+        return REGISTERED, None
+    return SKIPPED, _reason_after(text, skipped_at)
 
 
 def _iso_epoch(ts: object, fallback: float) -> float:
@@ -105,7 +129,14 @@ def _iso_epoch(ts: object, fallback: float) -> float:
 
 
 def detect_channel_mode_by_session(server_name: str, session_id: str | None) -> str:
-    """REGISTERED / SKIPPED / UNKNOWN by matching the marker to THIS session's id across
+    """REGISTERED / SKIPPED / UNKNOWN — see ``detect_channel_mode_by_session_ex``."""
+    return detect_channel_mode_by_session_ex(server_name, session_id)[0]
+
+
+def detect_channel_mode_by_session_ex(
+    server_name: str, session_id: str | None
+) -> tuple[str, str | None]:
+    """(verdict, skip_reason) by matching the marker to THIS session's id across
     every project-keyed mcp-log dir under the cache root.
 
     Claude Code keys each MCP log dir by the *session* cwd. For a worktree session — or
@@ -118,12 +149,13 @@ def detect_channel_mode_by_session(server_name: str, session_id: str | None) -> 
     is needed: the id is the disambiguator, and the latest marker for this id wins (so a
     resume that re-registers as a channel, or flips to skipped, is honored)."""
     if not session_id:
-        return UNKNOWN
+        return UNKNOWN, None
     root = _cache_root() / "claude-cli-nodejs"
     if not root.is_dir():
-        return UNKNOWN
+        return UNKNOWN, None
     best_key: float | None = None
     best_verdict = UNKNOWN
+    best_reason: str | None = None
     for logdir in root.glob("*/mcp-logs-*"):
         if server_name not in logdir.name or not logdir.is_dir():
             continue
@@ -148,7 +180,11 @@ def detect_channel_mode_by_session(server_name: str, session_id: str | None) -> 
                     continue
                 if obj.get("sessionId") != session_id:
                     continue  # id was incidental (substring), not the field value
+                reason: str | None = None
+                if verdict == SKIPPED:
+                    pos = line.find(_SKIPPED_MARK)
+                    reason = _reason_after(line, pos) if pos >= 0 else None
                 key = _iso_epoch(obj.get("timestamp"), mtime)
                 if best_key is None or key >= best_key:
-                    best_key, best_verdict = key, verdict
-    return best_verdict
+                    best_key, best_verdict, best_reason = key, verdict, reason
+    return best_verdict, best_reason
