@@ -616,7 +616,9 @@ async def _handle(websocket) -> None:
                 )
 
             elif kind == wsproto.LIST_FORGEJO_PR_SUBSCRIPTIONS:
-                await _handle_list_pr_subscriptions(websocket, conn, msg, provider="forgejo")
+                await _handle_list_pr_subscriptions(
+                    websocket, conn, msg, provider="forgejo"
+                )
 
             elif kind == wsproto.REGISTER_AGENT:
                 await _handle_register_agent(websocket, conn, msg)
@@ -914,7 +916,11 @@ async def _handle_list_pr_subscriptions(
             "pending": len(t.unacked_for(session_id)),
             # Named-instance alias so the relay can render "<alias>:owner/repo#n";
             # omitted for the default instance (and github) so those items stay v1-shaped.
-            **({"instance": t.instance} if (t.provider == "forgejo" and t.instance) else {}),
+            **(
+                {"instance": t.instance}
+                if (t.provider == "forgejo" and t.instance)
+                else {}
+            ),
         }
         for t in TRACKERS.values()
         if session_id in t.subscribers and t.provider == provider
@@ -1791,9 +1797,7 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
         if delay is None:
             delay = _poll_delay(tracker)
             throttle_until = (
-                tracker.client.should_throttle()
-                if tracker.client is not None
-                else None
+                tracker.client.should_throttle() if tracker.client is not None else None
             )
             if throttle_until is not None:
                 delay = max(

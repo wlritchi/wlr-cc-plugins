@@ -29,8 +29,12 @@ LIST_PR_SUBSCRIPTIONS = "list_pr_subscriptions"  # {req_id, session_id}
 # Multi-instance (additive): an optional `instance` alias field selects a named Forgejo
 # instance; absent/"" is the default instance, byte-identical to v1. The daemon echoes
 # `instance` back in its replies so the relay can detect an old daemon that ignored it.
-SUBSCRIBE_FORGEJO_PR = "subscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
-UNSUBSCRIBE_FORGEJO_PR = "unsubscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
+SUBSCRIBE_FORGEJO_PR = (
+    "subscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
+)
+UNSUBSCRIBE_FORGEJO_PR = (
+    "unsubscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
+)
 LIST_FORGEJO_PR_SUBSCRIPTIONS = "list_forgejo_pr_subscriptions"  # {req_id, session_id}
 # agent directory (Phase A)
 REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?, reclaim_key?}
@@ -58,7 +62,9 @@ SCHEDULED = "scheduled"  # {req_id, id, due_at}
 LIST_RESULT = "list_result"  # {req_id, items}
 SUBSCRIBED = "subscribed"  # {req_id, pr, summary, merged, closed, instance?}
 UNSUBSCRIBED = "unsubscribed"  # {req_id, pr, instance?}
-SUBSCRIPTIONS_RESULT = "subscriptions_result"  # {req_id, items:[{pr, instance?, merged, pending}]}
+SUBSCRIPTIONS_RESULT = (
+    "subscriptions_result"  # {req_id, items:[{pr, instance?, merged, pending}]}
+)
 AGENT_OK = "agent_ok"  # {req_id, agent}          resulting record dict (or null/{name} for unregister)
 AGENT_LIST = "agent_list"  # {req_id, agents}      [record-dict + "connected": bool]
 # agent messaging (Phase B) — daemon -> relay (AGENT_OK acks leave/set_threshold/

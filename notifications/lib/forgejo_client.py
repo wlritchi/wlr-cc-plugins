@@ -250,9 +250,7 @@ class ForgejoClient:
         A single fetch (which spans several REST GETs over ONE pooled httpx client)
         is retried in-poll on ForgejoTransient only; other classified errors propagate
         immediately."""
-        return await _retry_transient(
-            lambda: self._fetch_pr_once(owner, repo, number)
-        )
+        return await _retry_transient(lambda: self._fetch_pr_once(owner, repo, number))
 
     async def _fetch_pr_once(self, owner: str, repo: str, number: int) -> dict:
         base = f"/repos/{owner}/{repo}"

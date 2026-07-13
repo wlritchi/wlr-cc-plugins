@@ -8,7 +8,6 @@ Mirrors test_unit_pr.py's patterns: a `fj()` builder that maps a raw Gitea fetch
 snapshot, `_types`/`_only` diff helpers, and a MockTransport fed by the same FakeForgejo
 the e2e test uses (so the production client and the fake agree on the REST protocol)."""
 
-import json
 import time
 
 import anyio
@@ -104,7 +103,12 @@ class TestSnapshotMapping:
 
     def test_review_state_normalization(self):
         reviews = [
-            {"id": 1, "state": "REQUEST_CHANGES", "user": {"login": "a"}, "html_url": "u"},
+            {
+                "id": 1,
+                "state": "REQUEST_CHANGES",
+                "user": {"login": "a"},
+                "html_url": "u",
+            },
             {"id": 2, "state": "COMMENT", "user": {"login": "b"}, "html_url": "u"},
             {"id": 3, "state": "APPROVED", "user": {"login": "c"}, "html_url": "u"},
             {"id": 4, "state": "DISMISSED", "user": {"login": "d"}, "html_url": "u"},
@@ -121,7 +125,12 @@ class TestSnapshotMapping:
     def test_pending_and_request_review_excluded(self):
         reviews = [
             {"id": 1, "state": "PENDING", "user": {"login": "a"}, "html_url": "u"},
-            {"id": 2, "state": "REQUEST_REVIEW", "user": {"login": "b"}, "html_url": "u"},
+            {
+                "id": 2,
+                "state": "REQUEST_REVIEW",
+                "user": {"login": "b"},
+                "html_url": "u",
+            },
             {"id": 3, "state": "APPROVED", "user": {"login": "c"}, "html_url": "u"},
         ]
         snap = fj(reviews=reviews)
@@ -345,7 +354,14 @@ class TestClientFetch:
             [{"id": 7, "user": {"login": "d"}, "body": "hi", "html_url": "u"}]
         )
         fake.set_statuses(
-            [{"context": "ci", "status": "success", "target_url": "u", "description": ""}]
+            [
+                {
+                    "context": "ci",
+                    "status": "success",
+                    "target_url": "u",
+                    "description": "",
+                }
+            ]
         )
         client = fc.ForgejoClient(
             base_url="http://fj", token="x", transport=_fake_transport(fake)
@@ -683,9 +699,7 @@ class TestForgejoStorage:
     def test_split_storage_roundtrip_forgejo(self, tmp_path, monkeypatch):
         monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
         base_url = "https://fj.example/api/v1"
-        tracker = pm.PRTracker(
-            "o", "r", 1, None, provider="forgejo", base_url=base_url
-        )
+        tracker = pm.PRTracker("o", "r", 1, None, provider="forgejo", base_url=base_url)
         tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
         tracker.consecutive_no_update = 2
         events = tracker.record(

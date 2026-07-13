@@ -62,7 +62,10 @@ class TestStorageKeyAlias:
         assert pm.storage_key("forgejo", "o", "r", 1, None) == "forgejo:o/r#1"
 
     def test_named_instance_folds_alias(self):
-        assert pm.storage_key("forgejo", "o", "r", 1, "external") == "forgejo:external:o/r#1"
+        assert (
+            pm.storage_key("forgejo", "o", "r", 1, "external")
+            == "forgejo:external:o/r#1"
+        )
 
     def test_github_ignores_alias(self):
         # github has no multi-instance dimension in v1; the alias is ignored and the key
@@ -143,7 +146,9 @@ class TestConfigParsing:
             "FORGEJO_SELF_HOSTED_API_URL": "https://self.example/",  # underscore -> kebab
             "FORGEJO_SELF_HOSTED_TOKEN": "s",
         }
-        inst = daemon._build_forgejo_instances(env, default_url="https://fj.example/api/v1")
+        inst = daemon._build_forgejo_instances(
+            env, default_url="https://fj.example/api/v1"
+        )
         assert sorted(inst) == ["external", "self-hosted"]
         assert inst["external"].base_url == "https://ext.example/api/v1"
         assert inst["self-hosted"].base_url == "https://self.example/api/v1"
@@ -168,7 +173,9 @@ class TestConfigParsing:
         assert "CONFIG ERROR" in err and "dup" in err
 
     def test_token_env_naming(self, daemon):
-        assert daemon._forgejo_token_env("") == "FORGEJO_TOKEN"  # default (v1-identical)
+        assert (
+            daemon._forgejo_token_env("") == "FORGEJO_TOKEN"
+        )  # default (v1-identical)
         assert daemon._forgejo_token_env("external") == "FORGEJO_EXTERNAL_TOKEN"
         assert daemon._forgejo_token_env("self-hosted") == "FORGEJO_SELF_HOSTED_TOKEN"
 
@@ -280,7 +287,9 @@ class TestLoadTrackersMultiInstance:
         )
         assert state["instance"] == "external"
 
-    def test_default_instance_absent_field_loads_as_default(self, tmp_path, monkeypatch):
+    def test_default_instance_absent_field_loads_as_default(
+        self, tmp_path, monkeypatch
+    ):
         # A v1 default forgejo tracker on disk has NO instance field; it must load as the
         # default instance and key on the bare provider string.
         monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
@@ -567,8 +576,13 @@ class TestAuthErrorNaming:
         daemon.TRACKERS.clear()
         client = _AuthFailClient("https://x/api/v1")
         t = pm.PRTracker(
-            "o", "r", 1, client, provider="forgejo",
-            base_url="https://x/api/v1", instance=instance,
+            "o",
+            "r",
+            1,
+            client,
+            provider="forgejo",
+            base_url="https://x/api/v1",
+            instance=instance,
         )
         t.snapshot = {"timeline": {}, "state": "open", "merged": False}
         t.subscribers.add("sidA")
@@ -640,15 +654,15 @@ class TestSkewCleanup:
         relay._SESSION_CREATED_SUBS.clear()
         # OLD daemon: subscribes on its default, replies subscribed but WITHOUT an instance.
         calls = self._install_stubs(
-            relay, monkeypatch, {"type": relay.wsproto.SUBSCRIBED, "pr": "o/r#1", "summary": "open"}
+            relay,
+            monkeypatch,
+            {"type": relay.wsproto.SUBSCRIBED, "pr": "o/r#1", "summary": "open"},
         )
         out = anyio.run(lambda: relay.subscribe_forgejo_pr("external:o/r#1"))
         assert "predates multi-instance" in out
         assert "has been undone" in out  # cleaned up the stray default sub
         # the follow-up request is the UNSUBSCRIBE the tool issued to undo it
-        assert any(
-            c["type"] == relay.wsproto.UNSUBSCRIBE_FORGEJO_PR for c in calls
-        )
+        assert any(c["type"] == relay.wsproto.UNSUBSCRIBE_FORGEJO_PR for c in calls)
         assert (("external", "o/r#1")) not in relay._SESSION_CREATED_SUBS
 
     def test_old_daemon_no_echo_not_created_warns_without_destroy(
@@ -678,9 +692,7 @@ class TestSkewCleanup:
         assert "may have been created" in out  # warn-without-destroy
         assert "check list_forgejo_pr_subscriptions" in out
         # It must NOT have issued an unsubscribe (would destroy a legit default sub).
-        assert all(
-            c["type"] != relay.wsproto.UNSUBSCRIBE_FORGEJO_PR for c in calls
-        )
+        assert all(c["type"] != relay.wsproto.UNSUBSCRIBE_FORGEJO_PR for c in calls)
 
     def test_new_daemon_echoes_instance_success(self, relay, monkeypatch):
         relay._SESSION_CREATED_SUBS.clear()
@@ -720,7 +732,9 @@ class TestSkewCleanup:
         # instance, so the missing echo is expected and it renders as a plain success.
         relay._SESSION_CREATED_SUBS.clear()
         self._install_stubs(
-            relay, monkeypatch, {"type": relay.wsproto.SUBSCRIBED, "pr": "o/r#1", "summary": "open"}
+            relay,
+            monkeypatch,
+            {"type": relay.wsproto.SUBSCRIBED, "pr": "o/r#1", "summary": "open"},
         )
         out = anyio.run(lambda: relay.subscribe_forgejo_pr("o/r#1"))
         assert "Subscribed to o/r#1 (Forgejo)." in out
@@ -743,7 +757,12 @@ class TestListRendering:
                 "type": relay.wsproto.SUBSCRIPTIONS_RESULT,
                 "items": [
                     {"pr": "o/r#1", "instance": "", "merged": False, "pending": 0},
-                    {"pr": "o/r#2", "instance": "external", "merged": False, "pending": 3},
+                    {
+                        "pr": "o/r#2",
+                        "instance": "external",
+                        "merged": False,
+                        "pending": 3,
+                    },
                 ],
             }
 

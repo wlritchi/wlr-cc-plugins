@@ -791,7 +791,9 @@ def _parse_forgejo_ref(pr: str) -> tuple[str, str, str, int] | str:
     return instance, match.group(1), match.group(2), int(match.group(3))
 
 
-def _forgejo_ref_display(instance: str, owner: str, repo: str, number: int | str) -> str:
+def _forgejo_ref_display(
+    instance: str, owner: str, repo: str, number: int | str
+) -> str:
     """Render a Forgejo ref the way tool output tags it: "<alias>:owner/repo#N" for a
     named instance, bare "owner/repo#N" for the default (v1-identical)."""
     bare = f"{owner}/{repo}#{number}"
@@ -820,7 +822,9 @@ async def _forgejo_daemon_request(payload: dict) -> dict | str:
     return reply
 
 
-def _forgejo_reply_pr(reply: dict, instance: str, owner: str, repo: str, number: int) -> str:
+def _forgejo_reply_pr(
+    reply: dict, instance: str, owner: str, repo: str, number: int
+) -> str:
     """The ref to show in a reply, tagged with the instance alias. Prefer the daemon's
     echoed instance (authoritative) but fall back to what we sent, and use the daemon's
     ``pr`` field for the bare ref when present."""
@@ -831,7 +835,9 @@ def _forgejo_reply_pr(reply: dict, instance: str, owner: str, repo: str, number:
     return f"{alias}:{bare}" if alias else bare
 
 
-async def _forgejo_skew_cleanup(instance: str, owner: str, repo: str, number: int) -> str:
+async def _forgejo_skew_cleanup(
+    instance: str, owner: str, repo: str, number: int
+) -> str:
     """The version-skew belt (spec): the tool SENT a non-default instance but the daemon's
     reply carried NO instance echo — an old daemon that ignored the field and subscribed on
     its DEFAULT instance. Treat it as FAILURE, not success.

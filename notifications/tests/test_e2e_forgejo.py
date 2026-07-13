@@ -80,9 +80,7 @@ def test_forgejo_subscribe_update_merge(tmp_path):
                 assert KEY in text and "pending=0" in text
 
                 # Merge -> terminal pr_merged event + auto-unsubscribe.
-                fj.set_pr(
-                    state="closed", merged=True, merged_by={"login": "carol"}
-                )
+                fj.set_pr(state="closed", merged=True, merged_by={"login": "carol"})
                 merged = await h.mcp_await_channel_with(read_a, "carol", 25)
                 assert merged is not None
                 assert "unsubscrib" in merged.params["content"]
@@ -133,7 +131,11 @@ def test_forgejo_two_instances_isolated(tmp_path):
                 )
                 assert f"Subscribed to {KEY} (Forgejo)." in text  # default: v1 wording
                 text, _ = await h.mcp_call(
-                    read_a, write_a, 3, "subscribe_forgejo_pr", {"pr": f"external:{KEY}"}
+                    read_a,
+                    write_a,
+                    3,
+                    "subscribe_forgejo_pr",
+                    {"pr": f"external:{KEY}"},
                 )
                 assert f"external:{KEY}" in text and "Forgejo: external" in text
 

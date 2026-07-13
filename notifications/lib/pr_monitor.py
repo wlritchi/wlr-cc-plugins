@@ -219,10 +219,14 @@ def snapshot_from_forgejo(data: dict) -> dict:
         "url": pr.get("html_url"),
         "draft": bool(pr.get("draft")),
         "labels": sorted(
-            str(label["name"]) for label in (pr.get("labels") or []) if label.get("name")
+            str(label["name"])
+            for label in (pr.get("labels") or [])
+            if label.get("name")
         ),
         "requested_reviewers": sorted(
-            r["login"] for r in (pr.get("requested_reviewers") or []) if (r or {}).get("login")
+            r["login"]
+            for r in (pr.get("requested_reviewers") or [])
+            if (r or {}).get("login")
         ),
         "reviews": {},
         "review_comments": {},
