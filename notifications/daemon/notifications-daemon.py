@@ -321,6 +321,13 @@ def _build_forgejo_instances(env: dict[str, str], default_url: str) -> dict:
         the default client's contract.
     """
     instances: dict = {}
+    # Every accepted instance's normalized URL -> a label, for the collision message.
+    # Seeded with the default so an alias == default is caught; grows as aliases are
+    # accepted so an alias == an EARLIER alias is caught too (two aliases must not
+    # double-poll one PR — same duplicate-tracker class canonicalization exists to prevent).
+    seen_urls: dict[str, str] = (
+        {default_url: "the default instance (FORGEJO_API_URL)"} if default_url else {}
+    )
     for name, value in sorted(env.items()):
         m = _FORGEJO_ALIAS_URL_RE.match(name)
         if not m or not (value or "").strip():
@@ -337,19 +344,20 @@ def _build_forgejo_instances(env: dict[str, str], default_url: str) -> dict:
         client = forgejo_client.ForgejoClient(base_url=value, token=token)
         if not client.configured:  # normalized to empty; nothing to poll
             continue
-        # Canonicalization: an alias pointing at the default instance's URL must NOT create
-        # a duplicate instance — it would resolve one PR to two storage keys (bare + aliased)
-        # and double-poll it. Refuse the alias and tell the operator to drop the pair.
-        if default_url and client.base_url == default_url:
+        # Canonicalization: an alias whose normalized URL is already served — by the
+        # default instance OR an earlier-accepted alias — must NOT create a duplicate:
+        # one PR would resolve to two trackers double-polling it. Refuse and tell the
+        # operator which pair to drop.
+        if client.base_url in seen_urls:
             print(
                 f"notifications daemon: CONFIG ERROR — Forgejo instance {alias!r} "
-                f"({name}) resolves to the same URL as the default instance "
-                f"(FORGEJO_API_URL); refusing to create a duplicate instance. Drop the "
-                f"{name} / {_forgejo_token_env(alias)} pair (the default instance already "
-                "serves this URL).",
+                f"({name}) resolves to the same URL as {seen_urls[client.base_url]}; "
+                f"refusing to create a duplicate instance for one PR. Drop the {name} / "
+                f"{_forgejo_token_env(alias)} pair.",
                 file=sys.stderr,
             )
             continue
+        seen_urls[client.base_url] = f"instance {alias!r} ({name})"
         instances[alias] = client
     return instances
 

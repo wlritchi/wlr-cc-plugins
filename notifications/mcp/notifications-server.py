@@ -928,6 +928,11 @@ async def subscribe_forgejo_pr(pr: str) -> str:
         return f"{display} is already closed/merged ({reply.get('summary')}); not subscribing."
     display = _forgejo_reply_pr(reply, instance, owner, repo, number)
     tag = f" (Forgejo: {instance})" if instance else " (Forgejo)"
+    # A clean success has no stray to undo — clear the in-flight marker. Otherwise a stale
+    # marker could survive to a later re-subscribe of the same named ref (only possible
+    # against a downgraded daemon, which daemon-first forbids) and make the skew path
+    # unsubscribe a legit default-instance sub — the one destroy the mirrored-repo guard prevents.
+    _SESSION_CREATED_SUBS.discard((instance, f"{owner}/{repo}#{number}"))
     return f"Subscribed to {display}{tag}. Current status: {reply.get('summary')}. {DAEMON.delivery_hint()}"
 
 

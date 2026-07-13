@@ -172,6 +172,22 @@ class TestConfigParsing:
         err = capsys.readouterr().err
         assert "CONFIG ERROR" in err and "dup" in err
 
+    def test_canonicalization_refuses_second_alias_same_url(self, daemon, capsys):
+        # Two NAMED aliases at the same normalized URL must not both build — one PR under
+        # both = two trackers double-polling. The first (sorted) wins; the second is
+        # refused (default unconfigured here, so this is purely alias-vs-alias). Also
+        # exercises URL normalization: bare vs /api/v1 form collapse to one URL.
+        env = {
+            "FORGEJO_ALPHA_API_URL": "https://same.example/",
+            "FORGEJO_ALPHA_TOKEN": "a",
+            "FORGEJO_BETA_API_URL": "https://same.example/api/v1",
+            "FORGEJO_BETA_TOKEN": "b",
+        }
+        inst = daemon._build_forgejo_instances(env, default_url="")
+        assert sorted(inst) == ["alpha"]  # beta refused — alpha took the URL first
+        err = capsys.readouterr().err
+        assert "CONFIG ERROR" in err and "beta" in err and "alpha" in err
+
     def test_token_env_naming(self, daemon):
         assert (
             daemon._forgejo_token_env("") == "FORGEJO_TOKEN"
@@ -709,6 +725,9 @@ class TestSkewCleanup:
         out = anyio.run(lambda: relay.subscribe_forgejo_pr("external:o/r#1"))
         assert "Subscribed to external:o/r#1 (Forgejo: external)" in out
         assert "predates" not in out
+        # A clean success discards the in-flight marker (no stray to undo), so it can't
+        # linger to a later re-subscribe and defeat the mirrored-repo destroy-safety.
+        assert ("external", "o/r#1") not in relay._SESSION_CREATED_SUBS
 
     def test_default_subscribe_renders_exactly_v1(self, relay, monkeypatch):
         relay._SESSION_CREATED_SUBS.clear()
