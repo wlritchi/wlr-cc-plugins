@@ -49,15 +49,31 @@ def pr_key(owner: str, repo: str, number: int | str) -> str:
     return f"{owner}/{repo}#{number}"
 
 
-def storage_key(provider: str, owner: str, repo: str, number: int | str) -> str:
+def storage_key(
+    provider: str,
+    owner: str,
+    repo: str,
+    number: int | str,
+    instance: str | None = None,
+) -> str:
     """The TRACKERS-dict / on-disk key. GitHub stays UNPREFIXED (byte-identical to the
     historical key, so existing trackers, dirs, and notification ids are unchanged);
     other providers get a "<provider>:" prefix so a Forgejo owner/repo#n cannot collide
     with a GitHub one. Only the storage key carries the prefix — the human-facing
     ``PRTracker.key`` (used in event text and tool replies) stays "owner/repo#number".
-    ``_safe`` maps the ':' and '/' to '_', so the dir names stay distinct on disk."""
+    ``_safe`` maps the ':' and '/' to '_', so the dir names stay distinct on disk.
+
+    ``instance`` is the Forgejo multi-instance alias dimension: the DEFAULT instance
+    (alias "" / None) stays ``forgejo:owner/repo#n`` — byte-identical to v1, so existing
+    on-disk trackers need no migration — while a NAMED instance becomes
+    ``forgejo:<alias>:owner/repo#n`` so the same owner/repo#n on two forges can't collide.
+    The alias is ignored for github (which has no multi-instance dimension in v1)."""
     key = pr_key(owner, repo, number)
-    return key if provider == "github" else f"{provider}:{key}"
+    if provider == "github":
+        return key
+    if instance:
+        return f"{provider}:{instance}:{key}"
+    return f"{provider}:{key}"
 
 
 def parse_pr_ref(ref: str) -> tuple[str, str, int] | None:
@@ -927,19 +943,27 @@ class PRTracker:
         client,
         provider: str = "github",
         base_url: str | None = None,
+        instance: str = "",
     ) -> None:
         self.owner = owner
         self.repo = repo
         self.number = number
         self.provider = provider
+        # For Forgejo, the multi-instance alias this PR's instance is configured under.
+        # "" means the DEFAULT instance (unaliased FORGEJO_API_URL/TOKEN), which keeps the
+        # storage key byte-identical to v1. A named instance folds its alias into the key
+        # so the same owner/repo#n on two forges can't collide.
+        self.instance = instance or ""
         # For Forgejo, the instance API base URL this PR lives on. Persisted so a future
-        # multi-instance setup can tell provenance from the record (builder's steer);
-        # unused in the single-instance v1 (the daemon's one ForgejoClient serves all).
+        # multi-instance setup can tell provenance from the record (builder's steer), AND
+        # as load_trackers' mismatch guard: if the alias is later repointed at a different
+        # URL, the persisted base_url disagrees with the configured client's and the
+        # tracker is skipped rather than polled against the wrong instance.
         self.base_url = base_url
         self.key = pr_key(owner, repo, number)  # human-facing ref (event text, replies)
         self.storage_key = storage_key(
-            provider, owner, repo, number
-        )  # TRACKERS-dict / on-disk key; provider-prefixed for non-github
+            provider, owner, repo, number, self.instance
+        )  # TRACKERS-dict / on-disk key; provider-prefixed for non-github, alias-tagged for named forgejo
         self.client = client
         self.subscribers: set[str] = set()
         self.acked: dict[str, set[str]] = {}  # session id -> set of acked event ids
@@ -1043,6 +1067,7 @@ def save_state(t: PRTracker) -> None:
                 "repo": t.repo,
                 "number": t.number,
                 "provider": t.provider,
+                "instance": t.instance,
                 "base_url": t.base_url,
                 "snapshot": t.snapshot,
                 "consecutive_no_update": t.consecutive_no_update,
@@ -1109,9 +1134,19 @@ def delete_tracker(key: str) -> None:
     shutil.rmtree(_tracker_dir(key), ignore_errors=True)
 
 
+def _client_key(provider: str, instance: str) -> object:
+    """The clients-map lookup key for a (provider, instance) pair. The DEFAULT instance
+    (instance "") keys on the bare provider string — byte-identical to the v1
+    ``{provider: client}`` shape, so existing callers/tests are unchanged — while a NAMED
+    forgejo instance keys on the ``(provider, instance)`` tuple."""
+    return provider if not instance else (provider, instance)
+
+
 def load_trackers(clients) -> list[PRTracker]:
-    # Accept either a {provider: client} map or a single client (treated as github —
-    # back-compat for existing callers and tests).
+    # Accept either a clients map or a single client (treated as the default github —
+    # back-compat for existing callers and tests). The map keys a DEFAULT instance on the
+    # bare provider string ("github" / "forgejo") and a NAMED forgejo instance on a
+    # (provider, alias) tuple, so the same map serves default + every configured alias.
     if not isinstance(clients, dict):
         clients = {"github": clients}
     base = pr_store_dir()
@@ -1127,18 +1162,46 @@ def load_trackers(clients) -> list[PRTracker]:
         except (OSError, ValueError):
             continue
         provider = state.get("provider", "github")  # absent -> github (legacy dirs)
-        # Skip a tracker whose provider isn't wired on this daemon (e.g. a forgejo
-        # tracker on disk but no ForgejoClient configured) so it can't crash the poll
-        # loop. Membership — not truthiness — is the test: a caller may deliberately
-        # map a provider to None (the storage-roundtrip tests pass a single None client).
-        if provider not in clients:
+        instance = state.get("instance", "") or ""  # absent -> default instance
+        key = _client_key(provider, instance)
+        # Skip a tracker whose (provider, instance) isn't wired on this daemon (e.g. a
+        # forgejo tracker for an alias no longer configured, or forgejo not configured at
+        # all) so it can't crash the poll loop. Membership — not truthiness — is the test:
+        # a caller may deliberately map a provider to None (the storage-roundtrip tests
+        # pass a single None client).
+        if key not in clients:
+            named = f" instance {instance!r}" if instance else ""
             print(
                 f"notifications: skipping PR tracker {directory.name!r} — no client for "
-                f"provider {provider!r} (is it configured on this daemon?)",
+                f"provider {provider!r}{named} (is it configured on this daemon?)",
                 file=sys.stderr,
             )
             continue
-        client = clients[provider]
+        client = clients[key]
+        # base_url mismatch guard: if this tracker's persisted base_url disagrees with the
+        # configured client's base_url for its (provider, instance), the alias has been
+        # repointed at a different URL since the tracker was written. Skip it with a loud
+        # warning rather than polling it against the wrong instance (which would emit bogus
+        # diffs, or leak one instance's PR state into another's addressing). Only guard
+        # forgejo, and only when both sides carry a base_url to compare (a None-client test
+        # stub, or a legacy tracker with no persisted base_url, can't mismatch).
+        persisted_base = state.get("base_url")
+        configured_base = getattr(client, "base_url", None)
+        if (
+            provider == "forgejo"
+            and persisted_base
+            and configured_base
+            and persisted_base != configured_base
+        ):
+            print(
+                f"notifications: skipping PR tracker {directory.name!r} — persisted "
+                f"base_url {persisted_base!r} disagrees with the configured "
+                f"{('instance ' + repr(instance)) if instance else 'default instance'} "
+                f"URL {configured_base!r} (alias repointed?); not polling the wrong "
+                "instance",
+                file=sys.stderr,
+            )
+            continue
         t = PRTracker(
             state["owner"],
             state["repo"],
@@ -1146,6 +1209,7 @@ def load_trackers(clients) -> list[PRTracker]:
             client,
             provider=provider,
             base_url=state.get("base_url"),
+            instance=instance,
         )
         snapshot = state.get("snapshot")
         # A snapshot from before the timeline-identity switch has a different

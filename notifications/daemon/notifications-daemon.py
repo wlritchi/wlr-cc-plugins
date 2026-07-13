@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import sys
 import time
@@ -236,23 +237,121 @@ def _alloc_ordinal() -> int:
 
 
 GH: github_client.GitHubClient | None = None
-# The Forgejo/Gitea client, built in main() only when FORGEJO_API_URL is configured;
-# None means this daemon does not serve Forgejo PR subscriptions.
+# The DEFAULT Forgejo/Gitea client, built in main() only when FORGEJO_API_URL is
+# configured; None means this daemon does not serve default-instance Forgejo PR
+# subscriptions.
 FJ: forgejo_client.ForgejoClient | None = None
+# NAMED Forgejo instances: alias (lowercase-kebab) -> ForgejoClient, built in main() from
+# FORGEJO_<ALIAS>_API_URL / FORGEJO_<ALIAS>_TOKEN env pairs. Empty when only the default
+# instance is configured (the v1 shape), so the default path stays byte-identical.
+FJ_INSTANCES: dict[str, forgejo_client.ForgejoClient] = {}
 
 
-def _pr_client(provider: str):
-    """The PR client for a provider, or None if that provider isn't wired here."""
-    return FJ if provider == "forgejo" else GH
+def _forgejo_client(instance: str):
+    """The Forgejo client for an alias, or None if that alias isn't configured here.
+    instance "" (or None) is the DEFAULT instance (FJ)."""
+    if not instance:
+        return FJ if (FJ is not None and FJ.configured) else None
+    return FJ_INSTANCES.get(instance)
+
+
+def _forgejo_aliases() -> list[str]:
+    """Configured named-instance aliases, sorted (names only — never URLs), for the
+    'unknown Forgejo instance' error and diagnostics."""
+    return sorted(FJ_INSTANCES)
+
+
+def _pr_client(provider: str, instance: str = ""):
+    """The PR client for a (provider, instance), or None if it isn't wired here. For
+    github the instance is ignored (no multi-instance dimension in v1); for forgejo,
+    instance "" is the default client and a named alias resolves to its registered
+    client (or None when the alias isn't configured)."""
+    if provider == "forgejo":
+        return _forgejo_client(instance)
+    return GH
 
 
 def _pr_clients() -> dict:
-    """The {provider: client} map for load_trackers — only configured providers, so a
-    tracker whose provider is unconfigured is skipped rather than loaded with no client."""
+    """The clients map for load_trackers, covering the default + every configured named
+    instance. The DEFAULT instance keys on the bare provider string (byte-identical to
+    the v1 {provider: client} shape); a NAMED forgejo instance keys on a
+    ("forgejo", alias) tuple. Only configured (provider, instance)s are included, so a
+    tracker whose instance is unconfigured is skipped rather than loaded with no client."""
     clients: dict = {"github": GH}
     if FJ is not None and FJ.configured:
         clients["forgejo"] = FJ
+    for alias, client in FJ_INSTANCES.items():
+        clients[("forgejo", alias)] = client
     return clients
+
+
+# A named Forgejo instance is one env pair: FORGEJO_<ALIAS>_API_URL + FORGEJO_<ALIAS>_TOKEN.
+# The alias is the env segment between the FORGEJO_ prefix and the _API_URL suffix,
+# lowercased with '_' -> '-' to recover the ref/tool alias (e.g. FORGEJO_EXTERNAL_API_URL
+# -> "external", FORGEJO_SELF_HOSTED_API_URL -> "self-hosted").
+_FORGEJO_ALIAS_URL_RE = re.compile(r"^FORGEJO_(?P<alias>[A-Z0-9][A-Z0-9_]*)_API_URL$")
+# The alias must round-trip to lowercase kebab-case (same rule as agent/channel names and
+# the relay's ref parser), so infrastructure names stay clean and a full host can never be
+# mistaken for an alias.
+_FORGEJO_ALIAS_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+
+
+def _forgejo_token_env(instance: str) -> str:
+    """The env var holding a Forgejo instance's token: FORGEJO_TOKEN for the default, and
+    FORGEJO_<ALIAS>_TOKEN (alias uppercased, '-' -> '_') for a named instance. Used to
+    name the exact var in the auth-error message so an operator knows which secret to fix."""
+    if not instance:
+        return "FORGEJO_TOKEN"
+    return f"FORGEJO_{instance.upper().replace('-', '_')}_TOKEN"
+
+
+def _build_forgejo_instances(env: dict[str, str], default_url: str) -> dict:
+    """Parse FORGEJO_<ALIAS>_API_URL / FORGEJO_<ALIAS>_TOKEN env pairs into named
+    ForgejoClients. ``default_url`` is the default instance's NORMALIZED base_url ("" when
+    the default instance is unconfigured), used for the canonicalization check.
+
+    Rules (per spec):
+      - The alias env segment must recover a lowercase kebab-case alias; a segment that
+        doesn't (e.g. a stray FORGEJO_API_URL — no alias segment — or an all-numeric one)
+        is ignored, not turned into an instance.
+      - CANONICALIZATION: an alias whose normalized URL equals the default instance's URL
+        would grow a SECOND tracker for one PR. That is a configuration error — it is
+        logged loudly and the alias is SKIPPED (never created).
+      - An alias missing its URL is skipped; a token is optional (public repos), matching
+        the default client's contract.
+    """
+    instances: dict = {}
+    for name, value in sorted(env.items()):
+        m = _FORGEJO_ALIAS_URL_RE.match(name)
+        if not m or not (value or "").strip():
+            continue
+        alias = m.group("alias").lower().replace("_", "-")
+        if _FORGEJO_ALIAS_RE.match(alias) is None:
+            print(
+                f"notifications daemon: ignoring {name} — alias {alias!r} is not valid "
+                "lowercase kebab-case",
+                file=sys.stderr,
+            )
+            continue
+        token = env.get(_forgejo_token_env(alias))
+        client = forgejo_client.ForgejoClient(base_url=value, token=token)
+        if not client.configured:  # normalized to empty; nothing to poll
+            continue
+        # Canonicalization: an alias pointing at the default instance's URL must NOT create
+        # a duplicate instance — it would resolve one PR to two storage keys (bare + aliased)
+        # and double-poll it. Refuse the alias and tell the operator to drop the pair.
+        if default_url and client.base_url == default_url:
+            print(
+                f"notifications daemon: CONFIG ERROR — Forgejo instance {alias!r} "
+                f"({name}) resolves to the same URL as the default instance "
+                f"(FORGEJO_API_URL); refusing to create a duplicate instance. Drop the "
+                f"{name} / {_forgejo_token_env(alias)} pair (the default instance already "
+                "serves this URL).",
+                file=sys.stderr,
+            )
+            continue
+        instances[alias] = client
+    return instances
 
 
 # Shared secret each relay must present (Authorization: Bearer <token>) to connect.
@@ -507,7 +606,14 @@ async def _handle(websocket) -> None:
 
             elif kind == wsproto.UNSUBSCRIBE_FORGEJO_PR:
                 _handle_unsubscribe(conn, msg, provider="forgejo")
-                await _send(websocket, wsproto.UNSUBSCRIBED, msg, pr=_msg_key(msg))
+                _uinst = _msg_instance(msg)  # named-only echo; default stays v1-shaped
+                await _send(
+                    websocket,
+                    wsproto.UNSUBSCRIBED,
+                    msg,
+                    pr=_msg_key(msg),
+                    **({"instance": _uinst} if _uinst else {}),
+                )
 
             elif kind == wsproto.LIST_FORGEJO_PR_SUBSCRIPTIONS:
                 await _handle_list_pr_subscriptions(websocket, conn, msg, provider="forgejo")
@@ -645,9 +751,47 @@ def _msg_key(msg: dict) -> str:
     return pr_monitor.pr_key(msg.get("owner"), msg.get("repo"), msg.get("number"))
 
 
+def _msg_instance(msg: dict) -> str:
+    """The Forgejo instance alias carried on a PR message payload, "" for the default
+    instance (absent, null, or empty). github never carries one."""
+    return msg.get("instance") or ""
+
+
+def _forgejo_config_error(provider: str, instance: str) -> str | None:
+    """Validate that a forgejo (provider, instance) is served here, returning a clear
+    error string when it isn't (else None). github is always served.
+
+    - Default instance ("") unconfigured -> the v1 "set FORGEJO_API_URL / FORGEJO_TOKEN"
+      message (byte-identical, so the default path is unchanged).
+    - A named alias that isn't configured -> "unknown Forgejo instance '<alias>' —
+      configured: <aliases>" (names only, never URLs, per spec). When no named instances
+      exist at all, say so explicitly rather than list an empty set."""
+    if provider != "forgejo":
+        return None
+    if not instance:
+        if _forgejo_client("") is None:
+            return (
+                "Forgejo PR monitoring is not configured on this daemon "
+                "(set FORGEJO_API_URL / FORGEJO_TOKEN)."
+            )
+        return None
+    if _forgejo_client(instance) is not None:
+        return None
+    aliases = _forgejo_aliases()
+    configured = ", ".join(aliases) if aliases else "(none configured)"
+    return (
+        f"unknown Forgejo instance {instance!r} — configured: {configured}. Name a "
+        "configured instance's alias, or omit the prefix for the default instance."
+    )
+
+
 def _msg_storage_key(msg: dict, provider: str) -> str:
     return pr_monitor.storage_key(
-        provider, msg.get("owner"), msg.get("repo"), msg.get("number")
+        provider,
+        msg.get("owner"),
+        msg.get("repo"),
+        msg.get("number"),
+        _msg_instance(msg) if provider == "forgejo" else "",
     )
 
 
@@ -661,18 +805,14 @@ async def _handle_subscribe(
             websocket, wsproto.ERROR, msg, error="missing session id or PR reference"
         )
         return
-    client = _pr_client(provider)
-    if client is None or (provider == "forgejo" and not client.configured):
-        await _send(
-            websocket,
-            wsproto.ERROR,
-            msg,
-            error="Forgejo PR monitoring is not configured on this daemon "
-            "(set FORGEJO_API_URL / FORGEJO_TOKEN).",
-        )
+    instance = _msg_instance(msg) if provider == "forgejo" else ""
+    if err := _forgejo_config_error(provider, instance):
+        await _send(websocket, wsproto.ERROR, msg, error=err)
         return
+    client = _pr_client(provider, instance)
     key = pr_monitor.pr_key(owner, repo, number)  # display ref for replies/errors
-    skey = pr_monitor.storage_key(provider, owner, repo, number)  # TRACKERS/dir key
+    # TRACKERS/dir key — alias-tagged for a named forgejo instance, unprefixed default.
+    skey = pr_monitor.storage_key(provider, owner, repo, number, instance)
     tracker = TRACKERS.get(skey)
 
     if tracker is None:
@@ -683,6 +823,7 @@ async def _handle_subscribe(
             client,
             provider=provider,
             base_url=client.base_url if provider == "forgejo" else None,
+            instance=instance,
         )
         try:
             summary = await tracker.initial_poll()
@@ -701,6 +842,9 @@ async def _handle_subscribe(
         summary = pr_monitor.summarize(tracker.snapshot)
 
     if tracker.terminal:
+        # Echo `instance` ONLY for a named instance — the skew belt only needs it there,
+        # and omitting it keeps the default (and github) reply byte-identical to v1.
+        inst = {"instance": instance} if instance else {}
         await _send(
             websocket,
             wsproto.SUBSCRIBED,
@@ -709,6 +853,7 @@ async def _handle_subscribe(
             summary=summary,
             merged=tracker.merged,
             closed=True,
+            **inst,
         )
         return
 
@@ -724,6 +869,7 @@ async def _handle_subscribe(
     pr_monitor.save_subscriber(tracker, session_id)
     tracker.wake.set()  # resume polling for this PR
     _wake(session_id)  # deliver any catch-up / future events immediately
+    inst = {"instance": instance} if instance else {}  # named-only echo (see above)
     await _send(
         websocket,
         wsproto.SUBSCRIBED,
@@ -732,6 +878,7 @@ async def _handle_subscribe(
         summary=summary,
         merged=tracker.merged,
         closed=False,
+        **inst,
     )
 
 
@@ -765,6 +912,9 @@ async def _handle_list_pr_subscriptions(
             "pr": t.key,  # human-facing ref (owner/repo#number), not the storage key
             "merged": t.merged,
             "pending": len(t.unacked_for(session_id)),
+            # Named-instance alias so the relay can render "<alias>:owner/repo#n";
+            # omitted for the default instance (and github) so those items stay v1-shaped.
+            **({"instance": t.instance} if (t.provider == "forgejo" and t.instance) else {}),
         }
         for t in TRACKERS.values()
         if session_id in t.subscribers and t.provider == provider
@@ -1597,13 +1747,20 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             delay = wait + random.uniform(1.0, 15.0)  # defer; not a "no update"
         except pr_errors.PRAuthError as exc:
             if not tracker.auth_notified:
-                label = {"github": "GitHub", "forgejo": "Forgejo"}.get(
-                    tracker.provider, tracker.provider
-                )
-                token_env = {
-                    "github": "GITHUB_TOKEN",
-                    "forgejo": "FORGEJO_TOKEN",
-                }.get(tracker.provider, "the provider token")
+                if tracker.provider == "forgejo":
+                    # Name the FAILING instance's alias and its exact token env var, so an
+                    # operator knows which of possibly-several Forgejo secrets to fix. The
+                    # default instance stays "Forgejo" / FORGEJO_TOKEN (v1-identical).
+                    label = (
+                        f"Forgejo ({tracker.instance})"
+                        if tracker.instance
+                        else "Forgejo"
+                    )
+                    token_env = _forgejo_token_env(tracker.instance)
+                elif tracker.provider == "github":
+                    label, token_env = "GitHub", "GITHUB_TOKEN"
+                else:
+                    label, token_env = tracker.provider, "the provider token"
                 _emit(
                     tracker,
                     pr_monitor.synthetic_event(
@@ -1690,15 +1847,26 @@ class _ProbeHandshakeFilter(logging.Filter):
 
 
 async def main() -> None:
-    global GH, FJ, TOKEN
+    global GH, FJ, FJ_INSTANCES, TOKEN
     TOKEN = wsproto.token()  # auto-creates <NOTIFICATIONS_DATA_DIR>/token if needed
     GH = github_client.GitHubClient()
     # Forgejo is optional: only served when an instance URL is configured. A daemon
     # without it rejects forgejo_* subscriptions (and skips any forgejo trackers on
-    # disk) rather than failing to start.
+    # disk) rather than failing to start. FORGEJO_API_URL/FORGEJO_TOKEN is the DEFAULT
+    # instance (byte-identical to v1); FORGEJO_<ALIAS>_API_URL/TOKEN pairs are additional
+    # NAMED instances built into FJ_INSTANCES.
     FJ = forgejo_client.ForgejoClient()
     if not FJ.configured:
         FJ = None
+    FJ_INSTANCES = _build_forgejo_instances(
+        dict(os.environ), FJ.base_url if FJ is not None else ""
+    )
+    if FJ_INSTANCES:
+        print(
+            "notifications daemon: Forgejo named instances configured: "
+            + ", ".join(_forgejo_aliases()),
+            file=sys.stderr,
+        )
     for tracker in pr_monitor.load_trackers(_pr_clients()):
         TRACKERS[tracker.storage_key] = tracker
         tracker.task = asyncio.create_task(_tracker_loop(tracker))

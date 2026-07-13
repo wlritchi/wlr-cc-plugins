@@ -26,8 +26,11 @@ UNSUBSCRIBE_PR = "unsubscribe_pr"  # {req_id, session_id, owner, repo, number}
 LIST_PR_SUBSCRIPTIONS = "list_pr_subscriptions"  # {req_id, session_id}
 # Forgejo/Gitea PR subscriptions (additive; parallel a separate REST poller). Reuse the
 # SUBSCRIBED / UNSUBSCRIBED / SUBSCRIPTIONS_RESULT reply frames — same shapes as GitHub.
-SUBSCRIBE_FORGEJO_PR = "subscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number}
-UNSUBSCRIBE_FORGEJO_PR = "unsubscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number}
+# Multi-instance (additive): an optional `instance` alias field selects a named Forgejo
+# instance; absent/"" is the default instance, byte-identical to v1. The daemon echoes
+# `instance` back in its replies so the relay can detect an old daemon that ignored it.
+SUBSCRIBE_FORGEJO_PR = "subscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
+UNSUBSCRIBE_FORGEJO_PR = "unsubscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
 LIST_FORGEJO_PR_SUBSCRIPTIONS = "list_forgejo_pr_subscriptions"  # {req_id, session_id}
 # agent directory (Phase A)
 REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?, reclaim_key?}
@@ -53,9 +56,9 @@ MESSAGE_STATUS = "message_status"  # {req_id, session_id, target}
 NOTIFY = "notify"  # {id, content, meta}          deliver this to the agent, then ack
 SCHEDULED = "scheduled"  # {req_id, id, due_at}
 LIST_RESULT = "list_result"  # {req_id, items}
-SUBSCRIBED = "subscribed"  # {req_id, pr, summary, merged, closed}
-UNSUBSCRIBED = "unsubscribed"  # {req_id, pr}
-SUBSCRIPTIONS_RESULT = "subscriptions_result"  # {req_id, items}
+SUBSCRIBED = "subscribed"  # {req_id, pr, summary, merged, closed, instance?}
+UNSUBSCRIBED = "unsubscribed"  # {req_id, pr, instance?}
+SUBSCRIPTIONS_RESULT = "subscriptions_result"  # {req_id, items:[{pr, instance?, merged, pending}]}
 AGENT_OK = "agent_ok"  # {req_id, agent}          resulting record dict (or null/{name} for unregister)
 AGENT_LIST = "agent_list"  # {req_id, agents}      [record-dict + "connected": bool]
 # agent messaging (Phase B) — daemon -> relay (AGENT_OK acks leave/set_threshold/

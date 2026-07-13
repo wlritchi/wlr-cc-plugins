@@ -741,6 +741,62 @@ _FORGEJO_UNSUPPORTED_MESSAGE = (
     "daemon predates this feature."
 )
 
+# A Forgejo ref may carry a leading "<alias>:" instance prefix — external:owner/repo#N.
+# The alias is lowercase kebab-case (2-64 chars, same rule as the daemon and agent names),
+# which by construction REJECTS a full-host ref: a scheme (https://…), a port (host:8080),
+# or a dotted hostname all contain characters the alias pattern forbids, so a host never
+# parses as an alias. A bare owner/repo#N has no prefix -> the default instance.
+_FORGEJO_ALIAS_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_FORGEJO_ALIAS_MIN = 2
+_FORGEJO_ALIAS_MAX = 64
+
+# This-session record of (instance, ref) pairs THIS relay just created a subscription for,
+# used only by the version-skew belt: if the tool sent a non-default instance but an old
+# daemon echoed no instance, a match here means we caused a stray default-instance sub and
+# should clean it up; a miss means it may be a legitimate pre-existing default sub (a
+# mirrored repo) we must NOT destroy. Best-effort, in-memory: a relay restart forgets it,
+# which only downgrades a would-be auto-cleanup to the warn path (never a wrong destroy).
+_SESSION_CREATED_SUBS: set[tuple[str, str]] = set()
+
+
+def _parse_forgejo_ref(pr: str) -> tuple[str, str, str, int] | str:
+    """Parse a (possibly alias-prefixed) Forgejo ref into (instance, owner, repo, number),
+    or return a human-readable error string. instance "" is the default. A "<alias>:"
+    prefix is split off first (only a lowercase-kebab alias — never a full host); the rest
+    must be a bare owner/repo#N."""
+    raw = (pr or "").strip()
+    instance = ""
+    prefix, sep, rest = raw.partition(":")
+    if sep:  # there is a leading "<prefix>:" — it must be a valid alias, not a host
+        # A valid alias is lowercase kebab-case AND the remainder is a bare owner/repo#N
+        # with no further colon (owner/repo/number never contain ':'). The second check is
+        # what rejects a full host:port:… — the first colon would otherwise peel a
+        # host-like alias and leave a colon-bearing owner.
+        if (
+            _FORGEJO_ALIAS_MIN <= len(prefix) <= _FORGEJO_ALIAS_MAX
+            and _FORGEJO_ALIAS_RE.match(prefix) is not None
+            and ":" not in rest
+        ):
+            instance, raw = prefix, rest
+        else:
+            return (
+                f"Invalid Forgejo instance prefix {prefix!r}. Use a configured "
+                "instance alias (lowercase kebab-case), e.g. external:owner/repo#N. "
+                "Full-host references (a URL or hostname) are not accepted — the alias "
+                "keeps infrastructure names out of the addressing layer."
+            )
+    match = _PR_REF_RE.match(raw)
+    if not match:
+        return "Invalid PR reference. Use owner/repo#number, e.g. wlritchi/scry#4."
+    return instance, match.group(1), match.group(2), int(match.group(3))
+
+
+def _forgejo_ref_display(instance: str, owner: str, repo: str, number: int | str) -> str:
+    """Render a Forgejo ref the way tool output tags it: "<alias>:owner/repo#N" for a
+    named instance, bare "owner/repo#N" for the default (v1-identical)."""
+    bare = f"{owner}/{repo}#{number}"
+    return f"{instance}:{bare}" if instance else bare
+
 
 async def _forgejo_daemon_request(payload: dict) -> dict | str:
     """Like _daemon_request, but degrades a request timeout OR an 'unknown message type'
@@ -764,6 +820,56 @@ async def _forgejo_daemon_request(payload: dict) -> dict | str:
     return reply
 
 
+def _forgejo_reply_pr(reply: dict, instance: str, owner: str, repo: str, number: int) -> str:
+    """The ref to show in a reply, tagged with the instance alias. Prefer the daemon's
+    echoed instance (authoritative) but fall back to what we sent, and use the daemon's
+    ``pr`` field for the bare ref when present."""
+    bare = reply.get("pr") or f"{owner}/{repo}#{number}"
+    alias = reply.get("instance")
+    if alias is None:  # old daemon: no echo — fall back to the alias we sent
+        alias = instance
+    return f"{alias}:{bare}" if alias else bare
+
+
+async def _forgejo_skew_cleanup(instance: str, owner: str, repo: str, number: int) -> str:
+    """The version-skew belt (spec): the tool SENT a non-default instance but the daemon's
+    reply carried NO instance echo — an old daemon that ignored the field and subscribed on
+    its DEFAULT instance. Treat it as FAILURE, not success.
+
+    - If THIS session's record says we just created this (instance, ref), the stray sub is
+      ours to undo: unsubscribe the default-instance sub the old daemon actually created.
+    - Otherwise warn WITHOUT destroying: a bare default-instance sub to the same
+      owner/repo#N may be a legitimate pre-existing subscription (mirrored repos), so blind
+      cleanup is forbidden."""
+    bare = f"{owner}/{repo}#{number}"
+    aliased = f"{instance}:{bare}"
+    if (instance, bare) in _SESSION_CREATED_SUBS:
+        _SESSION_CREATED_SUBS.discard((instance, bare))
+        session_id, _ = session_state.effective_session_id()
+        # Undo the stray DEFAULT-instance sub (no instance field) the old daemon created.
+        await _forgejo_daemon_request(
+            {
+                "type": wsproto.UNSUBSCRIBE_FORGEJO_PR,
+                "session_id": session_id,
+                "owner": owner,
+                "repo": repo,
+                "number": number,
+            }
+        )
+        return (
+            f"Could not subscribe to {aliased}: this daemon predates multi-instance "
+            "Forgejo support and ignored the instance, subscribing on its DEFAULT "
+            "instance instead. That stray default-instance subscription has been undone. "
+            "Upgrade the daemon to subscribe to named instances."
+        )
+    return (
+        f"Could not subscribe to {aliased}: this daemon predates multi-instance Forgejo "
+        f"support and ignored the instance. A default-instance subscription to {bare} may "
+        "have been created — check list_forgejo_pr_subscriptions and unsubscribe it if it "
+        "is unwanted. Upgrade the daemon to subscribe to named instances."
+    )
+
+
 @mcp.tool()
 async def subscribe_forgejo_pr(pr: str) -> str:
     """Subscribe this session to notifications for a Forgejo/Gitea PR, as owner/repo#number.
@@ -773,56 +879,85 @@ async def subscribe_forgejo_pr(pr: str) -> str:
     the PR (reviews, inline + conversation comments, commit status, mergeability, new
     commits) and delivers updates as <channel> events. Subscriptions persist in the
     daemon; a merged PR auto-unsubscribes you.
+
+    A second (or third) Forgejo instance the daemon is configured for is addressed by an
+    alias prefix: `external:owner/repo#N`. A bare `owner/repo#N` targets the default
+    instance. Full-host references are not accepted — use the configured alias.
     """
-    match = _PR_REF_RE.match(pr or "")
-    if not match:
-        return "Invalid PR reference. Use owner/repo#number, e.g. wlritchi/scry#4."
+    parsed = _parse_forgejo_ref(pr)
+    if isinstance(parsed, str):
+        return parsed
+    instance, owner, repo, number = parsed
     session_id, _ = session_state.effective_session_id()
     if not session_id:
         return "Cannot subscribe: this relay does not yet know its session id."
-    owner, repo, number = match.group(1), match.group(2), int(match.group(3))
-    reply = await _forgejo_daemon_request(
-        {
-            "type": wsproto.SUBSCRIBE_FORGEJO_PR,
-            "session_id": session_id,
-            "owner": owner,
-            "repo": repo,
-            "number": number,
-        }
-    )
+    payload: dict = {
+        "type": wsproto.SUBSCRIBE_FORGEJO_PR,
+        "session_id": session_id,
+        "owner": owner,
+        "repo": repo,
+        "number": number,
+    }
+    if instance:
+        payload["instance"] = instance
+    # Record BEFORE the request so the skew-cleanup can tell "a sub I just caused" from a
+    # pre-existing default sub, even if the reply races. Discarded on any non-success path.
+    if instance:
+        _SESSION_CREATED_SUBS.add((instance, f"{owner}/{repo}#{number}"))
+    reply = await _forgejo_daemon_request(payload)
     if isinstance(reply, str):
+        _SESSION_CREATED_SUBS.discard((instance, f"{owner}/{repo}#{number}"))
         return reply
     if reply.get("type") == wsproto.ERROR:
-        return f"Could not subscribe to {owner}/{repo}#{number}: {reply.get('error')}"
+        _SESSION_CREATED_SUBS.discard((instance, f"{owner}/{repo}#{number}"))
+        display = _forgejo_ref_display(instance, owner, repo, number)
+        return f"Could not subscribe to {display}: {reply.get('error')}"
+    # Version-skew belt: a non-default instance that came back with NO instance echo is an
+    # old daemon that subscribed on its default. That is a FAILURE, not a success.
+    if instance and reply.get("instance") is None:
+        return await _forgejo_skew_cleanup(instance, owner, repo, number)
     if reply.get("closed"):
-        return f"{reply.get('pr')} is already closed/merged ({reply.get('summary')}); not subscribing."
-    return f"Subscribed to {reply.get('pr')} (Forgejo). Current status: {reply.get('summary')}. {DAEMON.delivery_hint()}"
+        _SESSION_CREATED_SUBS.discard((instance, f"{owner}/{repo}#{number}"))
+        display = _forgejo_reply_pr(reply, instance, owner, repo, number)
+        return f"{display} is already closed/merged ({reply.get('summary')}); not subscribing."
+    display = _forgejo_reply_pr(reply, instance, owner, repo, number)
+    tag = f" (Forgejo: {instance})" if instance else " (Forgejo)"
+    return f"Subscribed to {display}{tag}. Current status: {reply.get('summary')}. {DAEMON.delivery_hint()}"
 
 
 @mcp.tool()
 async def unsubscribe_forgejo_pr(pr: str) -> str:
-    """Unsubscribe this session from a Forgejo/Gitea PR, given as owner/repo#number."""
-    match = _PR_REF_RE.match(pr or "")
-    if not match:
-        return "Invalid PR reference. Use owner/repo#number, e.g. wlritchi/scry#4."
+    """Unsubscribe this session from a Forgejo/Gitea PR, given as owner/repo#number.
+
+    Address a named instance with an alias prefix (`external:owner/repo#N`); a bare ref
+    targets the default instance.
+    """
+    parsed = _parse_forgejo_ref(pr)
+    if isinstance(parsed, str):
+        return parsed
+    instance, owner, repo, number = parsed
     session_id, _ = session_state.effective_session_id()
     if not session_id:
         return "Cannot unsubscribe: this relay does not yet know its session id."
-    owner, repo, number = match.group(1), match.group(2), int(match.group(3))
-    reply = await _forgejo_daemon_request(
-        {
-            "type": wsproto.UNSUBSCRIBE_FORGEJO_PR,
-            "session_id": session_id,
-            "owner": owner,
-            "repo": repo,
-            "number": number,
-        }
-    )
+    payload: dict = {
+        "type": wsproto.UNSUBSCRIBE_FORGEJO_PR,
+        "session_id": session_id,
+        "owner": owner,
+        "repo": repo,
+        "number": number,
+    }
+    if instance:
+        payload["instance"] = instance
+    reply = await _forgejo_daemon_request(payload)
     if isinstance(reply, str):
         return reply
     if reply.get("type") == wsproto.ERROR:
-        return f"Could not unsubscribe from {owner}/{repo}#{number}: {reply.get('error')}"
-    return f"Unsubscribed from {reply.get('pr')}."
+        display = _forgejo_ref_display(instance, owner, repo, number)
+        return f"Could not unsubscribe from {display}: {reply.get('error')}"
+    # Drop any this-session created-marker for this ref on an explicit unsubscribe.
+    _SESSION_CREATED_SUBS.discard((instance, f"{owner}/{repo}#{number}"))
+    display = _forgejo_reply_pr(reply, instance, owner, repo, number)
+    return f"Unsubscribed from {display}."
 
 
 @mcp.tool()
@@ -844,7 +979,11 @@ async def list_forgejo_pr_subscriptions() -> str:
     lines = ["Forgejo PR subscriptions:"]
     for item in items:
         state = " (merged)" if item.get("merged") else ""
-        lines.append(f"  {item.get('pr')}{state}  pending={item.get('pending', 0)}")
+        # A named instance renders "<alias>:owner/repo#N"; the default renders the bare
+        # ref exactly as v1 (item["instance"] is "" / absent for the default and github).
+        alias = item.get("instance") or ""
+        ref = f"{alias}:{item.get('pr')}" if alias else item.get("pr")
+        lines.append(f"  {ref}{state}  pending={item.get('pending', 0)}")
     return "\n".join(lines)
 
 

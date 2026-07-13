@@ -66,6 +66,7 @@ def daemon_env(
     *,
     graphql_url: str | None = None,
     forgejo_url: str | None = None,
+    forgejo_instances: dict[str, str] | None = None,
     poll_seconds: str = "1",
     warm_ttl: str | None = None,
     agent_ttl: str | None = None,
@@ -88,9 +89,17 @@ def daemon_env(
         env["GITHUB_GRAPHQL_URL"] = graphql_url
         env["GITHUB_TOKEN"] = "test-token"
     if forgejo_url:
-        # Point the spawned daemon's ForgejoClient at the fake (client appends /api/v1).
+        # Point the spawned daemon's default ForgejoClient at the fake (client appends
+        # /api/v1). This is the DEFAULT instance (unaliased FORGEJO_API_URL/TOKEN).
         env["FORGEJO_API_URL"] = forgejo_url
         env["FORGEJO_TOKEN"] = "test-token"
+    # Named Forgejo instances: {alias -> instance root url}. Each becomes a
+    # FORGEJO_<ALIAS>_API_URL / FORGEJO_<ALIAS>_TOKEN env pair (alias uppercased,
+    # '-' -> '_'), so the daemon builds one named ForgejoClient per entry.
+    for alias, url in (forgejo_instances or {}).items():
+        env_alias = alias.upper().replace("-", "_")
+        env[f"FORGEJO_{env_alias}_API_URL"] = url
+        env[f"FORGEJO_{env_alias}_TOKEN"] = "test-token"
     return env
 
 
