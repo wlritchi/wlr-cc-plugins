@@ -176,16 +176,15 @@ class ForgejoClient:
             raise ForgejoTransient(f"server error (HTTP {code})")
         raise ForgejoTransient(f"unexpected HTTP {code}")
 
-    async def _get(self, path: str, params: dict | None = None) -> httpx.Response:
-        """One GET + classify; returns the response or raises a classified error.
-        Rate-limit headers are updated on every response."""
+    async def _get(
+        self, client: httpx.AsyncClient, path: str, params: dict | None = None
+    ) -> httpx.Response:
+        """One GET on the caller's shared client + classify; returns the response or
+        raises a classified error. Rate-limit headers are updated on every response."""
         try:
-            async with httpx.AsyncClient(
-                transport=self._transport, timeout=httpx.Timeout(20.0)
-            ) as client:
-                resp = await client.get(
-                    self._url(path), headers=self._headers(), params=params or {}
-                )
+            resp = await client.get(
+                self._url(path), headers=self._headers(), params=params or {}
+            )
         except httpx.HTTPError as exc:
             raise ForgejoTransient(f"network error: {exc}") from exc
         self._update_rate_limit(resp.headers)
@@ -199,18 +198,18 @@ class ForgejoClient:
         except ValueError as exc:
             raise ForgejoTransient(f"non-JSON response: {exc}") from exc
 
-    async def _get_obj(self, path: str) -> dict:
-        return self._json(await self._get(path)) or {}
+    async def _get_obj(self, client: httpx.AsyncClient, path: str) -> dict:
+        return self._json(await self._get(client, path)) or {}
 
-    async def _get_obj_optional(self, path: str) -> dict:
+    async def _get_obj_optional(self, client: httpx.AsyncClient, path: str) -> dict:
         """Like _get_obj but a 404 on a sub-resource yields {} instead of terminating
         the PR — only the top-level pulls fetch treats 404 as 'PR gone'."""
         try:
-            return await self._get_obj(path)
+            return await self._get_obj(client, path)
         except ForgejoNotFound:
             return {}
 
-    async def _get_list(self, path: str) -> list[dict]:
+    async def _get_list(self, client: httpx.AsyncClient, path: str) -> list[dict]:
         """Follow ?page=&limit= pagination, returning every page's items merged. Stops
         when a short page is returned or _MAX_PAGES is hit (loud on the cap, never a
         silent truncation)."""
@@ -225,7 +224,7 @@ class ForgejoClient:
                 )
                 break
             batch = self._json(
-                await self._get(path, {"page": page, "limit": _PAGE_LIMIT})
+                await self._get(client, path, {"page": page, "limit": _PAGE_LIMIT})
             )
             if not isinstance(batch, list) or not batch:
                 break
@@ -235,53 +234,68 @@ class ForgejoClient:
             page += 1
         return items
 
-    async def _get_list_optional(self, path: str) -> list[dict]:
+    async def _get_list_optional(
+        self, client: httpx.AsyncClient, path: str
+    ) -> list[dict]:
         """Like _get_list but a 404 on a sub-resource yields [] instead of terminating
         the PR — only the top-level pulls fetch treats 404 as 'PR gone'."""
         try:
-            return await self._get_list(path)
+            return await self._get_list(client, path)
         except ForgejoNotFound:
             return []
 
     async def fetch_pr(self, owner: str, repo: str, number: int) -> dict:
         """Return the raw Gitea pieces for one PR, or raise a classified error.
 
-        A single fetch (which spans several REST GETs) is retried in-poll on
-        ForgejoTransient only; other classified errors propagate immediately."""
+        A single fetch (which spans several REST GETs over ONE pooled httpx client)
+        is retried in-poll on ForgejoTransient only; other classified errors propagate
+        immediately."""
         return await _retry_transient(
             lambda: self._fetch_pr_once(owner, repo, number)
         )
 
     async def _fetch_pr_once(self, owner: str, repo: str, number: int) -> dict:
         base = f"/repos/{owner}/{repo}"
-        # The pulls fetch is the one that decides existence: its 404 is terminal.
-        pr = await self._get_obj(f"{base}/pulls/{number}")
-        if not pr:
-            raise ForgejoNotFound(f"{owner}/{repo}#{number} not found")
-        reviews = await self._get_list_optional(f"{base}/pulls/{number}/reviews")
-        review_comments: list[dict] = []
-        for review in reviews:
-            rid = review.get("id")
-            # Only reviews that carry inline comments cost an extra request.
-            if rid is not None and review.get("comments_count"):
-                review_comments.extend(
-                    await self._get_list_optional(
-                        f"{base}/pulls/{number}/reviews/{rid}/comments"
+        # One pooled AsyncClient for the whole fan-out (pulls + reviews + per-review
+        # comments + issue comments + status): connections are reused across the GETs
+        # instead of opening a fresh client per request.
+        async with httpx.AsyncClient(
+            transport=self._transport, timeout=httpx.Timeout(20.0)
+        ) as client:
+            # The pulls fetch is the one that decides existence: its 404 is terminal.
+            pr = await self._get_obj(client, f"{base}/pulls/{number}")
+            if not pr:
+                raise ForgejoNotFound(f"{owner}/{repo}#{number} not found")
+            reviews = await self._get_list_optional(
+                client, f"{base}/pulls/{number}/reviews"
+            )
+            review_comments: list[dict] = []
+            for review in reviews:
+                rid = review.get("id")
+                # Only reviews that carry inline comments cost an extra request.
+                if rid is not None and review.get("comments_count"):
+                    review_comments.extend(
+                        await self._get_list_optional(
+                            client, f"{base}/pulls/{number}/reviews/{rid}/comments"
+                        )
                     )
+            issue_comments = await self._get_list_optional(
+                client, f"{base}/issues/{number}/comments"
+            )
+            statuses: list[dict] = []
+            head_sha = (pr.get("head") or {}).get("sha")
+            if head_sha:
+                # Swallow a 404 here (like the other sub-resources): a missing/absent
+                # status for the head commit means "no statuses", NOT that the PR is
+                # gone. Only the pulls fetch above decides existence.
+                combined = await self._get_obj_optional(
+                    client, f"{base}/commits/{head_sha}/status"
                 )
-        issue_comments = await self._get_list_optional(f"{base}/issues/{number}/comments")
-        statuses: list[dict] = []
-        head_sha = (pr.get("head") or {}).get("sha")
-        if head_sha:
-            # Swallow a 404 here (like the other sub-resources): a missing/absent status
-            # for the head commit means "no statuses", NOT that the PR is gone. Only the
-            # pulls fetch above decides existence.
-            combined = await self._get_obj_optional(f"{base}/commits/{head_sha}/status")
-            statuses = combined.get("statuses") or []
-        return {
-            "pr": pr,
-            "reviews": reviews,
-            "review_comments": review_comments,
-            "issue_comments": issue_comments,
-            "statuses": statuses,
-        }
+                statuses = combined.get("statuses") or []
+            return {
+                "pr": pr,
+                "reviews": reviews,
+                "review_comments": review_comments,
+                "issue_comments": issue_comments,
+                "statuses": statuses,
+            }

@@ -257,7 +257,13 @@ def snapshot_from_forgejo(data: dict) -> dict:
             "url": c.get("html_url"),
         }
     for s in data.get("statuses") or []:
-        snap["statuses"][s.get("context")] = {
+        context = s.get("context")
+        # statuses are keyed (and diffed) by context; a context-less entry would
+        # collapse every such status onto the None key and lose all but the last.
+        # Gitea always sets context in practice, so this just drops malformed entries.
+        if not context:
+            continue
+        snap["statuses"][context] = {
             "state": s.get("status"),
             "url": s.get("target_url"),
             "desc": s.get("description"),
