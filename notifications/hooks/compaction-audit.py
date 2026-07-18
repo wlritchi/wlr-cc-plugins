@@ -14,6 +14,12 @@ us.
 Claude Code exposes no PostCompact event, so post-compaction size isn't available
 from a hook — the pre-compaction size at each event is the metric we can capture,
 and it is the one that answers "where did compaction fire?".
+
+Note on self-compaction (the compact_session tool): it rides Claude Code's AUTO
+executor, so its compaction is labeled trigger="auto", NOT "manual" — self-compacts
+are indistinguishable from threshold auto-compaction on the trigger field alone.
+Distinguish them by a below-threshold transcript_bytes (a self-compact fires well
+under the auto threshold) or by the transcript's own compact_boundary tool-result.
 """
 
 # /// script
