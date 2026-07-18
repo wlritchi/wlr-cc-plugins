@@ -712,6 +712,11 @@ def _handle_ack(conn: Connection, msg: dict) -> None:
     nid = msg.get("id")
     if not nid:
         return
+    # Any ack means this session's relay just surfaced a delivery into a runnable
+    # context — stamp last_acked for the context-wedge liveness signal (a connected
+    # session that stops acking while messages pend is the wedge fingerprint).
+    if conn.session_id:
+        REGISTRY.mark_acked(conn.session_id, time.time())
     if isinstance(nid, str) and nid.startswith("trunc:"):
         # trunc:{storage_key}:{sid} — the trailing session id never contains ':', so
         # rpartition(':') peels it off cleanly, leaving the storage key (which may carry
@@ -1605,6 +1610,10 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
             info[n] = {
                 "connected": rec is not None and rec.session_id in CONNECTIONS,
                 "last_seen": rec.last_seen if rec is not None else None,
+                # Last surfaced-a-push time; lets the relay flag a connected-but-not-
+                # acking recipient with a pending message as possibly context-wedged
+                # (docs/specs/2026-07-14). Additive; older relays ignore it.
+                "last_acked": rec.last_acked if rec is not None else None,
             }
         return info
 

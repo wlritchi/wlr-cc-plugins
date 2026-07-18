@@ -94,6 +94,49 @@ def _debounce_max(window: float) -> float:
     return max(window * 5, 10.0)
 
 
+# Bounded catch_up: one drain returns at most this many messages / characters, so a
+# large backlog (post-eviction/outage/wedge) comes back in ordered chunks instead of
+# one unbounded tool result that could jump a turn's context past the window (and
+# re-wedge a freshly-recovered session). Overridable for tuning/tests.
+CATCHUP_MAX_MESSAGES = 25
+CATCHUP_MAX_CHARS = 50_000
+# Wedge hint: a connected recipient with a message pending whose relay has not acked
+# anything in this long is flagged 'possibly context-wedged' in message_status.
+WEDGE_HINT_DEFAULT_SECONDS = 600.0
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return default
+
+
+def _catchup_max_messages() -> int:
+    return _positive_int_env("NOTIFICATIONS_CATCHUP_MAX_MESSAGES", CATCHUP_MAX_MESSAGES)
+
+
+def _catchup_max_chars() -> int:
+    return _positive_int_env("NOTIFICATIONS_CATCHUP_MAX_CHARS", CATCHUP_MAX_CHARS)
+
+
+def _wedge_hint_seconds() -> float:
+    raw = os.environ.get("NOTIFICATIONS_WEDGE_HINT_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return WEDGE_HINT_DEFAULT_SECONDS
+
+
 # Reconnect backoff: binary (exponential) growth with +/- jitter, capped at a
 # jittered 30 minutes, after which it retries roughly every half hour forever.
 # The counter resets only after a connection that stayed up at least
@@ -392,28 +435,75 @@ class DaemonClient:
         await self.apply_mode(detected)
 
     async def drain_buffer(self) -> str:
-        """Drain everything pending for this session and ack it: the pull-mode buffer
-        (PR/scheduled notifications never pushed) and the wake-gating held buffer (agent
-        messages below the threshold, or that arrived while not a channel)."""
+        """Drain pending notifications for this session and ack what's drained: the
+        pull-mode buffer (PR/scheduled notifications never pushed) and the wake-gating
+        held buffer (agent messages below the threshold, or that arrived while not a
+        channel).
+
+        Bounded: one call drains at most _catchup_max_messages() items /
+        _catchup_max_chars() characters (whichever first; oldest-first, buffer then
+        held), leaving the rest UNACKED to re-drain on the next call. This keeps a large
+        backlog from coming back as one unbounded tool result that could jump the turn's
+        context past the window (and re-wedge a freshly-recovered session). Lossless:
+        only the drained chunk is acked, exactly per the ack-on-surface invariant."""
+        max_messages = _catchup_max_messages()
+        max_chars = _catchup_max_chars()
+        drained = 0
+        chars = 0
+
+        def _room_for(content: str) -> bool:
+            # Always allow the first item so a single oversized message can't wedge the
+            # drain forever; after that, stop at either budget.
+            if drained == 0:
+                return True
+            return drained < max_messages and chars + len(content) <= max_chars
+
         sections: list[str] = []
         if self._buffer:
-            parts = [
-                "Pending notifications (this session is not a channel, so they weren't pushed automatically):",
-                "",
-            ]
+            parts: list[str] = []
             for notification_id, payload in list(self._buffer.items()):
-                parts.append(payload.get("content", ""))
+                content = payload.get("content", "")
+                if not _room_for(content):
+                    break  # remaining stay in _buffer, unacked, for the next call
+                parts.append(content)
                 await self._ack(notification_id)
                 self._buffer.pop(notification_id, None)
-            sections.append("\n\n".join(parts))
+                drained += 1
+                chars += len(content)
+            if parts:
+                sections.append(
+                    "Pending notifications (this session is not a channel, so they "
+                    "weren't pushed automatically):\n\n" + "\n\n".join(parts)
+                )
         if self._held:
-            held, self._held = self._held, []
-            parts = ["Held agent messages (below your wake threshold):", ""]
-            for item in held:
-                parts.append(item.get("content", ""))
+            parts = []
+            remaining: list[dict] = []
+            stop = False
+            for item in self._held:
+                content = item.get("content", "")
+                if stop or not _room_for(content):
+                    stop = (
+                        True  # once one won't fit, keep it and everything after (FIFO)
+                    )
+                    remaining.append(item)
+                    continue
+                parts.append(content)
                 await self._ack(item["id"])
-            sections.append("\n\n".join(parts))
+                drained += 1
+                chars += len(content)
+            self._held = remaining
+            if parts:
+                sections.append(
+                    "Held agent messages (below your wake threshold):\n\n"
+                    + "\n\n".join(parts)
+                )
         body = "\n\n".join(sections) if sections else "No pending notifications."
+        remaining_count = len(self._buffer) + len(self._held)
+        if remaining_count and sections:
+            body += (
+                f"\n\n⚠️ Showing a capped batch — {remaining_count} more pending. "
+                "Call catch_up again to continue."
+            )
         if self._mode == "pull":
             # Self-announce silent-pull: a session that was MEANT to be a channel
             # (e.g. a respawn that lost --channels from its argv) otherwise looks
@@ -1042,6 +1132,24 @@ def _format_last_seen(last_seen: float) -> str:
     if hours < 48:
         return f"~{int(round(hours))}h ago"
     return f"~{int(round(hours / 24.0))}d ago"
+
+
+def _wedge_annotation(
+    name: str, info: dict, threshold: float, now: float
+) -> str | None:
+    """The 'possibly context-wedged' hint for a CONNECTED recipient that has a message
+    pending and whose relay has not acked anything in ``threshold`` seconds — the wedge
+    fingerprint (connected + registered, but not surfacing into a runnable context).
+    Returns None when it does not apply. Requires last_acked truthy: a never-acked fresh
+    session is new/quiet, not wedged (docs/specs/2026-07-14)."""
+    last_acked = info.get("last_acked")
+    if not last_acked or now - float(last_acked) < threshold:
+        return None
+    return (
+        f"{name} (connected but no delivery acked in "
+        f"{_format_last_seen(float(last_acked))} despite a pending message — possibly "
+        "context-wedged; a restart may be needed)"
+    )
 
 
 def _identity_path() -> Path:
@@ -1710,25 +1818,26 @@ async def message_status(message_id: str) -> str:
     reactions = reply.get("reactions", [])
     recipients = reply.get("recipients", {})
 
-    def _annotate(name: str) -> str:
+    def _annotate(name: str, pending: bool = False) -> str:
         """Append liveness so 'delivered' can't be misread as 'processed': a
         disconnected or long-idle recipient may have the message sitting in a
-        context nobody is running."""
+        context nobody is running, and a *connected* recipient that has stopped acking
+        while a message is pending may be context-wedged."""
         info = recipients.get(name)
         if not isinstance(info, dict):
             return name  # older daemon: no annotation available
         if info.get("connected"):
+            # A connected recipient with THIS message pending, whose relay hasn't acked
+            # anything in a while, is the context-wedge fingerprint (connected +
+            # registered, but not surfacing into a runnable context).
+            if pending:
+                hint = _wedge_annotation(name, info, _wedge_hint_seconds(), time.time())
+                if hint:
+                    return hint
             return name
         last_seen = info.get("last_seen")
         if last_seen:
-            idle = max(0.0, time.time() - float(last_seen))
-            if idle >= 3600:
-                ago = f"{idle / 3600:.1f}h ago"
-            elif idle >= 60:
-                ago = f"{int(idle / 60)}m ago"
-            else:
-                ago = f"{int(idle)}s ago"
-            return f"{name} (offline, last seen {ago})"
+            return f"{name} (offline, last seen {_format_last_seen(float(last_seen))})"
         return f"{name} (offline)"
 
     total = len(delivered) + len(pending)
@@ -1736,7 +1845,9 @@ async def message_status(message_id: str) -> str:
     if delivered:
         parts[0] += ": " + ", ".join(_annotate(n) for n in delivered)
     if pending:
-        parts.append("pending: " + ", ".join(_annotate(n) for n in pending))
+        parts.append(
+            "pending: " + ", ".join(_annotate(n, pending=True) for n in pending)
+        )
     if reactions:
         parts.append(
             "reactions: "

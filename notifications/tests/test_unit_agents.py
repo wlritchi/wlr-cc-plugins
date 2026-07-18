@@ -673,3 +673,26 @@ def test_unregister_then_register_restarts_generation(tmp_path: Path) -> None:
         "s2", "worker", now=1100.0, is_session_live=_never_live, ttl=900.0
     )
     assert rec.generation == 1
+
+
+# --- last_acked (context-wedge liveness signal) ------------------------------
+
+
+def test_mark_acked_sets_last_acked_and_persistence_roundtrip(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    reg.register("s1", "worker", now=1000.0, is_session_live=_never_live, ttl=900.0)
+    assert reg.get_by_session("s1").last_acked == 0.0  # never acked yet
+    reg.mark_acked("s1", now=1234.0)
+    assert reg.get_by_session("s1").last_acked == 1234.0
+    # The in-memory stamp rides along when the record is next persisted (touch).
+    reg.touch("s1", now=1300.0)
+    reloaded = ar.AgentRegistry(tmp_path)
+    assert reloaded.get_by_session("s1").last_acked == 1234.0
+    # A legacy record dict without the field reads as 0.0.
+    assert ar.AgentRecord.from_dict({"name": "o", "session_id": "sX"}).last_acked == 0.0
+
+
+def test_mark_acked_unknown_session_is_noop(tmp_path: Path) -> None:
+    reg = ar.AgentRegistry(tmp_path)
+    reg.mark_acked("ghost", now=1234.0)  # no record -> silently does nothing
+    assert reg.get_by_session("ghost") is None

@@ -767,3 +767,104 @@ def test_reaper_disabled_keeps_everything(daemon, tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "TRACKERS", {t.key: t})
     assert daemon._reap_idle_trackers(time.time()) == []
     assert t.key in daemon.TRACKERS
+
+
+# --------------------------------------------------------------------------- #
+# bounded catch_up (drain_buffer cap)
+# --------------------------------------------------------------------------- #
+
+
+def _pull_client(relay):
+    """A pull-mode DaemonClient with _ack replaced by a recorder (no ws)."""
+    client = relay.DaemonClient()
+    client._mode = "pull"
+    acked: list = []
+
+    async def fake_ack(notification_id):
+        acked.append(notification_id)
+
+    client._ack = fake_ack
+    return client, acked
+
+
+def test_drain_buffer_caps_at_max_messages(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_CATCHUP_MAX_MESSAGES", "2")
+    client, acked = _pull_client(relay)
+    client._buffer = {
+        "id0": {"content": "alpha", "meta": {}},
+        "id1": {"content": "bravo", "meta": {}},
+        "id2": {"content": "charlie", "meta": {}},
+    }
+    out = anyio.run(client.drain_buffer)
+    assert "alpha" in out and "bravo" in out and "charlie" not in out
+    assert "capped batch" in out and "1 more pending" in out
+    assert acked == ["id0", "id1"]
+    assert list(client._buffer) == ["id2"]  # remainder kept, unacked, for next call
+
+
+def test_drain_buffer_no_footer_when_all_fit(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_CATCHUP_MAX_MESSAGES", "5")
+    client, acked = _pull_client(relay)
+    client._buffer = {
+        "id0": {"content": "alpha", "meta": {}},
+        "id1": {"content": "bravo", "meta": {}},
+    }
+    out = anyio.run(client.drain_buffer)
+    assert "alpha" in out and "bravo" in out and "capped batch" not in out
+    assert client._buffer == {} and acked == ["id0", "id1"]
+
+
+def test_drain_buffer_char_cap_always_drains_at_least_one(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_CATCHUP_MAX_CHARS", "10")
+    monkeypatch.setenv("NOTIFICATIONS_CATCHUP_MAX_MESSAGES", "100")
+    client, acked = _pull_client(relay)
+    big = "x" * 50  # a single item over the whole char budget
+    client._buffer = {
+        "id0": {"content": big, "meta": {}},
+        "id1": {"content": "next", "meta": {}},
+    }
+    out = anyio.run(client.drain_buffer)
+    # The first item always drains (an oversized message can't wedge the drain); the
+    # budget is then blown, so the second is held back.
+    assert big in out and "next" not in out and "1 more pending" in out
+    assert acked == ["id0"] and list(client._buffer) == ["id1"]
+
+
+def test_drain_buffer_budget_spans_buffer_then_held(relay, monkeypatch):
+    monkeypatch.setenv("NOTIFICATIONS_CATCHUP_MAX_MESSAGES", "3")
+    client, acked = _pull_client(relay)
+    client._buffer = {"b0": {"content": "buf0", "meta": {}}}
+    client._held = [
+        {"id": "h0", "content": "held0", "meta": {}},
+        {"id": "h1", "content": "held1", "meta": {}},
+        {"id": "h2", "content": "held2", "meta": {}},
+    ]
+    out = anyio.run(client.drain_buffer)
+    # Budget 3 spans both buffers oldest-first: buf0 + held0 + held1; held2 held back.
+    assert "buf0" in out and "held0" in out and "held1" in out and "held2" not in out
+    assert acked == ["b0", "h0", "h1"]
+    assert [i["id"] for i in client._held] == ["h2"]
+
+
+# --------------------------------------------------------------------------- #
+# message_status wedge hint (_wedge_annotation)
+# --------------------------------------------------------------------------- #
+
+
+def test_wedge_annotation_flags_stale_connected_recipient(relay):
+    info = {"connected": True, "last_acked": 1000.0}
+    out = relay._wedge_annotation("worker", info, threshold=600.0, now=2000.0)
+    assert out is not None
+    assert "worker" in out and "possibly context-wedged" in out
+
+
+def test_wedge_annotation_none_when_recently_acked(relay):
+    info = {"connected": True, "last_acked": 1900.0}  # acked 100s ago, < 600 threshold
+    assert relay._wedge_annotation("worker", info, threshold=600.0, now=2000.0) is None
+
+
+def test_wedge_annotation_none_when_never_acked(relay):
+    # A never-acked (fresh/quiet) session isn't a wedge, even connected with a pending
+    # message — guards against flagging brand-new sessions.
+    assert relay._wedge_annotation("w", {"connected": True}, 600.0, 2000.0) is None
+    assert relay._wedge_annotation("w", {"last_acked": 0.0}, 600.0, 2000.0) is None

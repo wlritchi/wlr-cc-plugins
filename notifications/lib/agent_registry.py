@@ -66,6 +66,12 @@ class AgentRecord:
     # DIFFERENT session; a same-session re-register keeps it. Audit + relay-side
     # supersession detection; never part of message addressing.
     generation: int = 1
+    # Last time this session ACKed a delivery — i.e. last SURFACED a notification into
+    # a runnable context (distinct from last_seen, the WS heartbeat). A connected
+    # session whose last_acked has gone stale while a message is pending is the
+    # context-wedge fingerprint (docs/specs/2026-07-14). Stamped in-memory on each ack;
+    # rides along when the record is persisted for other reasons.
+    last_acked: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -83,6 +89,7 @@ class AgentRecord:
             last_seen=data.get("last_seen", 0.0),
             reclaim_key_hash=data.get("reclaim_key_hash", ""),
             generation=int(data.get("generation", 1)),
+            last_acked=data.get("last_acked", 0.0),
         )
 
 
@@ -274,3 +281,13 @@ class AgentRegistry:
             return
         record.last_seen = now
         self._persist(record)
+
+    def mark_acked(self, session_id: str, now: float) -> None:
+        """Record that this session just ACKed a delivery (surfaced a notification).
+        In-memory only — acks are frequent, so we avoid a disk write per ack; the value
+        rides along whenever the record is next persisted for another reason (touch/
+        register). Lost on daemon restart (0.0), which the wedge heuristic treats as
+        'no ack signal yet' rather than a false wedge."""
+        record = self.get_by_session(session_id)
+        if record is not None:
+            record.last_acked = now
