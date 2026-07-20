@@ -1,5 +1,5 @@
 # vim: filetype=python
-"""Unit tests for the plugin's hook scripts (the PreCompact compaction-audit hook)."""
+"""Unit tests for the plugin's hook scripts (the PostCompact compaction-audit hook)."""
 
 import importlib.util
 import json
@@ -17,44 +17,38 @@ def _load_hook():
 hook = _load_hook()
 
 
-def test_build_record_full_payload(tmp_path):
-    transcript = tmp_path / "t.jsonl"
-    transcript.write_text("a\nbb\n")  # 5 bytes
+def test_build_record_full_payload():
     payload = {
-        "hook_event_name": "PreCompact",
+        "hook_event_name": "PostCompact",
         "session_id": "sid-1",
         "trigger": "auto",
-        "transcript_path": str(transcript),
+        "transcript_path": "/somewhere/t.jsonl",  # present but not read (post-hook race)
     }
-    record = hook.build_record(payload, now=1234.5)
-    assert record == {
-        "event": "PreCompact",
+    assert hook.build_record(payload, now=1234.5) == {
+        "event": "PostCompact",
         "ts": 1234.5,
         "session_id": "sid-1",
         "trigger": "auto",
-        "transcript_bytes": 5,
     }
 
 
 def test_build_record_matcher_fallback_and_defaults():
-    # No hook_event_name -> defaults to PreCompact; "matcher" read when "trigger" absent.
+    # No hook_event_name -> defaults to PostCompact; "matcher" read when "trigger" absent.
     record = hook.build_record({"matcher": "manual", "session_id": "s"}, now=1.0)
-    assert record["event"] == "PreCompact"
+    assert record["event"] == "PostCompact"
     assert record["trigger"] == "manual"
-    assert record["transcript_bytes"] is None  # no transcript_path
+    assert record["session_id"] == "s"
 
 
-def test_build_record_missing_transcript_is_none():
-    record = hook.build_record(
-        {"trigger": "auto", "transcript_path": "/nonexistent/x.jsonl"}, now=1.0
-    )
-    assert record["transcript_bytes"] is None  # stat fails -> None, not a crash
+def test_build_record_missing_trigger_is_none():
+    record = hook.build_record({"session_id": "s"}, now=1.0)
+    assert record["trigger"] is None  # neither trigger nor matcher present
 
 
 def test_append_record_creates_dir_and_appends(tmp_path):
     audit = tmp_path / "nested" / "audit.jsonl"  # parent does not exist yet
-    hook.append_record(audit, {"event": "PreCompact", "n": 1})
-    hook.append_record(audit, {"event": "PreCompact", "n": 2})
+    hook.append_record(audit, {"event": "PostCompact", "n": 1})
+    hook.append_record(audit, {"event": "PostCompact", "n": 2})
     lines = audit.read_text().splitlines()
     assert [json.loads(line)["n"] for line in lines] == [1, 2]  # ordered append
 

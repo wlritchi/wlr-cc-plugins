@@ -1,25 +1,33 @@
 #!/usr/bin/env -S uv run -qs
 # vim: filetype=python
-"""PreCompact hook for the notifications plugin: a compaction audit breadcrumb.
+"""PostCompact hook for the notifications plugin: a compaction audit breadcrumb.
 
-Fires just before Claude Code compacts the session context. Appends one JSONL
-line per compaction recording the trigger (manual vs auto), the session id, a
-timestamp, and the transcript's byte size at compaction time. That last number
-is the diagnostic one: it shows whether compaction is firing near the intended
-threshold or letting context balloon toward the window wall before it acts — the
-failure mode behind the late-context wedges this plugin has chased. Fleet
-observability only; entirely best-effort, so a compaction never fails because of
-us.
+Fires just after Claude Code compacts the session context. Appends one JSONL line
+per compaction recording the trigger (auto vs manual), the session id, and a
+timestamp — a lightweight, greppable, per-session trail of "a compaction fired,
+by this trigger, at this time" that aggregates across the fleet WITHOUT parsing
+multi-hundred-MB transcripts. Its most direct use is trend data on manual /compact
+load (trigger="manual") vs everything the harness compacts on its own.
 
-Claude Code exposes no PostCompact event, so post-compaction size isn't available
-from a hook — the pre-compaction size at each event is the metric we can capture,
-and it is the one that answers "where did compaction fire?".
+What it deliberately does NOT try to capture, and why:
+  - Context-size / effectiveness numbers. The exact token counts a compaction moved
+    live in the transcript's own `compactMetadata` event
+    ({trigger, preTokens, postTokens, durationMs}), which Claude Code finalizes
+    AFTER this PostCompact hook has already run (verified empirically on 2.1.170) —
+    so the hook cannot read its own compaction's metadata. Those counts remain exact
+    in each session transcript and can be joined to this trail by session_id when
+    precise per-event effectiveness is wanted.
+  - The transcript FILE size is NOT a context-size proxy: the transcript is an
+    append-only log, so it only grows across a compaction (the summary is appended).
 
-Note on self-compaction (the compact_session tool): it rides Claude Code's AUTO
-executor, so its compaction is labeled trigger="auto", NOT "manual" — self-compacts
-are indistinguishable from threshold auto-compaction on the trigger field alone.
-Distinguish them by a below-threshold transcript_bytes (a self-compact fires well
-under the auto threshold) or by the transcript's own compact_boundary tool-result.
+Note on trigger for compact_session: an agent-initiated compact_session rides Claude
+Code's AUTO executor, so it records trigger="auto" (NOT "manual") — the same label a
+threshold auto-compaction gets. The two are told apart only by the transcript's
+compactMetadata.preTokens (a self-compact fires well below the auto threshold), not
+by this hook. The trigger here reliably separates MANUAL (/compact) from AUTO.
+
+Entirely best-effort: any failure is swallowed so a compaction never fails because
+of us. Fleet observability only.
 """
 
 # /// script
@@ -35,39 +43,26 @@ from pathlib import Path
 
 
 def _audit_path() -> Path:
-    """Where the audit log lives. Env override wins (tests point it at a tmp
-    file); default is a persistent, PVC-mounted location beside the plugin's
-    other client-side state (e.g. agent-identity.json)."""
+    """Where the audit log lives. Env override wins (tests point it at a tmp file);
+    default is a persistent, PVC-mounted location beside the plugin's other
+    client-side state (e.g. agent-identity.json)."""
     override = os.environ.get("NOTIFICATIONS_COMPACTION_AUDIT_FILE")
     if override:
         return Path(override)
     return Path.home() / ".claude" / "notifications-compaction-audit.jsonl"
 
 
-def _transcript_bytes(payload: dict) -> int | None:
-    """Byte size of the session transcript at compaction time — a cheap (a stat,
-    no read) proxy for how large the context had grown before compaction fired."""
-    path = payload.get("transcript_path")
-    if not path:
-        return None
-    try:
-        return os.stat(path).st_size
-    except OSError:
-        return None
-
-
 def build_record(payload: dict, now: float) -> dict:
-    """The audit line for one compaction event. Pure — the clock is injected so
-    the record is testable without patching time."""
+    """The audit line for one compaction event. Pure — the clock is injected so the
+    record is testable without patching time. Every field comes from the hook payload,
+    which is reliable (unlike the transcript's post-hook compactMetadata)."""
     return {
-        "event": payload.get("hook_event_name") or "PreCompact",
+        "event": payload.get("hook_event_name") or "PostCompact",
         "ts": now,
         "session_id": payload.get("session_id"),
-        # "manual" (an explicit /compact or the compact_session tool) vs "auto"
-        # (Claude Code's threshold-driven compaction). The field is "trigger"; a
-        # couple of payload variants spell it "matcher".
+        # "manual" (an explicit /compact) vs "auto" (Claude Code's threshold-driven
+        # compaction AND the compact_session tool, which rides the auto executor).
         "trigger": payload.get("trigger") or payload.get("matcher"),
-        "transcript_bytes": _transcript_bytes(payload),
     }
 
 

@@ -10,7 +10,7 @@
         ]
       }
     ],
-    "PreCompact": [
+    "PostCompact": [
       {
         "hooks": [
           {
