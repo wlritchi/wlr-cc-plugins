@@ -69,6 +69,9 @@ SESSION_POLL_SECONDS = 5.0
 # into the channel before the client has finished the MCP/channel handshake.
 STARTUP_GRACE_SECONDS = 3.0
 REQUEST_TIMEOUT_SECONDS = 10.0
+# spawn_agent covers a uv pre-warm plus a `claude --bg` dispatch on the daemon
+# side, both of which can take tens of seconds on a cold machine.
+SPAWN_REQUEST_TIMEOUT_SECONDS = 180.0
 
 # Debounce/coalesce window for push (channel) delivery. A burst of notifications
 # (e.g. several PR check/review/comment events landing in one poll) is coalesced
@@ -521,7 +524,9 @@ class DaemonClient:
             return f"{note}\n\n{body}"
         return body
 
-    async def request(self, payload: dict) -> dict:
+    async def request(
+        self, payload: dict, *, timeout: float = REQUEST_TIMEOUT_SECONDS
+    ) -> dict:
         """Send a request to the daemon and await its correlated reply."""
         ws = self._ws
         if ws is None:
@@ -532,7 +537,7 @@ class DaemonClient:
         self._pending[req_id] = send_stream
         try:
             await ws.send(json.dumps({**payload, "req_id": req_id}))
-            with anyio.fail_after(REQUEST_TIMEOUT_SECONDS):
+            with anyio.fail_after(timeout):
                 return await receive_stream.receive()
         finally:
             self._pending.pop(req_id, None)
@@ -758,13 +763,15 @@ async def list_scheduled_notifications() -> str:
 _PR_REF_RE = re.compile(r"^\s*([^/\s]+)/([^/#\s]+)#(\d+)\s*$")
 
 
-async def _daemon_request(payload: dict) -> dict | str:
+async def _daemon_request(
+    payload: dict, *, timeout: float = REQUEST_TIMEOUT_SECONDS
+) -> dict | str:
     """Common guard + request for the daemon-backed tools (PR and agent directory);
     returns the reply dict or a human-readable error string when unreachable."""
     if not await DAEMON.wait_connected():
         return _daemon_unreachable_message()
     try:
-        return await DAEMON.request(payload)
+        return await DAEMON.request(payload, timeout=timeout)
     except (ConnectionError, TimeoutError):
         return _daemon_unreachable_message()
 
@@ -1639,6 +1646,51 @@ async def dm(
     return (
         f"Sent DM to {', '.join(recipients)}{handle} — "
         f"{reply.get('members', 0)} in the thread."
+    )
+
+
+@mcp.tool()
+async def spawn_agent(initial_message: str, working_dir: str, name: str = "") -> str:
+    """Launch a new background agent session on the daemon's host, seeded with an
+    initial message.
+
+    Only works on daemons with spawn enabled (local/workstation deployments that
+    opted in via NOTIFICATIONS_SPAWN_ENABLED); elsewhere this returns the daemon's
+    refusal. The new session runs `claude --bg` in working_dir (which must fall
+    under the operator's configured spawn roots), joins this notification bus, and
+    can be messaged like any other agent once it registers. The daemon does not
+    supervise spawned sessions: an idle session settles after about an hour and
+    stops receiving pushes until the operator resumes it.
+
+    Args:
+        initial_message: the first prompt the new session processes.
+        working_dir: absolute path the session starts in (its job identity anchor).
+        name: optional agent/session display name; also seeds its reclaim key.
+    """
+    if err := _require_session("spawn an agent"):
+        return err
+    if not initial_message.strip():
+        return "Could not spawn: initial_message is required."
+    session_id, _ = session_state.effective_session_id()
+    payload: dict[str, object] = {
+        "type": wsproto.SPAWN_AGENT,
+        "session_id": session_id,
+        "initial_message": initial_message,
+        "working_dir": working_dir,
+    }
+    if name.strip():
+        payload["name"] = name.strip()
+    reply = await _daemon_request(payload, timeout=SPAWN_REQUEST_TIMEOUT_SECONDS)
+    if isinstance(reply, str):
+        return reply
+    if reply.get("type") == wsproto.ERROR:
+        return f"Could not spawn: {reply.get('error')}"
+    short = reply.get("short")
+    label = reply.get("name") or short
+    return (
+        f"Spawned background session {short} ('{label}') in "
+        f"{reply.get('working_dir')}. It will register on the bus once its relay "
+        "connects; check list_agents shortly."
     )
 
 

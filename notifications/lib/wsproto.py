@@ -53,6 +53,8 @@ LIST_SUBSCRIPTIONS = "list_subscriptions"  # {req_id, session_id}
 # receipts + reactions (Phase C) — relay -> daemon
 REACT = "react"  # {req_id, session_id, target, reaction}
 MESSAGE_STATUS = "message_status"  # {req_id, session_id, target}
+# local agent spawn (docs/specs/2026-07-21-local-agent-spawn.md) — relay -> daemon
+SPAWN_AGENT = "spawn_agent"  # {req_id, session_id, initial_message, working_dir, name?}
 
 # daemon -> relay
 # NOTIFY meta optionally carries message-gating fields when kind=="message":
@@ -82,6 +84,8 @@ SUBSCRIPTION_LIST = (
 # receipts + reactions (Phase C) — daemon -> relay (AGENT_OK acks a react, carrying
 # the reaction's own id; ERROR reports not-a-member / unknown message / invalid reaction).
 MESSAGE_STATUS_RESULT = "message_status_result"  # {req_id, delivered: [name...], pending: [name...], reactions: [{by, reaction}]}
+# local agent spawn — daemon -> relay (ERROR reports disabled/bad-cwd/at-cap/cooldown/launch failure)
+SPAWN_RESULT = "spawn_result"  # {req_id, short, working_dir, name?}
 ERROR = "error"  # {req_id, error}
 
 

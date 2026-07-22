@@ -30,6 +30,10 @@ Config (env):  NOTIFICATIONS_WS_HOST (default 127.0.0.1)
                NOTIFICATIONS_CHANNEL_TTL_SECONDS (default 86400)
                NOTIFICATIONS_CHANNEL_HISTORY (default 20)
                GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com)
+               NOTIFICATIONS_SPAWN_ENABLED (default off; local deployments only)
+               NOTIFICATIONS_SPAWN_ROOTS (colon-separated cwd allowlist; required)
+               NOTIFICATIONS_SPAWN_MAX_ACTIVE (default 4)
+               NOTIFICATIONS_SPAWN_COOLDOWN_SECONDS (default 30)
 """
 
 # /// script
@@ -56,6 +60,7 @@ from websockets.exceptions import ConnectionClosed
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import agent_registry  # noqa: E402
+import agent_spawn  # noqa: E402
 import forgejo_client  # noqa: E402
 import github_client  # noqa: E402
 import messaging  # noqa: E402
@@ -366,6 +371,12 @@ def _build_forgejo_instances(env: dict[str, str], default_url: str) -> dict:
 # Computed once at startup; relays compute the same value from NOTIFICATIONS_DATA_DIR.
 TOKEN = ""
 
+# Local agent spawn (docs/specs/2026-07-21-local-agent-spawn.md). Config resolved
+# once at startup; SPAWN_STATE persists spawned shorts + cooldown across restarts
+# and exists only when spawn is enabled.
+SPAWN_CONFIG: agent_spawn.SpawnConfig | None = None
+SPAWN_STATE: agent_spawn.SpawnState | None = None
+
 
 def _session_live(session_id: str) -> bool:
     """Liveness predicate the registry uses for name-reclaim decisions."""
@@ -669,6 +680,9 @@ async def _handle(websocket) -> None:
 
             elif kind == wsproto.MESSAGE_STATUS:
                 await _handle_message_status(websocket, conn, msg)
+
+            elif kind == wsproto.SPAWN_AGENT:
+                await _handle_spawn_agent(websocket, conn, msg)
 
             else:
                 # No silent drops: an unknown type means a newer relay is speaking a verb
@@ -1628,6 +1642,119 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
     )
 
 
+async def _handle_spawn_agent(websocket, conn: Connection, msg: dict) -> None:
+    """Launch a new local background agent session (docs/specs/2026-07-21).
+
+    Spawn is the daemon's highest-privilege verb — a bus message becomes process
+    creation on this host — so every attempt (refused or not) lands in the audit
+    log and every success is announced in #system. The caller must be a registered
+    agent so the audit trail carries a name, not just a session id.
+    """
+    session_id, record = await _resolve_sender(websocket, conn, msg)
+    if session_id is None or record is None:
+        return
+    config, state = SPAWN_CONFIG, SPAWN_STATE
+    if config is None or not config.enabled or state is None:
+        reason = (
+            config.disabled_reason if config is not None else None
+        ) or "spawn is not available on this daemon"
+        await _send(websocket, wsproto.ERROR, msg, error=reason)
+        return
+
+    initial_message = str(msg.get("initial_message") or "").strip()
+    working_dir_raw = str(msg.get("working_dir") or "")
+    name = str(msg.get("name") or "").strip() or None
+    now = time.time()
+
+    def _audit(outcome: str, short: str | None = None) -> None:
+        agent_spawn.append_audit(
+            _data_dir() / "spawn" / "audit.jsonl",
+            agent_spawn.audit_record(
+                requester_session=session_id,
+                requester_name=record.name,
+                working_dir=working_dir_raw,
+                name=name,
+                outcome=outcome,
+                short=short,
+                now=now,
+            ),
+        )
+
+    try:
+        if not initial_message:
+            raise agent_spawn.SpawnError("initial_message is required")
+        working_dir = agent_spawn.validate_working_dir(config, working_dir_raw)
+        live = await agent_spawn.list_live_shorts(config)
+        agent_spawn.check_gates(config, state, live, now)
+    except agent_spawn.SpawnError as exc:
+        _audit(f"refused: {exc}")
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+
+    # Cooldown starts at the attempt, not the success, so a failing launch
+    # cannot be retried at full speed.
+    state.touch(now)
+    for problem in await agent_spawn.prewarm(config):
+        print(f"notifications daemon: spawn: {problem}", file=sys.stderr)
+    child_env = agent_spawn.build_child_env(
+        os.environ, ws_url=wsproto.uri(), token=TOKEN, name=name
+    )
+    try:
+        short, _ = await agent_spawn.dispatch(
+            config,
+            initial_message=initial_message,
+            working_dir=working_dir,
+            name=name,
+            child_env=child_env,
+        )
+    except agent_spawn.SpawnError as exc:
+        _audit(f"failed: {exc}")
+        await _send(websocket, wsproto.ERROR, msg, error=str(exc))
+        return
+
+    state.record(
+        {
+            "short": short,
+            "name": name,
+            "working_dir": str(working_dir),
+            "requested_by": record.name,
+            "at": now,
+        },
+        now,
+    )
+    _audit("spawned", short)
+    await _announce_spawn(record.name, name, short, str(working_dir))
+    await _send(
+        websocket,
+        wsproto.SPAWN_RESULT,
+        msg,
+        short=short,
+        working_dir=str(working_dir),
+        name=name,
+    )
+
+
+async def _announce_spawn(
+    requester: str, name: str | None, short: str, working_dir: str
+) -> None:
+    """No silent spawns: an ambient #system post makes every launch fleet-visible,
+    the same surface succession events use."""
+    topic = _get_or_create_topic("chan:system", "channel")
+    label = f"'{name}' ({short})" if name else short
+    message = topic.post(
+        "system",
+        now=time.time(),
+        body=f"⚡ spawn: {requester} launched {label} in {working_dir}",
+        intent="fyi",
+        severity="low",
+        ordinal=_alloc_ordinal(),
+    )
+    # Not _persist_post: "system" is an author, not a member (see succession).
+    message_topic.append_messages(_data_dir(), topic, [message])
+    message_topic.save_state(_data_dir(), topic)
+    _wake_topic_members(topic)
+
+
 def _reap_idle_topics(now: float) -> list[str]:
     """Delete message topics that have been both memberless and silent past the TTL,
     dropping them from TOPICS and from disk. Returns the keys removed."""
@@ -1868,8 +1995,16 @@ class _ProbeHandshakeFilter(logging.Filter):
 
 
 async def main() -> None:
-    global GH, FJ, FJ_INSTANCES, TOKEN
+    global GH, FJ, FJ_INSTANCES, TOKEN, SPAWN_CONFIG, SPAWN_STATE
     TOKEN = wsproto.token()  # auto-creates <NOTIFICATIONS_DATA_DIR>/token if needed
+    SPAWN_CONFIG = agent_spawn.load_config(os.environ)
+    if SPAWN_CONFIG.enabled:
+        SPAWN_STATE = agent_spawn.SpawnState(_data_dir() / "spawn" / "spawned.json")
+        roots = ":".join(str(root) for root in SPAWN_CONFIG.roots)
+        print(
+            f"notifications daemon: local agent spawn enabled (roots: {roots})",
+            file=sys.stderr,
+        )
     GH = github_client.GitHubClient()
     # Forgejo is optional: only served when an instance URL is configured. A daemon
     # without it rejects forgejo_* subscriptions (and skips any forgejo trackers on

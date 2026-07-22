@@ -198,17 +198,13 @@ error; it never edits the operator's config file itself.
 **MAX_ACTIVE accounting (no watcher needed):** job dirs are NOT a liveness signal —
 `~/.claude/jobs/` accumulates history (dozens of `state: done` dirs persist after
 their sessions end, and `state.json` is session-self-reported, so a crashed worker
-can leave a stale non-done state). The authoritative live-worker registry is the
-harness supervisor's roster, `~/.claude/daemon/roster.json`: `workers` keyed by
-short-id, each with `pid` + `procStart` (the /proc start-time, so pid reuse can't
-fake liveness), plus the supervisor's own `supervisorPid`/`supervisorProcStart` in
-the header to detect a stale roster left by a dead harness daemon. "Active" =
-(shorts the daemon recorded spawning, in `spawned.json`) ∩ (roster workers whose
-pid/procStart check out, excluding `source: "spare"` entries), counted 0 if the
-supervisor itself is gone. Evaluated lazily at spawn time — no background task —
-and only daemon-spawned jobs count against the cap, not the operator's own
-sessions. The roster is an internal harness file; verify its shape against the
-running harness version at implementation.
+can leave a stale non-done state). Live sessions come from `claude agents --json`,
+the harness's supported scripting surface (it reports each active session's short
+id, pid, name, and status; internally it reads the supervisor's roster, but the CLI
+is the stable contract). "Active" = (shorts the daemon recorded spawning, in
+`spawned.json`) ∩ (ids reported live). Spares and the operator's own sessions never
+count against the cap — only recorded spawns can intersect. Evaluated lazily at
+spawn time; no background task.
 
 ## Open questions
 

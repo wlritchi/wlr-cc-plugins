@@ -39,6 +39,7 @@ EXPECTED_TOOLS = [
     "set_availability",
     "set_channel_topic",
     "set_threshold",
+    "spawn_agent",
     "subscribe_forgejo_pr",
     "subscribe_github_pr",
     "unregister_agent",
