@@ -5,7 +5,8 @@ Exponential backoff: base 4 minutes 30 seconds, doubling after every 2
 consecutive no-update polls, capped at 8 hours. The base sits just under the
 5-minute prompt-cache TTL of a subscribed agent: while a PR is active, one
 extra wake with a warm cache is cheaper than a wake just after the cache goes
-cold. During business hours the interval is capped
+cold. To keep that guarantee, polls that have not backed off yet are capped at
+the TTL after jitter (jitter can only shorten them, never push them past it). During business hours the interval is capped
 to 1 hour instead. Business hours are 8am ET through 8pm PT, Monday-Friday;
 since US Pacific is always 3 hours behind US Eastern, 8pm PT == 11pm ET, so the
 window is exactly 08:00-23:00 in America/New_York (DST-safe). Outside business
@@ -21,6 +22,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 BASE_INTERVAL_SECONDS = 4 * 60 + 30
+CACHE_TTL_CAP_SECONDS = 5 * 60  # prompt-cache TTL; hard ceiling for un-backed-off polls
 MAX_INTERVAL_SECONDS = 8 * 60 * 60
 BUSINESS_CAP_SECONDS = 60 * 60
 JITTER = 0.15  # +/- 15%
@@ -68,7 +70,10 @@ def compute_next_poll(
 ) -> datetime:
     """Absolute (tz-aware) time of the next poll. `now` must be tz-aware."""
     r = rng if rng is not None else _DEFAULT_RNG
-    interval = _jitter(base_interval_seconds(consecutive_no_update), r)
+    base = base_interval_seconds(consecutive_no_update)
+    interval = _jitter(base, r)
+    if base <= BASE_INTERVAL_SECONDS:
+        interval = min(interval, CACHE_TTL_CAP_SECONDS)
     nxt = now + timedelta(seconds=interval)
     if in_business_hours(now):
         nxt = min(nxt, now + timedelta(seconds=_jitter(BUSINESS_CAP_SECONDS, r)))

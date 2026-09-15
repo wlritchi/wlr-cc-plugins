@@ -82,6 +82,20 @@ class TestSchedule:
         assert ps.base_interval_seconds(4) == 1080
         assert ps.base_interval_seconds(100) == 8 * 3600
 
+    def test_cache_ttl_cap_before_backoff(self):
+        rng = random.Random(5)
+        now = _utc(2026, 6, 25, 14)
+        for no_update in (0, 1):
+            for _ in range(200):
+                gap = (ps.compute_next_poll(now, no_update, rng) - now).total_seconds()
+                assert gap <= 300
+        # Once backoff kicks in, the cap no longer applies.
+        gaps = [
+            (ps.compute_next_poll(now, 2, rng) - now).total_seconds()
+            for _ in range(200)
+        ]
+        assert max(gaps) > 300
+
     def test_business_hours_cap(self):
         rng = random.Random(1)
         now = _utc(2026, 6, 25, 14)  # in business hours
