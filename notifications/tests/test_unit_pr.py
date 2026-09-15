@@ -76,10 +76,10 @@ class TestSchedule:
         assert ps.in_business_hours(_utc(2026, 1, 15, 15))  # Thu 10:00 EST (winter)
 
     def test_backoff_doubling(self):
-        assert ps.base_interval_seconds(0) == 300
-        assert ps.base_interval_seconds(1) == 300
-        assert ps.base_interval_seconds(2) == 600
-        assert ps.base_interval_seconds(4) == 1200
+        assert ps.base_interval_seconds(0) == 270
+        assert ps.base_interval_seconds(1) == 270
+        assert ps.base_interval_seconds(2) == 540
+        assert ps.base_interval_seconds(4) == 1080
         assert ps.base_interval_seconds(100) == 8 * 3600
 
     def test_business_hours_cap(self):
