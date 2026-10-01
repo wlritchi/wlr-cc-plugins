@@ -13,7 +13,7 @@ hits the network at test time (a local fake GitHub GraphQL server is used).
 
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pytest>=8", "mcp", "anyio", "websockets", "httpx", "tzdata"]
+# dependencies = ["pytest>=8", "mcp>=1,<2", "anyio", "websockets", "httpx", "tzdata"]
 # ///
 
 import sys
