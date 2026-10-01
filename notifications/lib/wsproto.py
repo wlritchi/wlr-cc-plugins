@@ -36,6 +36,12 @@ UNSUBSCRIBE_FORGEJO_PR = (
     "unsubscribe_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
 )
 LIST_FORGEJO_PR_SUBSCRIPTIONS = "list_forgejo_pr_subscriptions"  # {req_id, session_id}
+# On-demand poll of a tracked PR (any session may ask; results reach subscribers as
+# normal PR events). The backoff level is untouched unless the poll finds activity.
+REFRESH_PR = "refresh_pr"  # {req_id, session_id, owner, repo, number}
+REFRESH_FORGEJO_PR = (
+    "refresh_forgejo_pr"  # {req_id, session_id, owner, repo, number, instance?}
+)
 # agent directory (Phase A)
 REGISTER_AGENT = "register_agent"  # {req_id, session_id, name, description?, capabilities?, working_dir?, default_threshold?, reclaim_key?}
 UNREGISTER_AGENT = "unregister_agent"  # {req_id, session_id}
@@ -67,6 +73,9 @@ UNSUBSCRIBED = "unsubscribed"  # {req_id, pr, instance?}
 SUBSCRIPTIONS_RESULT = (
     "subscriptions_result"  # {req_id, items:[{pr, instance?, merged, pending}]}
 )
+# polled=false carries `reason` (no connected subscribers / closed / rate limited);
+# ERROR reports an unknown (never subscribed or already reaped) PR.
+PR_REFRESHED = "pr_refreshed"  # {req_id, pr, instance?, polled, reason?, subscribers}
 AGENT_OK = "agent_ok"  # {req_id, agent}          resulting record dict (or null/{name} for unregister)
 AGENT_LIST = "agent_list"  # {req_id, agents}      [record-dict + "connected": bool]
 # agent messaging (Phase B) — daemon -> relay (AGENT_OK acks leave/set_threshold/

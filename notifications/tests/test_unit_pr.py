@@ -1402,3 +1402,154 @@ class TestCheckSummary:
             len([e for e in events if e["type"] == "pr_check"]) == 6
         )  # all individual
         assert "pr_checks_summary" not in [e["type"] for e in events]
+
+
+# --------------------------------------------------------------------------- #
+# daemon-level: on-demand refresh (poll now, backoff untouched unless activity)
+# --------------------------------------------------------------------------- #
+
+
+class _StubClient:
+    def __init__(self, throttle_until: float | None = None) -> None:
+        self.throttle_until = throttle_until
+
+    def should_throttle(self) -> float | None:
+        return self.throttle_until
+
+
+def _refresh_msg(number: int = 1) -> dict:
+    return {"req_id": "r", "owner": "o", "repo": "r", "number": number}
+
+
+def _event(identity: str) -> dict:
+    return pm.synthetic_event("pr_comment", "normal", "hi", "o/r#1", identity)
+
+
+class TestRefresh:
+    @pytest.fixture
+    def tracked(self, daemon, tmp_path, monkeypatch):
+        """A connected subscriber + a backed-off tracker whose loop is running, with a
+        stubbed poll_once. Returns (tracker, conn, ws, polls, calls, gate): `polls`
+        is the queued stub return values (the last one repeats), `calls` records the
+        time of each poll_once call, and `gate` is an asyncio.Event poll_once awaits
+        before returning (cleared to hold a poll in flight)."""
+        monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
+        sid = "sidA"
+        tracker = pm.PRTracker("o", "r", 1, _StubClient())
+        tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
+        tracker.subscribers.add(sid)
+        tracker.acked[sid] = set()
+        tracker.consecutive_no_update = 4
+        tracker.next_poll_at = time.time() + 3600  # deep in its backoff
+        polls: list = []
+        calls: list[float] = []
+        gate = asyncio.Event()
+        gate.set()
+
+        async def poll_once() -> list[dict]:
+            calls.append(time.time())
+            await gate.wait()
+            return polls.pop(0) if len(polls) > 1 else (polls[0] if polls else [])
+
+        tracker.poll_once = poll_once
+        ws = _FakeWS()
+        conn = daemon.Connection(ws)
+        conn.session_id = sid
+        monkeypatch.setitem(daemon.TRACKERS, tracker.storage_key, tracker)
+        monkeypatch.setitem(daemon.CONNECTIONS, sid, conn)
+        return tracker, conn, ws, polls, calls, gate
+
+    async def _run(self, daemon, tracker, body):
+        task = asyncio.create_task(daemon._tracker_loop(tracker))
+        try:
+            await body()
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    def test_refresh_polls_now_and_keeps_backoff_when_idle(self, daemon, tracked):
+        tracker, conn, ws, polls, calls, _ = tracked
+        polls.append([])  # nothing new
+
+        async def body():
+            await asyncio.sleep(0.1)
+            assert calls == []  # the scheduled poll is an hour away
+            await daemon._handle_refresh(ws, conn, _refresh_msg())
+            reply = ws.sent[-1]
+            assert reply["type"] == "pr_refreshed" and reply["polled"] is True
+            assert reply["subscribers"] == 1 and reply["pr"] == "o/r#1"
+            await asyncio.sleep(0.2)
+            assert len(calls) == 1
+
+        anyio.run(lambda: self._run(daemon, tracker, body))
+        assert tracker.consecutive_no_update == 4  # idle refresh: level unchanged
+        assert tracker.refresh_pending is False
+        # rescheduled on the SAME backoff level (18 min base, jittered), not "now"
+        assert tracker.next_poll_at > time.time() + 600
+
+    def test_refresh_that_finds_activity_resets_backoff(self, daemon, tracked):
+        tracker, conn, ws, polls, calls, _ = tracked
+        polls.append([_event("c:1")])
+
+        async def body():
+            await daemon._handle_refresh(ws, conn, _refresh_msg())
+            await asyncio.sleep(0.2)
+            assert len(calls) == 1
+
+        anyio.run(lambda: self._run(daemon, tracker, body))
+        assert tracker.consecutive_no_update == 0
+        assert len(tracker.events) == 1
+
+    def test_refresh_during_inflight_poll_polls_again(self, daemon, tracked):
+        tracker, conn, ws, polls, calls, gate = tracked
+        polls.append([])
+        tracker.next_poll_at = time.time()  # a scheduled poll is due right now
+        gate.clear()  # ...and it will hang in fetch until released
+
+        async def body():
+            await asyncio.sleep(0.1)
+            assert len(calls) == 1  # the scheduled poll is in flight
+            await daemon._handle_refresh(ws, conn, _refresh_msg())
+            assert ws.sent[-1]["polled"] is True
+            gate.set()  # the in-flight fetch returns; it predates the refresh
+            await asyncio.sleep(0.3)
+            assert len(calls) == 2  # so the loop polled again at once
+
+        anyio.run(lambda: self._run(daemon, tracker, body))
+        # the scheduled (unforced) idle poll counted; the forced one did not
+        assert tracker.consecutive_no_update == 5
+        assert tracker.refresh_pending is False
+
+    def test_refresh_refusals(self, daemon, tracked):
+        tracker, conn, ws, _, calls, _ = tracked
+
+        async def body():
+            await daemon._handle_refresh(ws, conn, _refresh_msg(number=9))
+            assert (
+                ws.sent[-1]["type"] == "error" and "not tracked" in ws.sent[-1]["error"]
+            )
+
+            tracker.client.throttle_until = time.time() + 900
+            await daemon._handle_refresh(ws, conn, _refresh_msg())
+            assert ws.sent[-1]["polled"] is False
+            assert ws.sent[-1]["reason"].startswith("rate limited until ")
+            tracker.client.throttle_until = None
+
+            del daemon.CONNECTIONS["sidA"]
+            await daemon._handle_refresh(ws, conn, _refresh_msg())
+            assert ws.sent[-1]["polled"] is False
+            assert ws.sent[-1]["reason"] == "no connected subscribers"
+            daemon.CONNECTIONS["sidA"] = conn
+
+            tracker.terminal, tracker.merged = True, True
+            await daemon._handle_refresh(ws, conn, _refresh_msg())
+            assert ws.sent[-1]["polled"] is False and ws.sent[-1]["reason"] == "merged"
+
+            await asyncio.sleep(0.1)
+            assert calls == []  # none of the refusals triggered a poll
+
+        anyio.run(lambda: self._run(daemon, tracker, body))
+        assert tracker.consecutive_no_update == 4

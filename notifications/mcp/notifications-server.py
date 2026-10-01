@@ -854,6 +854,86 @@ async def list_github_pr_subscriptions() -> str:
     return "\n".join(lines)
 
 
+_REFRESH_UNSUPPORTED_MESSAGE = (
+    "This daemon build doesn't support on-demand PR refresh yet. The daemon is "
+    "deployed independently of relays (daemon-first); if it was just updated, retry "
+    "shortly, otherwise the running daemon predates this feature. The next scheduled "
+    "poll will still pick up any activity."
+)
+
+
+async def _daemon_request_or_unsupported(payload: dict, unsupported: str) -> dict | str:
+    """_daemon_request, but a request timeout OR an 'unknown message type' ERROR becomes
+    `unsupported`: an older daemon either drops a verb it doesn't know (so the request
+    times out) or replies ERROR (daemons with the terminal-else dispatch branch)."""
+    if not await DAEMON.wait_connected():
+        return _daemon_unreachable_message()
+    try:
+        reply = await DAEMON.request(payload)
+    except TimeoutError:
+        return unsupported
+    except ConnectionError:
+        return _daemon_unreachable_message()
+    if reply.get("type") == wsproto.ERROR and "unknown message type" in str(
+        reply.get("error") or ""
+    ):
+        return unsupported
+    return reply
+
+
+def _refresh_outcome(reply: dict, display: str) -> str:
+    """Render a PR_REFRESHED reply for the agent."""
+    if reply.get("type") == wsproto.ERROR:
+        return (
+            f"Could not refresh {display}: {reply.get('error')}. Only a PR some session "
+            "is subscribed to can be refreshed."
+        )
+    count = reply.get("subscribers", 0)
+    if not reply.get("polled"):
+        return (
+            f"Did not poll {display} ({reply.get('reason')}); it has {count} "
+            "subscriber(s). Its scheduled polling is unchanged."
+        )
+    return (
+        f"Polling {display} now. New activity reaches its {count} subscriber(s) as "
+        "normal PR notifications; the backoff schedule is unchanged unless the poll "
+        "finds activity."
+    )
+
+
+@mcp.tool()
+async def refresh_github_pr(pr: str) -> str:
+    """Poll a subscribed GitHub PR right now instead of waiting for its scheduled poll.
+
+    Use this when you learn out-of-band that something happened on the PR (a review
+    landed, CI finished, a comment was posted) and want the update without waiting out
+    the backoff. Any session may refresh any tracked PR, so an agent can nudge another
+    agent's PR watcher; the results are delivered to that PR's subscribers as the usual
+    PR notifications, not returned here. A refresh that finds nothing new does not
+    deepen the backoff; one that finds activity resets it, as a scheduled poll would.
+    """
+    match = _PR_REF_RE.match(pr or "")
+    if not match:
+        return "Invalid PR reference. Use org/repo#number, e.g. octocat/hello-world#42."
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot refresh: this relay does not yet know its session id."
+    owner, repo, number = match.group(1), match.group(2), int(match.group(3))
+    reply = await _daemon_request_or_unsupported(
+        {
+            "type": wsproto.REFRESH_PR,
+            "session_id": session_id,
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+        },
+        _REFRESH_UNSUPPORTED_MESSAGE,
+    )
+    if isinstance(reply, str):
+        return reply
+    return _refresh_outcome(reply, f"{owner}/{repo}#{number}")
+
+
 # --------------------------------------------------------------------------- #
 # Forgejo/Gitea PR subscription tools (a parallel REST poller in the daemon)
 # --------------------------------------------------------------------------- #
@@ -925,25 +1005,10 @@ def _forgejo_ref_display(
 
 
 async def _forgejo_daemon_request(payload: dict) -> dict | str:
-    """Like _daemon_request, but degrades a request timeout OR an 'unknown message type'
-    ERROR to a clear 'daemon doesn't support Forgejo yet' message. An older daemon
-    silently drops a verb it doesn't know (its dispatch has no branch for it), so the
-    relay's request times out; a daemon new enough to have the terminal-else replies
-    ERROR. Either way the caller gets a clear message instead of a hang or a generic
+    """_daemon_request_or_unsupported with the 'daemon doesn't support Forgejo yet'
+    message, so a pre-Forgejo daemon fails loudly instead of hanging or reading as
     'unreachable'."""
-    if not await DAEMON.wait_connected():
-        return _daemon_unreachable_message()
-    try:
-        reply = await DAEMON.request(payload)
-    except TimeoutError:
-        return _FORGEJO_UNSUPPORTED_MESSAGE
-    except ConnectionError:
-        return _daemon_unreachable_message()
-    if reply.get("type") == wsproto.ERROR and "unknown message type" in str(
-        reply.get("error") or ""
-    ):
-        return _FORGEJO_UNSUPPORTED_MESSAGE
-    return reply
+    return await _daemon_request_or_unsupported(payload, _FORGEJO_UNSUPPORTED_MESSAGE)
 
 
 def _forgejo_reply_pr(
@@ -1120,6 +1185,37 @@ async def list_forgejo_pr_subscriptions() -> str:
         ref = f"{alias}:{item.get('pr')}" if alias else item.get("pr")
         lines.append(f"  {ref}{state}  pending={item.get('pending', 0)}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def refresh_forgejo_pr(pr: str) -> str:
+    """Poll a subscribed Forgejo/Gitea PR right now instead of waiting for its scheduled poll.
+
+    The Forgejo counterpart of refresh_github_pr: same semantics (any session may
+    refresh any tracked PR, results go to subscribers as normal PR notifications, the
+    backoff is untouched unless activity is found). Address a named instance with an
+    alias prefix (`external:owner/repo#N`); a bare ref targets the default instance.
+    """
+    parsed = _parse_forgejo_ref(pr)
+    if isinstance(parsed, str):
+        return parsed
+    instance, owner, repo, number = parsed
+    session_id, _ = session_state.effective_session_id()
+    if not session_id:
+        return "Cannot refresh: this relay does not yet know its session id."
+    payload: dict = {
+        "type": wsproto.REFRESH_FORGEJO_PR,
+        "session_id": session_id,
+        "owner": owner,
+        "repo": repo,
+        "number": number,
+    }
+    if instance:
+        payload["instance"] = instance
+    reply = await _daemon_request_or_unsupported(payload, _REFRESH_UNSUPPORTED_MESSAGE)
+    if isinstance(reply, str):
+        return reply
+    return _refresh_outcome(reply, _forgejo_ref_display(instance, owner, repo, number))
 
 
 # --------------------------------------------------------------------------- #

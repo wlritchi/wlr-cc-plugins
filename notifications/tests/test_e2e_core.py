@@ -34,6 +34,8 @@ EXPECTED_TOOLS = [
     "message_status",
     "post",
     "react",
+    "refresh_forgejo_pr",
+    "refresh_github_pr",
     "register_agent",
     "schedule_test_notification",
     "set_availability",

@@ -25,7 +25,11 @@ It provides two capabilities:
   honoured (it throttles as the budget runs low) and failures are classified
   (auth / not-found / rate-limited / transient) so recovery is tailored to each.
   Polling backs off (4.5 min, doubling after every 2 idle polls, up to 8 h) but is
-  capped to ~1 h during business hours (8am ET–8pm PT, Mon–Fri). Events have
+  capped to ~1 h during business hours (8am ET–8pm PT, Mon–Fri).
+  `refresh_github_pr(org/repo#number)` polls a tracked PR at once (any session may
+  ask, e.g. to tell another agent's watcher that something just happened); the
+  results reach subscribers as normal events, and a refresh that finds nothing does
+  not deepen the backoff. Events have
   content-addressed ids and each subscriber tracks the ids it has acked; new
   subscribers join without replay; polling suspends when no subscribed session is
   connected; a merged PR auto-unsubscribes everyone. When the last subscriber

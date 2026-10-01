@@ -987,6 +987,10 @@ class PRTracker:
         # quick re-subscribe reuses the cached snapshot instead of re-baselining.
         self.idle_since: float | None = None
         self.auth_notified = False  # the one-time auth-failure event was emitted
+        # Set by an agent's refresh request. The poll loop polls at once and does not
+        # count a no-update result against the backoff: an on-demand poll is not
+        # evidence that the PR is idle. Runtime-only, never persisted.
+        self.refresh_pending = False
         self.task = None
         self.wake = asyncio.Event()
 

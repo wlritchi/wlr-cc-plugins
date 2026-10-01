@@ -509,3 +509,60 @@ def test_pr_one_session_multiple_trackers(tmp_path):
                 assert KEY in text and key2 in text
 
         anyio.run(scenario)
+
+
+def test_refresh_polls_immediately_and_delivers(tmp_path):
+    """With the scheduled poll an hour away, refresh_github_pr makes the daemon poll
+    at once; the resulting event reaches the subscriber as a normal channel event."""
+    store, xdg = tmp_path / "store", tmp_path / "xdg"
+    store.mkdir()
+    xdg.mkdir()
+    ws = h.free_port()
+
+    with (
+        h.FakeGitHub(NUMBER, base_pr()) as gh,
+        h.daemon_process(
+            h.daemon_env(ws, store, graphql_url=gh.graphql_url, poll_seconds="3600")
+        ),
+    ):
+
+        async def scenario():
+            async with h.stdio_client(
+                h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-A"))
+            ) as (read_a, write_a):
+                await h.mcp_handshake(read_a, write_a)
+
+                text, _ = await h.mcp_call(
+                    read_a, write_a, 2, "refresh_github_pr", {"pr": KEY}
+                )
+                assert "Could not refresh" in text and "not tracked" in text
+
+                text, _ = await h.mcp_call(
+                    read_a, write_a, 3, "subscribe_github_pr", {"pr": KEY}
+                )
+                assert f"Subscribed to {KEY}" in text
+
+                gh.pr["comments"] = {
+                    "nodes": [
+                        {
+                            "id": "IC1",
+                            "author": {"login": "dave"},
+                            "body": "ping",
+                            "url": "https://gh/ic/1",
+                        }
+                    ]
+                }
+                # a different session may nudge the watcher
+                async with h.stdio_client(
+                    h.relay_params(h.push_relay_env(tmp_path, ws, store, xdg, "sid-B"))
+                ) as (read_b, write_b):
+                    await h.mcp_handshake(read_b, write_b)
+                    text, _ = await h.mcp_call(
+                        read_b, write_b, 2, "refresh_github_pr", {"pr": KEY}
+                    )
+                    assert f"Polling {KEY} now" in text and "1 subscriber" in text
+
+                event = await h.mcp_await_channel(read_a, timeout=10)
+                assert event is not None and "dave" in event.params["content"]
+
+        anyio.run(scenario)

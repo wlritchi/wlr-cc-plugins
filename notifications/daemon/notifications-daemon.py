@@ -639,6 +639,12 @@ async def _handle(websocket) -> None:
                     websocket, conn, msg, provider="forgejo"
                 )
 
+            elif kind == wsproto.REFRESH_PR:
+                await _handle_refresh(websocket, conn, msg)
+
+            elif kind == wsproto.REFRESH_FORGEJO_PR:
+                await _handle_refresh(websocket, conn, msg, provider="forgejo")
+
             elif kind == wsproto.REGISTER_AGENT:
                 await _handle_register_agent(websocket, conn, msg)
 
@@ -953,6 +959,47 @@ async def _handle_list_pr_subscriptions(
         if session_id in t.subscribers and t.provider == provider
     ]
     await _send(websocket, wsproto.SUBSCRIPTIONS_RESULT, msg, items=items)
+
+
+async def _handle_refresh(
+    websocket, conn: Connection, msg: dict, provider: str = "github"
+) -> None:
+    """Poll a tracked PR now instead of at its scheduled time. Any session may ask,
+    not only a subscriber: the use case is one agent telling another's PR watcher
+    that something just happened. Events still reach subscribers the normal way."""
+    skey = _msg_storage_key(msg, provider)
+    tracker = TRACKERS.get(skey)
+    key = _msg_key(msg)
+    if tracker is None:
+        await _send(websocket, wsproto.ERROR, msg, error=f"{key} is not tracked")
+        return
+    instance = _msg_instance(msg) if provider == "forgejo" else ""
+    inst = {"instance": instance} if instance else {}  # named-only echo, as elsewhere
+    reply: dict[str, object] = {
+        "pr": key,
+        "subscribers": len(tracker.subscribers),
+        **inst,
+    }
+    reason: str | None = None
+    if tracker.terminal:
+        reason = "merged" if tracker.merged else "closed or gone"
+    elif not any(s in CONNECTIONS for s in tracker.subscribers):
+        reason = "no connected subscribers"
+    else:
+        throttle_until = (
+            tracker.client.should_throttle() if tracker.client is not None else None
+        )
+        if throttle_until is not None:
+            reason = f"rate limited until {_iso(throttle_until)}"
+    if reason is not None:
+        await _send(
+            websocket, wsproto.PR_REFRESHED, msg, polled=False, reason=reason, **reply
+        )
+        return
+    tracker.refresh_pending = True
+    tracker.next_poll_at = time.time()
+    tracker.wake.set()
+    await _send(websocket, wsproto.PR_REFRESHED, msg, polled=True, **reply)
 
 
 # --------------------------------------------------------------------------- #
@@ -1866,14 +1913,16 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             await _wait_or_wake(tracker, due_in)
             continue
         delay: float | None = None
+        forced = tracker.refresh_pending
+        tracker.refresh_pending = False
         try:
             added = tracker.record(await tracker.poll_once())
             pr_monitor.append_events(tracker, added)
             if added:
                 _wake_subscribers(tracker)  # deliver new PR events immediately
-            tracker.consecutive_no_update = (
-                0 if added else tracker.consecutive_no_update + 1
-            )
+                tracker.consecutive_no_update = 0
+            elif not forced:
+                tracker.consecutive_no_update += 1
         except pr_errors.PRNotFound as exc:
             _emit(
                 tracker,
@@ -1939,7 +1988,9 @@ async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
             tracker.consecutive_no_update += 1
 
         if delay is None:
-            delay = _poll_delay(tracker)
+            # A refresh that arrived while this poll was in flight may postdate the
+            # fetch, so poll again at once rather than trust the result just gathered.
+            delay = 0.0 if tracker.refresh_pending else _poll_delay(tracker)
             throttle_until = (
                 tracker.client.should_throttle() if tracker.client is not None else None
             )
