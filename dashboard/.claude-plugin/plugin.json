@@ -1,7 +1,7 @@
 {
   "name": "dashboard",
   "description": "A pane of open user-facing tasks and questions, kept by the model in .claude/local/dashboard.md",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "wlritchi"
   },
