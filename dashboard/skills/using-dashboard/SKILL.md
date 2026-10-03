@@ -1,12 +1,13 @@
 ---
 name: using-dashboard
-description: Use when you need something from the user that they may not handle right away - a decision, an answer, a credential, a login, a physical or out-of-band action, an approval - while you can keep working on other parts of the task; also use when a dashboard note arrives with a prompt, or when the user checks off or edits items in .claude/local/dashboard.md
+description: Use when you need something from the user that they may not handle right away - a decision, an answer, a credential, a login, a physical or out-of-band action, an approval - while you can keep working on other parts of the task; also use when a dashboard note arrives with a prompt, or when the user checks off or edits items in a .claude/local/dashboard.md file (the project's, or a git worktree's)
 ---
 
 # Using the Dashboard
 
 The dashboard is a markdown file at `.claude/local/dashboard.md`, relative to the
-session's project root. The `dashboard` plugin shows it to the user in a pane. The
+session's project root. A git worktree the session works in has a second one at
+the same path inside the worktree (see [Worktrees](#worktrees)). The `dashboard` plugin shows it to the user in a pane. The
 pane opens by itself when the file has unchecked items, and it closes when every
 item is checked. The user can toggle it with `/dashboard`, check off items in the
 pane, or edit the file in their editor. While the pane is closed, the prompt
@@ -80,9 +81,11 @@ Rules:
 ## Maintaining it
 
 1. **Make sure git ignores it.** Before you create the file, run
-   `git check-ignore -q .claude/local/dashboard.md`. If that fails, add
-   `.claude/local/` to `.git/info/exclude`. Do not change `.gitignore` unless the
-   user asks.
+   `git check-ignore -q .claude/local/dashboard.md` in the folder that holds
+   `.claude/` (the project, or the worktree). If that fails, add `.claude/local/`
+   to `"$(git rev-parse --git-common-dir)/info/exclude"`, which covers the main
+   checkout and all its worktrees. Do not change `.gitignore` unless the user
+   asks.
 2. **Edit it with the Edit and Write tools**, not with shell commands. The plugin
    records your tool edits as changes you know about. It reports other changes to
    you as changes by the user.
