@@ -65,7 +65,7 @@ test('a pane draws items and a press checks one off in the file', async ($, on) 
     origin: { kind: 'composer' },
     presentation: { isFullscreen: true, columns: 160 },
   })
-  expect(ran.text).toBe('Dashboard: 1 open item(s).')
+  expect(ran.text).toBe('Dashboard panel shown')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
       plugin: 'dashboard',
@@ -149,4 +149,39 @@ test('the status line shows the count only while the pane is not drawn', async (
   }
   await $.prompt.submit({ text: 'next', wait: false, origin })
   expect(state.status.at(-1)).toBeUndefined()
+})
+
+test('/dashboard toggles the pane', async ($, on) => {
+  const state = fake(on, { [PATH]: '- [ ] First\n' })
+  const run = async (): Promise<string | undefined> =>
+    (
+      await $.command.run({
+        command: 'dashboard',
+        args: '',
+        origin: { kind: 'composer' },
+        presentation: { isFullscreen: true, columns: 160 },
+      })
+    ).text
+
+  expect(await run()).toBe('Dashboard panel shown')
+  expect(state.panes.map(pane => pane.id)).toEqual(['dashboard'])
+  expect(await run()).toBe('Dashboard panel hidden')
+  expect(state.panes).toEqual([])
+  expect(state.status.at(-1)).toBe('1 open dashboard item (/dashboard to view)')
+  expect(await run()).toBe('Dashboard panel shown')
+  expect(state.status.at(-1)).toBeUndefined()
+})
+
+test('the command row draws without the plugin-name prefix', async ($, on) => {
+  fake(on, {})
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'dashboard',
+      surface,
+      component: 'CommandOutput',
+      props: { command: 'dashboard', args: '', text: 'dashboard: Dashboard panel shown', isErrored: false },
+    })
+    expect(await ui.find({ type: 'Text', text: 'Dashboard panel shown' })).toBeDefined()
+    await ui.unmount()
+  }
 })

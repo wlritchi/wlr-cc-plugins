@@ -52,7 +52,9 @@ const clip = (text: string): string =>
 // the file.
 let lastMtime: number | undefined
 let lastToast = ''
-let lastStatus: string | undefined
+// Null until the first call, so that the first call always clears a status
+// line that the module set before a reload.
+let lastStatus: string | undefined | null = null
 
 // The status line stands in for the pane only while the pane is not drawn.
 async function syncStatus($: EngineInterface, text: string | null): Promise<void> {
@@ -142,7 +144,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'dashboard',
-      description: 'Show the dashboard of tasks and questions that need you',
+      description: 'Show or hide the dashboard of tasks and questions that need you',
+      immediate: true,
     })
     void refresh($, true)
     $.clock.every(POLL_MS, () => void refresh($))
@@ -151,15 +154,31 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'dashboard' }, async $ => {
+    const isDrawn = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
+    if (isDrawn) {
+      await hide($)
+      await $.ui.close({ id: PANE })
+      await syncStatus($, (await read($, doc)).text)
+
+      return { text: 'Dashboard panel hidden' }
+    }
     await update($, dismissed, () => [])
     const text = await refresh($, true)
     await $.ui.open({ id: PANE, title: 'Dashboard' })
     await syncStatus($, text)
-    const open = openItems(text).length
 
-    return {
-      text: text === null ? `No dashboard file at ${RELATIVE_PATH}.` : `Dashboard: ${open} open item(s).`,
+    return { text: 'Dashboard panel shown' }
+  })
+
+  // Draws the command's reply as a plain row, as the built-in panel commands
+  // do, without the plugin-name prefix.
+  on('ui.render', { component: 'CommandOutput', props: { command: 'dashboard' } }, async ($, e, next) => {
+    if (e.props.isErrored) {
+      return next(e)
     }
+    const { Text } = $.ui.resolve(e)
+
+    return <Text dimColor>{e.props.text.replace(/^dashboard:\s*/, '')}</Text>
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {

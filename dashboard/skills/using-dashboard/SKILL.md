@@ -8,7 +8,7 @@ description: Use when you need something from the user that they may not handle 
 The dashboard is a markdown file at `.claude/local/dashboard.md`, relative to the
 session's project root. The `dashboard` plugin shows it to the user in a pane. The
 pane opens by itself when the file has unchecked items, and it closes when every
-item is checked. The user can check off items in the pane, or edit the file in
+item is checked. The user can toggle it with `/dashboard`, check off items in the pane, or edit the file in
 their editor.
 
 The file is the single record of what the user must do or decide. Keep it current,
