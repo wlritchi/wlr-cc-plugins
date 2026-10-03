@@ -52,12 +52,25 @@ const clip = (text: string): string =>
 // the file.
 let lastMtime: number | undefined
 let lastToast = ''
+let lastStatus: string | undefined
 
-// Shows or hides the pane and the status line for the new file text.
+// The status line stands in for the pane only while the pane is not drawn.
+async function syncStatus($: EngineInterface, text: string | null): Promise<void> {
+  const count = openItems(text).length
+  const isDrawn = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
+  const status =
+    count === 0 || isDrawn
+      ? undefined
+      : `${count} open dashboard item${count === 1 ? '' : 's'} (/dashboard to view)`
+  if (status !== lastStatus) {
+    lastStatus = status
+    $.ui.status(status)
+  }
+}
+
+// Shows or hides the pane for the new file text.
 async function sync($: EngineInterface, before: string | null, after: string | null): Promise<void> {
   const open = openItems(after)
-  $.ui.status(open.length > 0 ? `dashboard: ${open.length} open` : undefined)
-
   const isUp = (await $.ui.panes()).some(pane => pane.id === PANE)
   if (open.length === 0) {
     if (isUp && openItems(before).length > 0) {
@@ -92,6 +105,8 @@ async function refresh($: EngineInterface, isForced = false): Promise<string | n
   const current = await read($, doc)
   const mtime = (await $.fs.exists(path)) ? (await $.fs.stat(path)).mtimeMs : undefined
   if (!isForced && path === current.path && mtime === lastMtime) {
+    // The pane can be placed or closed without a file change.
+    await syncStatus($, current.text)
     return current.text
   }
   lastMtime = mtime
@@ -100,6 +115,7 @@ async function refresh($: EngineInterface, isForced = false): Promise<string | n
     await update($, doc, () => ({ path, text }))
   }
   await sync($, current.text, text)
+  await syncStatus($, text)
 
   return text
 }
@@ -138,6 +154,7 @@ export const register: Register = on => {
     await update($, dismissed, () => [])
     const text = await refresh($, true)
     await $.ui.open({ id: PANE, title: 'Dashboard' })
+    await syncStatus($, text)
     const open = openItems(text).length
 
     return {
@@ -149,8 +166,10 @@ export const register: Register = on => {
     if (e.origin.kind === 'person') {
       await hide($)
     }
+    const closed = await next(e)
+    await syncStatus($, (await read($, doc)).text)
 
-    return next(e)
+    return closed
   })
 
   // The model's own reads and writes of the file are what it has seen.

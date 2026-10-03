@@ -11,7 +11,7 @@ type Fake = {
 }
 
 // Answers the engine calls the plugin makes, from memory.
-function fake(on: On, files: Record<string, string>): Fake {
+function fake(on: On, files: Record<string, string>, isPlaced = true): Fake {
   const state: Fake = { files: new Map(Object.entries(files)), panes: [], status: [] }
   let tick = 0
   mock.clock(on)
@@ -29,9 +29,9 @@ function fake(on: On, files: Record<string, string>): Fake {
   on('ui.panes', () => ({ value: state.panes }))
   on('ui.open', ($, e) => {
     if (!state.panes.some(pane => pane.id === e.id)) {
-      state.panes.push({ id: e.id, title: e.title ?? e.id, isShown: true, isFocused: false, isPlaced: true })
+      state.panes.push({ id: e.id, title: e.title ?? e.id, isShown: true, isFocused: false, isPlaced })
     }
-    return { value: { isPlaced: true as const } }
+    return { value: isPlaced ? { isPlaced: true as const } : { isPlaced: false as const, reason: 'narrow' } }
   })
   on('ui.close', ($, e) => {
     state.panes = state.panes.filter(pane => pane.id !== e.id)
@@ -100,6 +100,7 @@ test('the first prompt carries open items; later prompts carry user changes', as
   const first = await $.prompt.submit({ text: 'hi', wait: false, origin })
   expect(first.context?.[0]).toContain('Approve the deploy')
   expect(state.panes.map(pane => pane.id)).toEqual(['dashboard'])
+  expect(state.status.at(-1)).toBeUndefined()
 
   const quiet = await $.prompt.submit({ text: 'next', wait: false, origin })
   expect(quiet.context).toBeUndefined()
@@ -133,4 +134,19 @@ test('a pane the person closed stays closed until a new item appears', async ($,
   state.files.set(PATH, '- [ ] First\n- [ ] Second\n')
   await $.prompt.submit({ text: 'again', wait: false, origin })
   expect(state.panes.map(pane => pane.id)).toEqual(['dashboard'])
+})
+
+test('the status line shows the count only while the pane is not drawn', async ($, on) => {
+  const state = fake(on, { [PATH]: '- [ ] First\n- [ ] Second\n' }, false)
+  const origin = { kind: 'composer' as const }
+
+  await $.prompt.submit({ text: 'hi', wait: false, origin })
+  expect(state.status.at(-1)).toBe('2 open dashboard items (/dashboard to view)')
+
+  const pane = state.panes[0]
+  if (pane !== undefined) {
+    pane.isPlaced = true
+  }
+  await $.prompt.submit({ text: 'next', wait: false, origin })
+  expect(state.status.at(-1)).toBeUndefined()
 })
