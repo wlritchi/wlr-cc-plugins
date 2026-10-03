@@ -133,3 +133,36 @@ export function describeChanges(before: string | null, after: string | null): st
 
   return changes
 }
+
+/** Resolves `.` and `..` segments of an absolute POSIX path. */
+export function normalize(path: string): string {
+  const parts: string[] = []
+  for (const part of path.split('/')) {
+    if (part === '..') {
+      parts.pop()
+    } else if (part !== '' && part !== '.') {
+      parts.push(part)
+    }
+  }
+
+  return `/${parts.join('/')}`
+}
+
+/**
+ * The main checkout's top folder for a linked worktree, from the text of the
+ * worktree's `.git` file. Undefined for any other `.git` file (a submodule).
+ */
+export function mainTopFromGitFile(top: string, gitFile: string): string | undefined {
+  const gitdir = /^gitdir:\s*(.+?)\s*$/m.exec(gitFile)?.[1]
+  if (gitdir === undefined) {
+    return undefined
+  }
+  const absolute = normalize(gitdir.startsWith('/') ? gitdir : `${top}/${gitdir}`)
+  const cut = absolute.lastIndexOf('/.git/worktrees/')
+
+  return cut < 0 ? undefined : absolute.slice(0, cut) || '/'
+}
+
+/** True when `path` is `dir` or is inside it. */
+export const isInside = (path: string, dir: string): boolean =>
+  path === dir || path.startsWith(dir.endsWith('/') ? dir : `${dir}/`)

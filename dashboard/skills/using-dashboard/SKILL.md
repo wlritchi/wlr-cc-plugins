@@ -8,11 +8,25 @@ description: Use when you need something from the user that they may not handle 
 The dashboard is a markdown file at `.claude/local/dashboard.md`, relative to the
 session's project root. The `dashboard` plugin shows it to the user in a pane. The
 pane opens by itself when the file has unchecked items, and it closes when every
-item is checked. The user can toggle it with `/dashboard`, check off items in the pane, or edit the file in
-their editor.
+item is checked. The user can toggle it with `/dashboard`, check off items in the
+pane, or edit the file in their editor. While the pane is closed, the prompt
+footer shows the count of open items.
 
 The file is the single record of what the user must do or decide. Keep it current,
 and let the pane remind the user, so that your replies do not have to.
+
+## Worktrees
+
+While the session works in a linked git worktree, that worktree has its own
+dashboard at `<worktree>/.claude/local/dashboard.md`. The pane shows the project's
+dashboard first and the worktree's below it. The plugin remembers the session's
+worktree across a restart of Claude Code.
+
+- Put items about the worktree's work (its branch, its review, its merge) in the
+  worktree's dashboard.
+- Put items that apply to the whole project in the project's dashboard.
+- When you finish with a worktree, resolve or move its open items before you
+  remove the worktree. Its dashboard goes away with it.
 
 ## What goes on it
 

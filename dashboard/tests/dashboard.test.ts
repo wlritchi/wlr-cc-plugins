@@ -1,6 +1,14 @@
 import { expect, test } from 'claude-code/testing'
 
-import { describeChanges, itemKey, openItems, parse, toggle } from '../hooks/dashboard'
+import {
+  describeChanges,
+  isInside,
+  itemKey,
+  mainTopFromGitFile,
+  openItems,
+  parse,
+  toggle,
+} from '../hooks/dashboard'
 
 const SAMPLE = [
   '# Dashboard',
@@ -57,4 +65,17 @@ test('describeChanges names checked, added, removed and prose changes', () => {
   ])
   expect(describeChanges(SAMPLE, SAMPLE)).toEqual([])
   expect(describeChanges(SAMPLE, null)).toEqual(['The dashboard file was deleted.'])
+})
+
+test('mainTopFromGitFile finds the main checkout of a linked worktree', () => {
+  expect(mainTopFromGitFile('/repo/.claude/worktrees/wt', 'gitdir: /repo/.git/worktrees/wt\n')).toBe('/repo')
+  expect(mainTopFromGitFile('/repo/.claude/worktrees/wt', 'gitdir: ../../../.git/worktrees/wt')).toBe('/repo')
+  expect(mainTopFromGitFile('/repo/sub', 'gitdir: ../.git/modules/sub')).toBeUndefined()
+  expect(mainTopFromGitFile('/repo/sub', 'not a git file')).toBeUndefined()
+})
+
+test('isInside matches whole path segments', () => {
+  expect(isInside('/repo/a', '/repo')).toBe(true)
+  expect(isInside('/repo', '/repo')).toBe(true)
+  expect(isInside('/repository', '/repo')).toBe(false)
 })
