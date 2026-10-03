@@ -152,6 +152,7 @@ test('a pane the person closed stays closed until a new item appears', async ($,
   await ui.press({ key: 'hide' })
   await ui.unmount()
   expect(state.panes).toEqual([])
+  expect(await bandText($)).toBe('1 open dashboard item')
   await $.prompt.submit({ text: 'next', wait: false, origin })
   expect(state.panes).toEqual([])
 

@@ -143,6 +143,13 @@ async function hide($: EngineInterface): Promise<void> {
   await update($, dismissed, () => openItems(text).map(itemKey))
 }
 
+// Closes the pane and shows the reminder at once, without the next poll.
+async function hidePane($: EngineInterface): Promise<void> {
+  await hide($)
+  await $.ui.close({ id: PANE })
+  await syncReminder($, (await read($, doc)).text)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -159,9 +166,7 @@ export const register: Register = on => {
   on('command.run', { command: 'dashboard' }, async $ => {
     const isDrawn = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
     if (isDrawn) {
-      await hide($)
-      await $.ui.close({ id: PANE })
-      await syncReminder($, (await read($, doc)).text)
+      await hidePane($)
 
       return { text: 'Dashboard panel hidden' }
     }
@@ -329,16 +334,7 @@ export const register: Register = on => {
           <Text key="footer" dimColor>
             {open} open · {RELATIVE_PATH}
           </Text>
-          <Button
-            key="hide"
-            role="dismiss"
-            dimColor
-            label="Hide"
-            onPress={async () => {
-              await hide($)
-              await $.ui.close({ id: PANE })
-            }}
-          />
+          <Button key="hide" role="dismiss" dimColor label="Hide" onPress={() => hidePane($)} />
         </Box>
       </Box>
     )
