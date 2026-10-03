@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On, UiPane } from 'claude-code'
+import type { Engine } from 'claude-code/testing'
 
 const ROOT = '/project'
 const PATH = `${ROOT}/.claude/local/dashboard.md`
@@ -7,12 +8,11 @@ const PATH = `${ROOT}/.claude/local/dashboard.md`
 type Fake = {
   files: Map<string, string>
   panes: UiPane[]
-  status: (string | undefined)[]
 }
 
 // Answers the engine calls the plugin makes, from memory.
 function fake(on: On, files: Record<string, string>, isPlaced = true): Fake {
-  const state: Fake = { files: new Map(Object.entries(files)), panes: [], status: [] }
+  const state: Fake = { files: new Map(Object.entries(files)), panes: [] }
   let tick = 0
   mock.clock(on)
   on('session.root', () => ({ value: ROOT }))
@@ -37,15 +37,39 @@ function fake(on: On, files: Record<string, string>, isPlaced = true): Fake {
     state.panes = state.panes.filter(pane => pane.id !== e.id)
     return { value: undefined }
   })
-  on('ui.status', ($, e) => {
-    state.status.push(e.text)
-    return { value: undefined }
-  })
   on('ui.toast', () => ({ value: undefined }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  // The engine's own drawing: the footer's mode labels, and an empty band.
+  on('ui.render', ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    return e.component === 'SessionMode'
+      ? Box({ children: e.props.modes.map(mode => Text({ children: mode })) })
+      : Box({})
+  })
   on('prompt.submit', ($, e) => ({ text: e.text, context: e.context }))
 
   return state
+}
+
+// The band's count text, or undefined when the band draws nothing of its own.
+async function bandText($: Engine): Promise<string | undefined> {
+  const ui = await $.ui.mount({
+    plugin: 'dashboard',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: {
+      hasSurvey: false,
+      isWorking: false,
+      maxRows: 10,
+      bodyColumns: 80,
+      scroll: { offset: 0, bodyRows: 10 },
+      view: {},
+    },
+  })
+  const found = await ui.find({ type: 'Text', text: /open dashboard item/ })
+  await ui.unmount()
+
+  return found?.text
 }
 
 const PANE_PROPS = {
@@ -89,7 +113,7 @@ test('a pane draws items and a press checks one off in the file', async ($, on) 
   await ui.press({ key: 'item:1' })
   expect(state.files.get(PATH)).toBe('# Needs you\n- [x] Pick a widget\n- [x] Done thing\n')
   expect((await ui.find({ key: 'item:1' }))?.props.label).toBe('☑')
-  expect(state.status.at(-1)).toBeUndefined()
+  expect(await bandText($)).toBeUndefined()
   await ui.unmount()
 })
 
@@ -100,7 +124,7 @@ test('the first prompt carries open items; later prompts carry user changes', as
   const first = await $.prompt.submit({ text: 'hi', wait: false, origin })
   expect(first.context?.[0]).toContain('Approve the deploy')
   expect(state.panes.map(pane => pane.id)).toEqual(['dashboard'])
-  expect(state.status.at(-1)).toBeUndefined()
+  expect(await bandText($)).toBeUndefined()
 
   const quiet = await $.prompt.submit({ text: 'next', wait: false, origin })
   expect(quiet.context).toBeUndefined()
@@ -136,19 +160,19 @@ test('a pane the person closed stays closed until a new item appears', async ($,
   expect(state.panes.map(pane => pane.id)).toEqual(['dashboard'])
 })
 
-test('the status line shows the count only while the pane is not drawn', async ($, on) => {
+test('the band shows the count only while the pane is not drawn', async ($, on) => {
   const state = fake(on, { [PATH]: '- [ ] First\n- [ ] Second\n' }, false)
   const origin = { kind: 'composer' as const }
 
   await $.prompt.submit({ text: 'hi', wait: false, origin })
-  expect(state.status.at(-1)).toBe('2 open dashboard items (/dashboard to view)')
+  expect(await bandText($)).toBe('2 open dashboard items')
 
   const pane = state.panes[0]
   if (pane !== undefined) {
     pane.isPlaced = true
   }
   await $.prompt.submit({ text: 'next', wait: false, origin })
-  expect(state.status.at(-1)).toBeUndefined()
+  expect(await bandText($)).toBeUndefined()
 })
 
 test('/dashboard toggles the pane', async ($, on) => {
@@ -167,9 +191,9 @@ test('/dashboard toggles the pane', async ($, on) => {
   expect(state.panes.map(pane => pane.id)).toEqual(['dashboard'])
   expect(await run()).toBe('Dashboard panel hidden')
   expect(state.panes).toEqual([])
-  expect(state.status.at(-1)).toBe('1 open dashboard item (/dashboard to view)')
+  expect(await bandText($)).toBe('1 open dashboard item')
   expect(await run()).toBe('Dashboard panel shown')
-  expect(state.status.at(-1)).toBeUndefined()
+  expect(await bandText($)).toBeUndefined()
 })
 
 test('the command row draws without the plugin-name prefix', async ($, on) => {
@@ -184,4 +208,41 @@ test('the command row draws without the plugin-name prefix', async ($, on) => {
     expect(await ui.find({ type: 'Text', text: 'Dashboard panel shown' })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('the footer label and the band Button follow the open count', async ($, on) => {
+  const state = fake(on, { [PATH]: '- [ ] First\n- [ ] Second\n' }, false)
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const footer = await $.ui.mount({
+      plugin: 'dashboard',
+      surface,
+      component: 'SessionMode',
+      props: { modes: ['focus'] },
+    })
+    expect(await footer.find({ type: 'Text', text: /2 open dashboard items · \/dashboard/ })).toBeDefined()
+    await footer.unmount()
+  }
+
+  const pane = state.panes[0]
+  if (pane !== undefined) {
+    pane.isPlaced = true
+  }
+  const band = await $.ui.mount({
+    plugin: 'dashboard',
+    surface: 'terminal',
+    component: 'AbovePrompt',
+    props: {
+      hasSurvey: false,
+      isWorking: false,
+      maxRows: 10,
+      bodyColumns: 80,
+      scroll: { offset: 0, bodyRows: 10 },
+      view: {},
+    },
+  })
+  await band.press({ key: 'show' })
+  await band.unmount()
+  expect(await bandText($)).toBeUndefined()
 })

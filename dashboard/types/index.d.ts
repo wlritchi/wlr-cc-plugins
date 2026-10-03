@@ -17,6 +17,7 @@ declare module 'claude-code' {
     dashboard: {
       doc: DashboardDoc
       modelView: DashboardModelView
+      reminder: number
       dismissed: string[]
     }
   }

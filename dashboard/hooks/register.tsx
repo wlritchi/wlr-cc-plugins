@@ -31,6 +31,8 @@ const modelView = atom(
     text: null,
   } as DashboardModelView,
 )
+// The open-item count the footer label and the band show; 0 hides them.
+const reminder = atom({ plugin: 'dashboard', key: 'reminder' } as const, 0)
 const dismissed = atom({ plugin: 'dashboard', key: 'dismissed' } as const, [] as string[])
 
 const dashboardPath = async ($: EngineInterface): Promise<string> =>
@@ -52,21 +54,13 @@ const clip = (text: string): string =>
 // the file.
 let lastMtime: number | undefined
 let lastToast = ''
-// Null until the first call, so that the first call always clears a status
-// line that the module set before a reload.
-let lastStatus: string | undefined | null = null
-
-// The status line stands in for the pane only while the pane is not drawn.
-async function syncStatus($: EngineInterface, text: string | null): Promise<void> {
+// The reminder stands in for the pane only while the pane is not drawn.
+async function syncReminder($: EngineInterface, text: string | null): Promise<void> {
   const count = openItems(text).length
   const isDrawn = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
-  const status =
-    count === 0 || isDrawn
-      ? undefined
-      : `${count} open dashboard item${count === 1 ? '' : 's'} (/dashboard to view)`
-  if (status !== lastStatus) {
-    lastStatus = status
-    $.ui.status(status)
+  const shown = isDrawn ? 0 : count
+  if ((await read($, reminder)) !== shown) {
+    await update($, reminder, () => shown)
   }
 }
 
@@ -108,7 +102,7 @@ async function refresh($: EngineInterface, isForced = false): Promise<string | n
   const mtime = (await $.fs.exists(path)) ? (await $.fs.stat(path)).mtimeMs : undefined
   if (!isForced && path === current.path && mtime === lastMtime) {
     // The pane can be placed or closed without a file change.
-    await syncStatus($, current.text)
+    await syncReminder($, current.text)
     return current.text
   }
   lastMtime = mtime
@@ -117,7 +111,7 @@ async function refresh($: EngineInterface, isForced = false): Promise<string | n
     await update($, doc, () => ({ path, text }))
   }
   await sync($, current.text, text)
-  await syncStatus($, text)
+  await syncReminder($, text)
 
   return text
 }
@@ -132,6 +126,15 @@ async function toggleItem($: EngineInterface, line: number, wasDone: boolean): P
     await $.fs.write(path, next)
   }
   await refresh($, true)
+}
+
+const reminderText = (count: number): string => `${count} open dashboard item${count === 1 ? '' : 's'}`
+
+async function showPane($: EngineInterface): Promise<void> {
+  await update($, dismissed, () => [])
+  const text = await refresh($, true)
+  await $.ui.open({ id: PANE, title: 'Dashboard' })
+  await syncReminder($, text)
 }
 
 // Hides the pane until an item it does not show now appears.
@@ -158,14 +161,11 @@ export const register: Register = on => {
     if (isDrawn) {
       await hide($)
       await $.ui.close({ id: PANE })
-      await syncStatus($, (await read($, doc)).text)
+      await syncReminder($, (await read($, doc)).text)
 
       return { text: 'Dashboard panel hidden' }
     }
-    await update($, dismissed, () => [])
-    const text = await refresh($, true)
-    await $.ui.open({ id: PANE, title: 'Dashboard' })
-    await syncStatus($, text)
+    await showPane($)
 
     return { text: 'Dashboard panel shown' }
   })
@@ -186,7 +186,7 @@ export const register: Register = on => {
       await hide($)
     }
     const closed = await next(e)
-    await syncStatus($, (await read($, doc)).text)
+    await syncReminder($, (await read($, doc)).text)
 
     return closed
   })
@@ -267,6 +267,34 @@ export const register: Register = on => {
     void refresh($)
 
     return next(e)
+  })
+
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+    const count = await read($, reminder)
+    if (count === 0) {
+      return next(e)
+    }
+
+    return next({
+      ...e,
+      props: { ...e.props, modes: [...e.props.modes, `${reminderText(count)} · /dashboard`] },
+    })
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const count = await read($, reminder)
+    if (count === 0 || e.props.hasSurvey) {
+      return next(e)
+    }
+    const { Box, Text, Button } = $.ui.resolve(e)
+
+    return (
+      <Box flexDirection="row" gap={1}>
+        <Text color="warning">◆</Text>
+        <Text>{reminderText(count)}</Text>
+        <Button key="show" label="Show" onPress={() => showPane($)} />
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
