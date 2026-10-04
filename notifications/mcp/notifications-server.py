@@ -64,6 +64,10 @@ SERVER_NAME = "notifications"  # used to locate this server's Claude Code MCP lo
 # How long to wait for Claude Code to log whether we were loaded as a channel.
 CHANNEL_DETECT_TIMEOUT_SECONDS = 12.0
 CHANNEL_DETECT_POLL_SECONDS = 0.5
+# If no marker is found in the first window, keep looking at a slower rate for this
+# long after startup, so a slow harness does not leave the session in pull mode.
+CHANNEL_LATE_DETECT_SECONDS = 300.0
+CHANNEL_LATE_DETECT_POLL_SECONDS = 5.0
 # Start time of this process. Channel markers older than this belong to earlier runs
 # of a resumed session.
 PROCESS_STARTED_AT = time.time()
@@ -401,34 +405,47 @@ class DaemonClient:
         else:  # skipped or unknown: err toward no silent loss
             self._mode = "pull"
 
-    async def detect_and_apply(self) -> None:
-        start = time.time()
-        # Primary: match the channel marker by this session's id. Claude Code keys each
-        # MCP log dir by the *session* cwd, which for a worktree session — or any bg
-        # agent whose process cwd differs from the session cwd — is NOT the relay's
-        # os.getcwd(), so a cwd-scoped probe reads the wrong dir and never sees the
-        # marker (persistent pull-mode misdetection). The marker line carries the
-        # session id, so matching on it survives that divergence.
-        # Fallback: probe the process cwd and CLAUDE_PROJECT_DIR directly (freshness-
-        # gated), for setups where the session id can't be resolved. First non-UNKNOWN
-        # verdict wins.
+    def probe_mode(self) -> tuple[str, str | None]:
+        """One look at the MCP logs for this run's channel marker: (verdict, reason).
+
+        Primary: match the channel marker by this session's ids. Claude Code keys each
+        MCP log dir by the *session* cwd, which for a worktree session — or any bg
+        agent whose process cwd differs from the session cwd — is NOT the relay's
+        os.getcwd(), so a cwd-scoped probe reads the wrong dir and never sees the
+        marker (persistent pull-mode misdetection). The marker line carries the
+        session id, so matching on it survives that divergence. A resumed session
+        keeps its id, so only markers written since this process started count.
+
+        Fallback: probe the process cwd and CLAUDE_PROJECT_DIR directly (freshness-
+        gated), for marker lines that have no session id. When the ids are known,
+        tagged lines in those dirs are ignored: the primary probe did not match them,
+        so they belong to a different session in the same cwd."""
+        session_ids = session_state.known_session_ids()
+        detected, reason = channel_detect.detect_channel_mode_by_session_ex(
+            SERVER_NAME, session_ids, newer_than=PROCESS_STARTED_AT
+        )
+        if detected != channel_detect.UNKNOWN:
+            return detected, reason
         candidates = [os.getcwd()]
         env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
         if env_dir and env_dir not in candidates:
             candidates.append(env_dir)
+        for candidate in candidates:
+            detected, reason = channel_detect.detect_channel_mode_ex(
+                SERVER_NAME,
+                candidate,
+                newer_than=PROCESS_STARTED_AT - 5.0,
+                ignore_session_tagged=bool(session_ids),
+            )
+            if detected != channel_detect.UNKNOWN:
+                return detected, reason
+        return channel_detect.UNKNOWN, None
+
+    async def detect_and_apply(self) -> None:
+        start = time.time()
         detected, reason = channel_detect.UNKNOWN, None
         while time.time() < start + CHANNEL_DETECT_TIMEOUT_SECONDS:
-            session_id, _ = session_state.effective_session_id()
-            detected, reason = channel_detect.detect_channel_mode_by_session_ex(
-                SERVER_NAME, session_id, newer_than=PROCESS_STARTED_AT
-            )
-            if detected == channel_detect.UNKNOWN:
-                for candidate in candidates:
-                    detected, reason = channel_detect.detect_channel_mode_ex(
-                        SERVER_NAME, candidate, newer_than=start - 5.0
-                    )
-                    if detected != channel_detect.UNKNOWN:
-                        break
+            detected, reason = self.probe_mode()
             if detected != channel_detect.UNKNOWN:
                 break
             await anyio.sleep(CHANNEL_DETECT_POLL_SECONDS)
@@ -439,6 +456,36 @@ class DaemonClient:
                 "no channel marker was found for this session (detection timed out)"
             )
         await self.apply_mode(detected)
+        # A marker that comes after the timeout is still this run's verdict.
+        while (
+            detected == channel_detect.UNKNOWN
+            and self._mode == "pull"
+            and time.time() < start + CHANNEL_LATE_DETECT_SECONDS
+        ):
+            await anyio.sleep(CHANNEL_LATE_DETECT_POLL_SECONDS)
+            detected, reason = self.probe_mode()
+            if detected == channel_detect.REGISTERED:
+                await self.upgrade_to_push()
+            elif detected == channel_detect.SKIPPED:
+                self._mode_detail = reason or "harness reported the channel as skipped"
+
+    async def upgrade_to_push(self) -> bool:
+        """Switch from pull to push mode. Returns False if not in pull mode."""
+        if self._mode != "pull":
+            return False
+        self._mode_detail = None
+        await self.apply_mode(channel_detect.REGISTERED)
+        return True
+
+    async def recheck_mode(self) -> bool:
+        """In pull mode, look again for this run's marker and switch to push mode if
+        it shows the channel as registered. Returns True if the mode changed."""
+        if self._mode != "pull":
+            return False
+        detected, _ = self.probe_mode()
+        if detected != channel_detect.REGISTERED:
+            return False
+        return await self.upgrade_to_push()
 
     async def drain_buffer(self) -> str:
         """Drain pending notifications for this session and ack what's drained: the
@@ -452,6 +499,7 @@ class DaemonClient:
         backlog from coming back as one unbounded tool result that could jump the turn's
         context past the window (and re-wedge a freshly-recovered session). Lossless:
         only the drained chunk is acked, exactly per the ack-on-surface invariant."""
+        upgraded = await self.recheck_mode()
         max_messages = _catchup_max_messages()
         max_chars = _catchup_max_chars()
         drained = 0
@@ -523,6 +571,13 @@ class DaemonClient:
                 ". Nothing will interrupt this session on its own: messages arrive "
                 "only when catch_up is called. If this session was supposed to be a "
                 "channel, a fresh session with the channel loaded restores push."
+            )
+            return f"{note}\n\n{body}"
+        if upgraded:
+            note = (
+                "Live push is now active: the harness registered this session as a "
+                "channel after startup detection ended. Updates that were waiting "
+                "will arrive as <channel> events."
             )
             return f"{note}\n\n{body}"
         return body

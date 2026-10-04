@@ -3,6 +3,7 @@
 relay's reconnect backoff math."""
 
 import importlib.util
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -392,6 +393,60 @@ class TestChannelDetect:
             == cd.REGISTERED
         )
 
+    def test_by_session_accepts_any_of_several_ids(self, tmp_path, monkeypatch):
+        # A resumed session can run under a temporary env id and a state-file id;
+        # the harness can tag the marker with either one.
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"debug":"Channel notifications registered","sessionId":"temp-1",'
+            '"timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        assert (
+            cd.detect_channel_mode_by_session("notifications", ["real-1", "temp-1"])
+            == cd.REGISTERED
+        )
+        assert (
+            cd.detect_channel_mode_by_session("notifications", ["real-1"]) == cd.UNKNOWN
+        )
+        assert cd.detect_channel_mode_by_session("notifications", []) == cd.UNKNOWN
+
+    def test_cwd_probe_ignore_session_tagged(self, tmp_path, monkeypatch):
+        # Another session in the same cwd logged 'registered'. With its own ids
+        # known, the relay must not take that marker from the cwd probe. Untagged
+        # lines still count.
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"debug":"Channel notifications registered","sessionId":"other",'
+            '"timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        assert cd.detect_channel_mode("notifications", self.PROJECT) == cd.REGISTERED
+        assert (
+            cd.detect_channel_mode(
+                "notifications", self.PROJECT, ignore_session_tagged=True
+            )
+            == cd.UNKNOWN
+        )
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-06-26T00-00-00Z",
+            '{"message":"Channel notifications skipped: x"}\n'
+            '{"debug":"Channel notifications registered","sessionId":"other",'
+            '"timestamp":"2026-06-26T00:00:00.000Z"}\n',
+        )
+        assert cd.detect_channel_mode_ex(
+            "notifications", self.PROJECT, ignore_session_tagged=True
+        ) == (cd.SKIPPED, "x")
+
     def test_by_session_requires_real_id_field(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
         assert cd.detect_channel_mode_by_session("notifications", None) == cd.UNKNOWN
@@ -543,6 +598,119 @@ def test_detect_falls_back_to_project_dir_log(relay, tmp_path, monkeypatch):
     client = relay.DaemonClient()
     anyio.run(client.detect_and_apply)
     assert client._mode == "push"
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _marker_line(marker: str, session_id: str, timestamp: str) -> str:
+    return (
+        json.dumps({"debug": marker, "sessionId": session_id, "timestamp": timestamp})
+        + "\n"
+    )
+
+
+@pytest.fixture
+def fast_detect(relay, tmp_path, monkeypatch):
+    """Point detection at a tmp cache with short windows, for session id 'me'."""
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("NOTIFICATIONS_MCP_LOG_CACHE_DIR", str(cache))
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(relay.session_state, "known_session_ids", lambda: ["me"])
+    monkeypatch.setattr(relay, "PROCESS_STARTED_AT", time.time())
+    monkeypatch.setattr(relay, "CHANNEL_DETECT_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(relay, "CHANNEL_DETECT_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(relay, "CHANNEL_LATE_DETECT_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(relay, "CHANNEL_LATE_DETECT_SECONDS", 0.6)
+    log_dir = (
+        cache
+        / "claude-cli-nodejs"
+        / cd.encode_cwd(str(tmp_path))
+        / "mcp-logs-plugin-notifications-notifications"
+    )
+    log_dir.mkdir(parents=True)
+    return log_dir
+
+
+def test_detect_ignores_resumed_sessions_stale_skip(relay, fast_detect):
+    """Regression: a resumed session keeps its id. An earlier run's 'skipped'
+    marker must not decide the mode before this run's 'registered' line arrives."""
+    (fast_detect / "old.jsonl").write_text(
+        _marker_line(
+            "Channel notifications skipped: not in --channels list",
+            "me",
+            "2026-01-01T00:00:00.000Z",
+        )
+    )
+
+    async def scenario():
+        client = relay.DaemonClient()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.detect_and_apply)
+            await anyio.sleep(0.1)
+            (fast_detect / "new.jsonl").write_text(
+                _marker_line("Channel notifications registered", "me", _iso_now())
+            )
+        return client
+
+    assert anyio.run(scenario)._mode == "push"
+
+
+def test_detect_ignores_other_sessions_tagged_marker_in_cwd(relay, fast_detect):
+    """The cwd fallback must not take a marker that another session in the same
+    cwd tagged with its own id."""
+    (fast_detect / "spare.jsonl").write_text(
+        _marker_line("Channel notifications registered", "spare", _iso_now())
+    )
+    client = relay.DaemonClient()
+    anyio.run(client.detect_and_apply)
+    assert client._mode == "pull"
+
+
+def test_detect_upgrades_on_late_marker(relay, fast_detect):
+    """A marker that arrives after the detection timeout still switches to push."""
+
+    async def scenario():
+        client = relay.DaemonClient()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.detect_and_apply)
+            await anyio.sleep(0.4)  # past CHANNEL_DETECT_TIMEOUT_SECONDS
+            assert client._mode == "pull"
+            (fast_detect / "new.jsonl").write_text(
+                _marker_line("Channel notifications registered", "me", _iso_now())
+            )
+        return client
+
+    client = anyio.run(scenario)
+    assert client._mode == "push"
+    assert client._mode_detail is None
+
+
+def test_catch_up_rechecks_pull_mode(relay, fast_detect):
+    """catch_up in pull mode looks for the marker again and switches to push if it
+    is there now; the held buffer moves to the push path."""
+    client = relay.DaemonClient()
+    client._mode = "pull"
+    client._mode_detail = "no channel marker was found for this session"
+    client._buffer["n1"] = {"content": "hello", "meta": {}}
+    (fast_detect / "new.jsonl").write_text(
+        _marker_line("Channel notifications registered", "me", _iso_now())
+    )
+    result = anyio.run(client.drain_buffer)
+    assert client._mode == "push"
+    assert "Live push is now active" in result
+    assert not client._buffer
+    assert [item["id"] for item in client._pending_debounce] == ["n1"]
+
+
+def test_catch_up_stays_pull_without_marker(relay, fast_detect):
+    client = relay.DaemonClient()
+    client._mode = "pull"
+    result = anyio.run(client.drain_buffer)
+    assert client._mode == "pull"
+    assert "Live push is disabled" in result
 
 
 def test_wait_connected_does_not_nudge_when_already_connected(relay):

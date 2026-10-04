@@ -207,6 +207,23 @@ def effective_session_id() -> tuple[str | None, str]:
     return None, "unavailable"
 
 
+def known_session_ids() -> list[str]:
+    """Every id this process may run under: the state-file id and the env id.
+
+    They differ on a resumed session, and the harness can tag its log lines with
+    either one, so a caller that matches log lines should accept both."""
+    ids: list[str] = []
+    claude_pid = resolve_claude_pid()
+    if claude_pid is not None:
+        session_id = read_session(claude_pid)
+        if session_id:
+            ids.append(session_id)
+    env = os.environ.get(SESSION_ID_ENV_VAR)
+    if env and env not in ids:
+        ids.append(env)
+    return ids
+
+
 def _pid_alive(pid: int) -> bool:
     if Path("/proc", str(pid)).exists():
         return True

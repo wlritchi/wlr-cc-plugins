@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Collection
 from datetime import datetime
 from pathlib import Path
 
@@ -83,17 +84,35 @@ def _reason_after(text: str, pos: int) -> str | None:
 
 
 def detect_channel_mode(
-    server_name: str, project_dir: str | None, *, newer_than: float = 0.0
+    server_name: str,
+    project_dir: str | None,
+    *,
+    newer_than: float = 0.0,
+    ignore_session_tagged: bool = False,
 ) -> str:
     """REGISTERED / SKIPPED / UNKNOWN from the latest MCP log written at/after `newer_than`."""
-    return detect_channel_mode_ex(server_name, project_dir, newer_than=newer_than)[0]
+    return detect_channel_mode_ex(
+        server_name,
+        project_dir,
+        newer_than=newer_than,
+        ignore_session_tagged=ignore_session_tagged,
+    )[0]
 
 
 def detect_channel_mode_ex(
-    server_name: str, project_dir: str | None, *, newer_than: float = 0.0
+    server_name: str,
+    project_dir: str | None,
+    *,
+    newer_than: float = 0.0,
+    ignore_session_tagged: bool = False,
 ) -> tuple[str, str | None]:
     """Like ``detect_channel_mode`` but also returns the harness's skip reason (the
-    text after 'Channel notifications skipped:'), or None when not skipped/unknown."""
+    text after 'Channel notifications skipped:'), or None when not skipped/unknown.
+
+    With ``ignore_session_tagged``, marker lines that carry a ``sessionId`` field are
+    ignored. Use it when the caller already matched its own ids with
+    ``detect_channel_mode_by_session_ex``: a tagged line that did not match belongs to
+    a different session that shares this cwd."""
     if not project_dir:
         return UNKNOWN, None
     directory = _log_dir(server_name, project_dir)
@@ -107,13 +126,31 @@ def detect_channel_mode_ex(
         text = latest.read_text(errors="replace")
     except OSError:
         return UNKNOWN, None
-    registered_at = text.rfind(_REGISTERED_MARK)
-    skipped_at = text.rfind(_SKIPPED_MARK)
-    if registered_at < 0 and skipped_at < 0:
-        return UNKNOWN, None
-    if registered_at > skipped_at:
-        return REGISTERED, None
-    return SKIPPED, _reason_after(text, skipped_at)
+    verdict, reason = UNKNOWN, None
+    for line in text.splitlines():
+        registered_at = line.rfind(_REGISTERED_MARK)
+        skipped_at = line.rfind(_SKIPPED_MARK)
+        if registered_at < 0 and skipped_at < 0:
+            continue
+        if ignore_session_tagged and _session_id_field(line) is not None:
+            continue
+        if registered_at > skipped_at:
+            verdict, reason = REGISTERED, None
+        else:
+            verdict, reason = SKIPPED, _reason_after(line, skipped_at)
+    return verdict, reason
+
+
+def _session_id_field(line: str) -> str | None:
+    """The ``sessionId`` field of a JSON log line, or None if it has none."""
+    try:
+        obj = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    session_id = obj.get("sessionId")
+    return session_id if isinstance(session_id, str) else None
 
 
 def _iso_epoch(ts: object, fallback: float) -> float:
@@ -129,7 +166,10 @@ def _iso_epoch(ts: object, fallback: float) -> float:
 
 
 def detect_channel_mode_by_session(
-    server_name: str, session_id: str | None, *, newer_than: float = 0.0
+    server_name: str,
+    session_id: str | Collection[str] | None,
+    *,
+    newer_than: float = 0.0,
 ) -> str:
     """REGISTERED / SKIPPED / UNKNOWN — see ``detect_channel_mode_by_session_ex``."""
     return detect_channel_mode_by_session_ex(
@@ -138,10 +178,14 @@ def detect_channel_mode_by_session(
 
 
 def detect_channel_mode_by_session_ex(
-    server_name: str, session_id: str | None, *, newer_than: float = 0.0
+    server_name: str,
+    session_id: str | Collection[str] | None,
+    *,
+    newer_than: float = 0.0,
 ) -> tuple[str, str | None]:
     """(verdict, skip_reason) by matching the marker to THIS session's id across
-    every project-keyed mcp-log dir under the cache root.
+    every project-keyed mcp-log dir under the cache root. ``session_id`` can be one id
+    or several (a resumed session can run under a temporary id and its real id).
 
     Claude Code keys each MCP log dir by the *session* cwd. For a worktree session — or
     any bg agent whose process cwd differs from the session cwd — that dir is not the
@@ -157,7 +201,9 @@ def detect_channel_mode_by_session_ex(
     Markers older than ``newer_than`` (epoch seconds) are ignored. The relay passes its
     own start time, because the harness writes this run's marker only after it
     connects, so any earlier marker for the id is stale."""
-    if not session_id:
+    session_ids = {session_id} if isinstance(session_id, str) else set(session_id or ())
+    session_ids.discard("")
+    if not session_ids:
         return UNKNOWN, None
     root = _cache_root() / "claude-cli-nodejs"
     if not root.is_dir():
@@ -175,7 +221,8 @@ def detect_channel_mode_by_session_ex(
             except OSError:
                 continue
             for line in text.splitlines():
-                if session_id not in line:  # cheap prefilter before the JSON parse
+                # cheap prefilter before the JSON parse
+                if not any(sid in line for sid in session_ids):
                     continue
                 if _REGISTERED_MARK in line:
                     verdict = REGISTERED
@@ -187,7 +234,7 @@ def detect_channel_mode_by_session_ex(
                     obj = json.loads(line)
                 except (ValueError, TypeError):
                     continue
-                if obj.get("sessionId") != session_id:
+                if obj.get("sessionId") not in session_ids:
                     continue  # id was incidental (substring), not the field value
                 reason: str | None = None
                 if verdict == SKIPPED:
