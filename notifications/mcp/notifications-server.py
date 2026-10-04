@@ -64,6 +64,9 @@ SERVER_NAME = "notifications"  # used to locate this server's Claude Code MCP lo
 # How long to wait for Claude Code to log whether we were loaded as a channel.
 CHANNEL_DETECT_TIMEOUT_SECONDS = 12.0
 CHANNEL_DETECT_POLL_SECONDS = 0.5
+# Start time of this process. Channel markers older than this belong to earlier runs
+# of a resumed session.
+PROCESS_STARTED_AT = time.time()
 SESSION_POLL_SECONDS = 5.0
 # Settle time before connecting, so a recovered (past-due) event isn't pushed
 # into the channel before the client has finished the MCP/channel handshake.
@@ -417,7 +420,7 @@ class DaemonClient:
         while time.time() < start + CHANNEL_DETECT_TIMEOUT_SECONDS:
             session_id, _ = session_state.effective_session_id()
             detected, reason = channel_detect.detect_channel_mode_by_session_ex(
-                SERVER_NAME, session_id
+                SERVER_NAME, session_id, newer_than=PROCESS_STARTED_AT
             )
             if detected == channel_detect.UNKNOWN:
                 for candidate in candidates:

@@ -128,13 +128,17 @@ def _iso_epoch(ts: object, fallback: float) -> float:
     return fallback
 
 
-def detect_channel_mode_by_session(server_name: str, session_id: str | None) -> str:
+def detect_channel_mode_by_session(
+    server_name: str, session_id: str | None, *, newer_than: float = 0.0
+) -> str:
     """REGISTERED / SKIPPED / UNKNOWN — see ``detect_channel_mode_by_session_ex``."""
-    return detect_channel_mode_by_session_ex(server_name, session_id)[0]
+    return detect_channel_mode_by_session_ex(
+        server_name, session_id, newer_than=newer_than
+    )[0]
 
 
 def detect_channel_mode_by_session_ex(
-    server_name: str, session_id: str | None
+    server_name: str, session_id: str | None, *, newer_than: float = 0.0
 ) -> tuple[str, str | None]:
     """(verdict, skip_reason) by matching the marker to THIS session's id across
     every project-keyed mcp-log dir under the cache root.
@@ -145,9 +149,14 @@ def detect_channel_mode_by_session_ex(
     wrong dir and misses the marker (persistent pull-mode misdetection). The marker line
     carries the session id, which is globally unique, so matching on it finds the right
     log regardless of which cwd dir it landed in, and never picks up a *different*
-    session's marker (e.g. a claimed-spare sharing the workspace cwd). No freshness gate
-    is needed: the id is the disambiguator, and the latest marker for this id wins (so a
-    resume that re-registers as a channel, or flips to skipped, is honored)."""
+    session's marker (e.g. a claimed-spare sharing the workspace cwd). The latest marker
+    for this id wins.
+
+    The id alone does not identify one process: a resumed session (``--continue``,
+    ``--resume``) keeps its id, so its logs also hold the markers of earlier runs.
+    Markers older than ``newer_than`` (epoch seconds) are ignored. The relay passes its
+    own start time, because the harness writes this run's marker only after it
+    connects, so any earlier marker for the id is stale."""
     if not session_id:
         return UNKNOWN, None
     root = _cache_root() / "claude-cli-nodejs"
@@ -185,6 +194,8 @@ def detect_channel_mode_by_session_ex(
                     pos = line.find(_SKIPPED_MARK)
                     reason = _reason_after(line, pos) if pos >= 0 else None
                 key = _iso_epoch(obj.get("timestamp"), mtime)
+                if key < newer_than:
+                    continue
                 if best_key is None or key >= best_key:
                     best_key, best_verdict, best_reason = key, verdict, reason
     return best_verdict, best_reason

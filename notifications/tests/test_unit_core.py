@@ -5,6 +5,7 @@ relay's reconnect backoff math."""
 import importlib.util
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anyio
@@ -356,6 +357,40 @@ class TestChannelDetect:
             '"timestamp":"2026-06-26T01:00:00.000Z"}\n',
         )
         assert cd.detect_channel_mode_by_session("notifications", "s") == cd.SKIPPED
+
+    def test_by_session_newer_than_ignores_resumed_sessions_old_marker(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression: a session resumed with --continue keeps its id. An earlier run
+        # logged 'skipped'; this run's 'registered' line comes only after the relay
+        # starts. Until then, the old marker must not give a verdict.
+        monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-10-03T15-12-34-013Z",
+            '{"debug":"Channel notifications skipped: not in --channels list",'
+            '"sessionId":"s","timestamp":"2026-10-03T15:12:34.872Z"}\n',
+        )
+        started = datetime(2026, 10, 3, 18, 29, 54, tzinfo=timezone.utc).timestamp()
+        assert cd.detect_channel_mode_by_session("notifications", "s") == cd.SKIPPED
+        assert (
+            cd.detect_channel_mode_by_session("notifications", "s", newer_than=started)
+            == cd.UNKNOWN
+        )
+        _write_log(
+            tmp_path,
+            self.PROJECT,
+            self.SERVER_DIR,
+            "2026-10-03T18-29-54-440Z",
+            '{"debug":"Channel notifications registered","sessionId":"s",'
+            '"timestamp":"2026-10-03T18:29:55.929Z"}\n',
+        )
+        assert (
+            cd.detect_channel_mode_by_session("notifications", "s", newer_than=started)
+            == cd.REGISTERED
+        )
 
     def test_by_session_requires_real_id_field(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cd, "_cache_root", lambda: tmp_path)
