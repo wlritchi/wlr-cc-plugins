@@ -159,9 +159,9 @@ async function currentWorktree($: EngineInterface, here: Located): Promise<strin
   return top
 }
 
-// A write inside a linked worktree of the project also enters that worktree.
-// The model can write there with absolute paths while the working directory
-// is in the main checkout.
+// The model can write inside a worktree with an absolute path while the
+// working directory is in the main checkout. Such a write enters that
+// worktree.
 async function enterByWrite($: EngineInterface, file: string): Promise<void> {
   if (!file.startsWith('/')) {
     return

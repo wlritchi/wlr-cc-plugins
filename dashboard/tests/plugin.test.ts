@@ -313,7 +313,7 @@ test('a removed worktree drops its dashboard', async ($, on) => {
   expect(await paneLabels($)).toEqual([])
 })
 
-// Answers Write calls as the engine does: the file gets the content.
+// Stands in for the engine, which runs the Write tool.
 function fakeWrite(on: On, state: Fake): void {
   on('tool.call', ($, e) => {
     if (e.tool !== 'Write') {
