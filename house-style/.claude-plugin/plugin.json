@@ -1,0 +1,8 @@
+{
+  "name": "house-style",
+  "description": "wlritchi's coding conventions: session guidance and a comment-discipline review agent",
+  "version": "0.1.0",
+  "author": {
+    "name": "wlritchi"
+  }
+}
