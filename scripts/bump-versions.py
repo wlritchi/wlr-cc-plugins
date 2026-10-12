@@ -14,7 +14,6 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional
 
 import anthropic
 import git
@@ -43,9 +42,9 @@ def get_plugins() -> list[dict]:
 
     print(f"📦 Found {len(plugins)} plugins:")
     for plugin in plugins:
-        name = plugin.get('name', 'unknown')
-        version = plugin.get('version', 'unknown')
-        if name == 'unknown' or version == 'unknown':
+        name = plugin.get("name", "unknown")
+        version = plugin.get("version", "unknown")
+        if name == "unknown" or version == "unknown":
             print(f"  ⚠️  Plugin missing name or version: {plugin}")
             continue
         print(f"  - {name} (v{version})")
@@ -53,7 +52,7 @@ def get_plugins() -> list[dict]:
     return plugins
 
 
-def find_last_version_bump(repo: git.Repo, plugin_name: str) -> Optional[str]:
+def find_last_version_bump(repo: git.Repo, plugin_name: str) -> str | None:
     """Find the last commit that bumped this plugin's version.
 
     Returns the commit SHA, or None if no version bump found.
@@ -61,7 +60,7 @@ def find_last_version_bump(repo: git.Repo, plugin_name: str) -> Optional[str]:
     # Files to check for version changes
     files_to_check = [
         ".claude-plugin/marketplace.json",
-        f"{plugin_name}/.claude-plugin/plugin.json"
+        f"{plugin_name}/.claude-plugin/plugin.json",
     ]
 
     # Get commit history for these files
@@ -83,7 +82,9 @@ def find_last_version_bump(repo: git.Repo, plugin_name: str) -> Optional[str]:
                     if diff.diff:
                         # Match actual JSON version field changes like: "version": "0.1.0"
                         # This requires the pattern to appear on changed lines (+ or - in diff)
-                        version_pattern = rb'[+-].*"version"\s*:\s*"[0-9]+\.[0-9]+\.[0-9]+"'
+                        version_pattern = (
+                            rb'[+-].*"version"\s*:\s*"[0-9]+\.[0-9]+\.[0-9]+"'
+                        )
                         if re.search(version_pattern, diff.diff):
                             return commit.hexsha
         except (IndexError, git.GitCommandError):
@@ -92,7 +93,9 @@ def find_last_version_bump(repo: git.Repo, plugin_name: str) -> Optional[str]:
     return None
 
 
-def has_changes_since(repo: git.Repo, plugin_name: str, since_commit: Optional[str]) -> bool:
+def has_changes_since(
+    repo: git.Repo, plugin_name: str, since_commit: str | None
+) -> bool:
     """Check if plugin directory has changes since the given commit.
 
     If since_commit is None, checks against repo root.
@@ -123,7 +126,9 @@ def has_changes_since(repo: git.Repo, plugin_name: str, since_commit: Optional[s
         return False
 
 
-def get_changes_context(repo: git.Repo, plugin_name: str, since_commit: Optional[str]) -> dict:
+def get_changes_context(
+    repo: git.Repo, plugin_name: str, since_commit: str | None
+) -> dict:
     """Get commit messages and diff for changes since the given commit."""
     plugin_path = plugin_name
 
@@ -154,26 +159,30 @@ def get_changes_context(repo: git.Repo, plugin_name: str, since_commit: Optional
             diffs = since.diff(head, paths=plugin_path, create_patch=True)
         else:
             # Get diff from empty tree
-            diffs = repo.head.commit.diff(git.NULL_TREE, paths=plugin_path, create_patch=True)
+            diffs = repo.head.commit.diff(
+                git.NULL_TREE, paths=plugin_path, create_patch=True
+            )
 
         diff_parts = []
         for diff in diffs:
             if diff.diff:
-                diff_parts.append(diff.diff.decode('utf-8', errors='ignore'))
+                diff_parts.append(diff.diff.decode("utf-8", errors="ignore"))
 
         diff_text = "\n".join(diff_parts)
     except (git.GitCommandError, git.BadName):
         diff_text = ""
 
     return {
-        "commit_messages": "\n".join(commit_messages) if commit_messages else "(no commits)",
-        "diff": diff_text if diff_text else "(no diff)"
+        "commit_messages": "\n".join(commit_messages)
+        if commit_messages
+        else "(no commits)",
+        "diff": diff_text if diff_text else "(no diff)",
     }
 
 
 def parse_version(version: str) -> tuple[int, int, int]:
     """Parse semantic version string into (major, minor, patch)."""
-    parts = version.split('.')
+    parts = version.split(".")
     if len(parts) != 3:
         raise ValueError(f"Invalid version format: {version}")
 
@@ -210,7 +219,7 @@ def analyze_changes_with_claude(
     client: anthropic.Anthropic,
     plugin_name: str,
     current_version: str,
-    changes_context: dict
+    changes_context: dict,
 ) -> str:
     """Use Claude to analyze changes and determine bump type.
 
@@ -247,18 +256,20 @@ Version bump type:"""
         response = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=10,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
         )
 
         bump_type = response.content[0].text.strip().lower()
 
         # Validate response
         if bump_type not in ["patch", "minor", "major"]:
-            print(f"  ⚠️  Claude returned unexpected value '{bump_type}', defaulting to 'minor'")
+            print(
+                f"  ⚠️  Claude returned unexpected value '{bump_type}', defaulting to 'minor'"
+            )
             return "minor"
 
         return bump_type
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - any API failure falls back to 'minor'
         print(f"  ⚠️  Claude API error: {e}, defaulting to 'minor'")
         return "minor"
 
@@ -313,7 +324,9 @@ def update_plugin_versions(bump_plan: list[dict]) -> list[str]:
     return modified_files
 
 
-def create_bump_commit(repo: git.Repo, bump_plan: list[dict], modified_files: list[str]) -> None:
+def create_bump_commit(
+    repo: git.Repo, bump_plan: list[dict], modified_files: list[str]
+) -> None:
     """Create commit for version bumps."""
     # Build commit message
     message_lines = ["chore: bump versions", ""]
@@ -322,12 +335,14 @@ def create_bump_commit(repo: git.Repo, bump_plan: list[dict], modified_files: li
         line = f"- {plan['plugin_name']}: {plan['current_version']} → {plan['new_version']} ({plan['bump_type']})"
         message_lines.append(line)
 
-    message_lines.extend([
-        "",
-        "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
-        "",
-        "Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>"
-    ])
+    message_lines.extend(
+        [
+            "",
+            "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+            "",
+            "Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>",
+        ]
+    )
 
     commit_message = "\n".join(message_lines)
 
@@ -401,15 +416,16 @@ def main() -> int:
         has_changes = has_changes_since(repo, plugin["name"], last_bump)
 
         if last_bump:
-            print(f"  - {plugin['name']}: last bump at {last_bump[:8]}, changes: {has_changes}")
+            print(
+                f"  - {plugin['name']}: last bump at {last_bump[:8]}, changes: {has_changes}"
+            )
         else:
-            print(f"  - {plugin['name']}: no version bump found, changes: {has_changes}")
+            print(
+                f"  - {plugin['name']}: no version bump found, changes: {has_changes}"
+            )
 
         if has_changes:
-            plugins_to_bump.append({
-                "plugin": plugin,
-                "last_bump": last_bump
-            })
+            plugins_to_bump.append({"plugin": plugin, "last_bump": last_bump})
 
     if not plugins_to_bump:
         print("\n✓ No plugins need version bumps")
@@ -433,23 +449,29 @@ def main() -> int:
         changes = get_changes_context(repo, plugin_name, item["last_bump"])
 
         # Ask Claude
-        bump_type = analyze_changes_with_claude(client, plugin_name, current_version, changes)
+        bump_type = analyze_changes_with_claude(
+            client, plugin_name, current_version, changes
+        )
         new_version = bump_version(current_version, bump_type)
 
         print(f"    {current_version} → {new_version} ({bump_type})")
 
-        bump_plan.append({
-            "plugin_name": plugin_name,
-            "current_version": current_version,
-            "new_version": new_version,
-            "bump_type": bump_type,
-            "plugin_dir": plugin["source"]
-        })
+        bump_plan.append(
+            {
+                "plugin_name": plugin_name,
+                "current_version": current_version,
+                "new_version": new_version,
+                "bump_type": bump_type,
+                "plugin_dir": plugin["source"],
+            }
+        )
 
     # Display summary
     print("\n📋 Version bump plan:")
     for plan in bump_plan:
-        print(f"  - {plan['plugin_name']}: {plan['current_version']} → {plan['new_version']} ({plan['bump_type']})")
+        print(
+            f"  - {plan['plugin_name']}: {plan['current_version']} → {plan['new_version']} ({plan['bump_type']})"
+        )
 
     # Update JSON files
     print("\n📝 Updating version files...")
@@ -459,7 +481,7 @@ def main() -> int:
     create_bump_commit(repo, bump_plan, modified_files)
 
     # Push changes
-    success = push_changes(repo)
+    push_changes(repo)
 
     return 0
 

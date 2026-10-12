@@ -249,7 +249,7 @@ async def _run(
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         raise SpawnError(f"{argv[0]} timed out after {timeout:.0f}s")

@@ -19,7 +19,7 @@ Or via uv:    uv run -qs a2a-server.py
 import asyncio
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -42,12 +42,12 @@ def _validate_agent_name(name: str) -> None:
 
 def _get_timestamp() -> str:
     """Get ISO 8601 UTC timestamp."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _get_filename_timestamp() -> str:
     """Get filesystem-safe timestamp for filenames."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
 
 
 @mcp.tool()

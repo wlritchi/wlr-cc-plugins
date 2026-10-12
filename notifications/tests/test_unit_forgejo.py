@@ -18,7 +18,6 @@ import _harness as h
 import forgejo_client as fc
 import pr_monitor as pm
 
-
 # --------------------------------------------------------------------------- #
 # raw Gitea fetch -> snapshot builders (parallel to test_unit_pr's gql())
 # --------------------------------------------------------------------------- #

@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
+from typing import Self
 
 import anyio
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -378,7 +379,7 @@ class FakeGitHub:
     def graphql_url(self) -> str:
         return f"http://127.0.0.1:{self.port}/graphql"
 
-    def __enter__(self) -> "FakeGitHub":
+    def __enter__(self) -> Self:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -624,7 +625,7 @@ class FakeForgejo:
             return (200, {"statuses": []})  # unknown sha -> empty combined status
         return (404, {})
 
-    def __enter__(self) -> "FakeForgejo":
+    def __enter__(self) -> Self:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -695,9 +696,12 @@ async def mcp_await_channel_with(read, needle: str, timeout: float = 20.0):
     with anyio.move_on_after(timeout):
         async for message in read:
             root = message.message.root
-            if isinstance(root, JSONRPCNotification) and root.method == CHANNEL_METHOD:
-                if needle in (root.params.get("content") or ""):
-                    return root
+            if (
+                isinstance(root, JSONRPCNotification)
+                and root.method == CHANNEL_METHOD
+                and needle in (root.params.get("content") or "")
+            ):
+                return root
     return None
 
 
@@ -831,9 +835,9 @@ __all__ = [
     "FakeForgejo",
     "FakeGitHub",
     "agent_session",
-    "forgejo_pr",
     "daemon_env",
     "daemon_process",
+    "forgejo_pr",
     "free_port",
     "mcp_await_channel",
     "mcp_await_channel_with",

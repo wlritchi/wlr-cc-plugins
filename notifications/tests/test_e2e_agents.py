@@ -564,7 +564,7 @@ def test_succession_announces_and_notifies_predecessor(tmp_path):
                     # The superseded session reconnects and gets the heir notice.
                     async with h.agent_session(tmp_path, ws, store, xdg, "sid-old") as (
                         read_back,
-                        write_back,
+                        _write_back,
                     ):
                         notice = await h.mcp_await_channel_with(
                             read_back, "an heir has appeared", timeout=20

@@ -159,7 +159,7 @@ def _iso_epoch(ts: object, fallback: float) -> float:
     files sort chronologically."""
     if isinstance(ts, str):
         try:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            return datetime.fromisoformat(ts).timestamp()
         except ValueError:
             pass
     return fallback

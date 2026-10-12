@@ -102,8 +102,7 @@ def parse_handle(s: str) -> int | None:
     non-numeric — the caller then treats the input as a full message id. Pure.
     """
     s = s.strip()
-    if s.startswith("#"):
-        s = s[1:]
+    s = s.removeprefix("#")
     if not (s.isascii() and s.isdigit()):  # isascii guards against e.g. superscripts
         return None
     n = int(s)

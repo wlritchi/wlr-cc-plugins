@@ -51,7 +51,7 @@ import re
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from websockets.asyncio.server import serve
@@ -59,18 +59,18 @@ from websockets.exceptions import ConnectionClosed
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-import agent_registry  # noqa: E402
-import agent_spawn  # noqa: E402
-import forgejo_client  # noqa: E402
-import github_client  # noqa: E402
-import messaging  # noqa: E402
-import message_topic  # noqa: E402
-import pr_errors  # noqa: E402
-import pr_monitor  # noqa: E402
-import pr_schedule  # noqa: E402
-import scheduler  # noqa: E402
-import storage  # noqa: E402
-import wsproto  # noqa: E402
+import agent_registry
+import agent_spawn
+import forgejo_client
+import github_client
+import message_topic
+import messaging
+import pr_errors
+import pr_monitor
+import pr_schedule
+import scheduler
+import storage
+import wsproto
 
 # A scheduled callback this far past due was held while nothing was connected.
 RECOVERED_THRESHOLD_SECONDS = 30
@@ -384,11 +384,11 @@ def _session_live(session_id: str) -> bool:
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _iso(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # --------------------------------------------------------------------------- #
@@ -544,7 +544,7 @@ async def _dispatch_loop(conn: Connection) -> None:
             timeout = _next_callback_timeout(session_id, now)
         try:
             await asyncio.wait_for(conn.wake.wait(), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         conn.wake.clear()
 
@@ -1175,7 +1175,7 @@ def _member_names(topic: message_topic.MessageTopic) -> list[str]:
 
 
 def _channel_name(topic: message_topic.MessageTopic) -> str:
-    return topic.key[len("chan:") :] if topic.key.startswith("chan:") else topic.key
+    return topic.key.removeprefix("chan:")
 
 
 def _topic_prefix(topic: message_topic.MessageTopic) -> str:
@@ -1312,7 +1312,7 @@ def _get_or_create_topic(key: str, kind: str) -> message_topic.MessageTopic:
 
 
 async def _handle_join_channel(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     try:
@@ -1343,7 +1343,7 @@ async def _handle_join_channel(websocket, conn: Connection, msg: dict) -> None:
 
 
 async def _handle_leave_channel(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     try:
@@ -1382,7 +1382,7 @@ def _persist_post(
 
 
 async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     try:
@@ -1418,7 +1418,7 @@ async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
 
 
 async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     to = msg.get("to")
@@ -1470,7 +1470,7 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
 
 
 async def _handle_set_threshold(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     threshold = msg.get("threshold")
@@ -1490,7 +1490,7 @@ async def _handle_set_threshold(websocket, conn: Connection, msg: dict) -> None:
 
 
 async def _handle_set_channel_topic(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     try:
@@ -1527,7 +1527,7 @@ async def _handle_list_channels(websocket, conn: Connection, msg: dict) -> None:
 
 
 async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     subscriptions = [
@@ -1594,7 +1594,7 @@ def _resolve_target(
 
 
 async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     raw_target = msg.get("target") or ""
@@ -1635,7 +1635,7 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
 
 
 async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
+    _session_id, record = await _resolve_sender(websocket, conn, msg)
     if record is None:
         return
     raw_target = msg.get("target") or ""
@@ -1895,7 +1895,7 @@ async def _wait_or_wake(tracker: pr_monitor.PRTracker, seconds: float) -> None:
     try:
         await asyncio.wait_for(tracker.wake.wait(), timeout=max(0.2, seconds))
         tracker.wake.clear()
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
 
 
@@ -2036,13 +2036,11 @@ class _ProbeHandshakeFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if (
+        return not (
             record.getMessage() == "opening handshake failed"
             and record.exc_info
             and _caused_by_eof(record.exc_info[1])
-        ):
-            return False  # drop
-        return True
+        )
 
 
 async def main() -> None:

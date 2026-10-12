@@ -54,10 +54,10 @@ from websockets.exceptions import ConnectionClosed, InvalidURI, WebSocketExcepti
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-import channel_detect  # noqa: E402
-import messaging  # noqa: E402
-import session_state  # noqa: E402
-import wsproto  # noqa: E402
+import channel_detect
+import messaging
+import session_state
+import wsproto
 
 CHANNEL_METHOD = "notifications/claude/channel"
 SERVER_NAME = "notifications"  # used to locate this server's Claude Code MCP log
@@ -616,7 +616,7 @@ class DaemonClient:
                 ConnectionError,
             ):
                 pass  # expected transient network failure — back off and retry
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 # The reconnect loop is the resilience boundary and must never die.
                 # Any other failure is a bad attempt, not a crash. This notably
                 # catches the anyio task-group ExceptionGroup raised when a
@@ -1288,11 +1288,11 @@ def _format_last_seen(last_seen: float) -> str:
         return f"~{int(delta)}s ago"
     minutes = delta / 60.0
     if minutes < 90:
-        return f"~{int(round(minutes))}m ago"
+        return f"~{round(minutes)}m ago"
     hours = minutes / 60.0
     if hours < 48:
-        return f"~{int(round(hours))}h ago"
-    return f"~{int(round(hours / 24.0))}d ago"
+        return f"~{round(hours)}h ago"
+    return f"~{round(hours / 24.0)}d ago"
 
 
 def _wedge_annotation(
@@ -1669,8 +1669,10 @@ async def join_channel(
         return f"Could not join '{channel}': {reply.get('error')}"
     members = reply.get("members", [])
     lines = [
-        f"Joined #{reply.get('channel', channel)} ({len(members)} member(s): "
-        f"{', '.join(members) if members else 'just you'})."
+        (
+            f"Joined #{reply.get('channel', channel)} ({len(members)} member(s): "
+            f"{', '.join(members) if members else 'just you'})."
+        )
     ]
     if reply.get("topic"):
         lines.append(f"Topic: {reply['topic']}")

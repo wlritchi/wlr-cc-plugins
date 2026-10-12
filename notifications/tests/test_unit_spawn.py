@@ -8,7 +8,6 @@ import pytest
 
 import agent_spawn
 
-
 # --- load_config -----------------------------------------------------------
 
 

@@ -1,0 +1,6 @@
+target-version = "py312"
+# The notifications scripts put lib/ (and tests/) on sys.path at run time.
+# List them here so isort sorts those modules as first-party.
+src = ["notifications/lib", "notifications/tests"]
+# Markdown holds prose and prompt text, not code to format.
+extend-exclude = ["*.md"]

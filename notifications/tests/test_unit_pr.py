@@ -8,7 +8,7 @@ import importlib.util
 import json
 import random
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anyio
@@ -19,8 +19,6 @@ import _harness as h
 import github_client as gc
 import pr_monitor as pm
 import pr_schedule as ps
-
-UTC = timezone.utc
 
 
 def _utc(y, mo, d, h, mi=0):

@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-import session_state  # noqa: E402
+import session_state
 
 
 def main() -> None:
@@ -45,6 +45,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         # Never let a hook failure break session startup.
         pass

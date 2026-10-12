@@ -6,7 +6,7 @@ import importlib.util
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anyio
@@ -374,7 +374,7 @@ class TestChannelDetect:
             '{"debug":"Channel notifications skipped: not in --channels list",'
             '"sessionId":"s","timestamp":"2026-10-03T15:12:34.872Z"}\n',
         )
-        started = datetime(2026, 10, 3, 18, 29, 54, tzinfo=timezone.utc).timestamp()
+        started = datetime(2026, 10, 3, 18, 29, 54, tzinfo=UTC).timestamp()
         assert cd.detect_channel_mode_by_session("notifications", "s") == cd.SKIPPED
         assert (
             cd.detect_channel_mode_by_session("notifications", "s", newer_than=started)
@@ -534,7 +534,7 @@ def relay():
 
 
 def test_backoff_grows_then_caps_with_jitter(relay):
-    for failures in range(0, 14):
+    for failures in range(14):
         nominal = min(
             relay.RECONNECT_MAX_SECONDS, relay.RECONNECT_INITIAL_SECONDS * 2**failures
         )
@@ -601,7 +601,7 @@ def test_detect_falls_back_to_project_dir_log(relay, tmp_path, monkeypatch):
 
 
 def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _marker_line(marker: str, session_id: str, timestamp: str) -> str:

@@ -25,7 +25,6 @@ import pytest
 import forgejo_client as fc
 import pr_monitor as pm
 
-
 # --------------------------------------------------------------------------- #
 # module loaders (hyphenated script filenames)
 # --------------------------------------------------------------------------- #
