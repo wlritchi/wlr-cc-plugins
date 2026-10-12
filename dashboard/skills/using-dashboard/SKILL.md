@@ -20,8 +20,13 @@ and let the pane remind the user, so that your replies do not have to.
 
 While the session works in a linked git worktree, that worktree has its own
 dashboard at `<worktree>/.claude/local/dashboard.md`. The pane shows the project's
-dashboard first and the worktree's below it. The plugin remembers the session's
-worktree across a restart of Claude Code.
+dashboard first and the worktree's below it.
+
+The session enters a worktree when its working directory goes into one, or when
+you write or edit a file inside a linked worktree of the project. The worktree
+stays until the session enters a different worktree or the worktree is removed.
+A shell that goes back to the main checkout does not change it. The plugin
+remembers the session's worktree across a restart of Claude Code.
 
 - Put items about the worktree's work (its branch, its review, its merge) in the
   worktree's dashboard.

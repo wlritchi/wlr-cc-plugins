@@ -2,7 +2,16 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { DashboardDoc, DashboardWorktree } from '../types'
-import { describeChanges, isInside, itemKey, mainTopFromGitFile, openItems, parse, toggle } from './dashboard'
+import {
+  describeChanges,
+  isInside,
+  itemKey,
+  mainTopFromGitFile,
+  normalize,
+  openItems,
+  parse,
+  toggle,
+} from './dashboard'
 
 const PANE = 'dashboard'
 const RELATIVE_PATH = '.claude/local/dashboard.md'
@@ -31,11 +40,7 @@ const docs = atom({ plugin: 'dashboard', key: 'docs' } as const, [] as Dashboard
 const seen = atom({ plugin: 'dashboard', key: 'seen' } as const, {} as Record<string, string | null>)
 const worktree = atom(
   { plugin: 'dashboard', key: 'worktree' } as const,
-  {
-    top: null,
-    isObserved: false,
-    isLoaded: false,
-  } as DashboardWorktree,
+  { top: null, isLoaded: false } as DashboardWorktree,
 )
 // The open-item count the footer label shows; 0 hides it.
 const reminder = atom({ plugin: 'dashboard', key: 'reminder' } as const, 0)
@@ -113,32 +118,60 @@ async function storeWorktree($: EngineInterface, top: string | null): Promise<vo
   await $.store.set(STORE_KEY, top === null ? kept : { ...kept, [id]: { top, at: now } })
 }
 
-// The linked worktree the session works in. The working directory says so
-// while the session runs; after a restart it is the launch folder again, so
-// the store keeps the worktree until the session leaves it in this process.
+// The session's worktree as this process knows it. The first call loads it
+// from the store, because after a restart the working directory is the
+// launch folder again.
+async function knownWorktree($: EngineInterface): Promise<string | null> {
+  const state = await read($, worktree)
+  if (state.isLoaded) {
+    return state.top
+  }
+  const top = (await storedWorktrees($))[await $.session.id()]?.top ?? null
+  await update($, worktree, () => ({ top, isLoaded: true }))
+
+  return top
+}
+
+async function setWorktree($: EngineInterface, top: string | null): Promise<void> {
+  if (top === (await knownWorktree($))) {
+    return
+  }
+  await update($, worktree, () => ({ top, isLoaded: true }))
+  await storeWorktree($, top)
+}
+
+// The linked worktree the session works in. The session enters a worktree
+// when its working directory goes into one. The worktree stays until the
+// session enters a different one or the worktree is removed. A move back to
+// the main checkout does not clear it, because the shell can go back there
+// after a `cd` while the work continues in the worktree.
 async function currentWorktree($: EngineInterface, here: Located): Promise<string | null> {
-  let state = await read($, worktree)
-  if (!state.isLoaded) {
-    const stored = (await storedWorktrees($))[await $.session.id()]
-    const top = stored !== undefined && (await $.fs.exists(stored.top)) ? stored.top : null
-    state = { top, isObserved: false, isLoaded: true }
-    await update($, worktree, () => state)
+  const top = await knownWorktree($)
+  if (here?.mainTop !== undefined && here.top !== top) {
+    await setWorktree($, here.top)
+    return here.top
   }
-  const now = here?.mainTop !== undefined ? here.top : null
-  if (now !== null && (now !== state.top || !state.isObserved)) {
-    await update($, worktree, () => ({ top: now, isObserved: true, isLoaded: true }))
-    if (now !== state.top) {
-      await storeWorktree($, now)
-    }
-    return now
-  }
-  if (now === null && state.top !== null && state.isObserved) {
-    await update($, worktree, () => ({ top: null, isObserved: true, isLoaded: true }))
-    await storeWorktree($, null)
+  if (top !== null && !(await $.fs.exists(`${top}/.git`))) {
+    await setWorktree($, null)
     return null
   }
 
-  return state.top
+  return top
+}
+
+// A write inside a linked worktree of the project also enters that worktree.
+// The model can write there with absolute paths while the working directory
+// is in the main checkout.
+async function enterByWrite($: EngineInterface, file: string): Promise<void> {
+  if (!file.startsWith('/')) {
+    return
+  }
+  const path = normalize(file)
+  const there = await locate($, path.slice(0, path.lastIndexOf('/')) || '/')
+  const project = await locate($, (await $.session.root()).replace(/\/+$/, ''))
+  if (there?.mainTop !== undefined && there.mainTop === (project?.mainTop ?? project?.top)) {
+    await setWorktree($, there.top)
+  }
 }
 
 // The dashboards that apply now: the project's, then the worktree's.
@@ -324,7 +357,16 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const file = e.tool === 'Write' || e.tool === 'Edit' || e.tool === 'Read' ? e.file_path : undefined
     const result = await next(e)
-    if (file !== undefined && file.endsWith(RELATIVE_PATH)) {
+    if (file === undefined) {
+      return result
+    }
+    // A subagent can work in a worktree of its own, so only the main agent's
+    // writes move the session.
+    const isWrite = e.tool !== 'Read' && e.agentId === undefined
+    if (isWrite && result.deny === undefined && result.isError !== true) {
+      await enterByWrite($, file)
+    }
+    if (file.endsWith(RELATIVE_PATH)) {
       const doc = (await refresh($, true)).find(one => one.path === file)
       if (doc !== undefined && e.agentId === undefined) {
         await update($, seen, view => ({ ...view, [doc.path]: doc.text }))

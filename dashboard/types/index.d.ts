@@ -10,8 +10,6 @@ export type DashboardDoc = {
 export type DashboardWorktree = {
   /** Top folder of the linked worktree the session works in, or null. */
   top: string | null
-  /** True when this process saw the session in `top`, not only the store. */
-  isObserved: boolean
   /** True once the value was loaded from the store in this process. */
   isLoaded: boolean
 }

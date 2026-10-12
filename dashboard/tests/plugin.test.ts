@@ -276,9 +276,84 @@ test('inside a worktree the pane shows the project and the worktree dashboards',
   expect(await paneLabels($)).toEqual(['Project', 'Worktree: wt'])
   expect(await footerText($)).toBeUndefined()
 
-  // Leaving the worktree in this process drops its dashboard.
+  // The shell can go back to the main checkout after a `cd`. The worktree stays.
   state.cwd = ROOT
   await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
+  expect(await paneLabels($)).toEqual(['Project', 'Worktree: wt'])
+})
+
+test('a move into a different worktree replaces the worktree dashboard', async ($, on) => {
+  const other = `${ROOT}/.claude/worktrees/other`
+  const state = fake(
+    on,
+    {
+      ...WORKTREE_FILES,
+      [`${other}/.git`]: `gitdir: ${ROOT}/.git/worktrees/other\n`,
+      [`${other}/.claude/local/dashboard.md`]: '- [ ] Other item\n',
+    },
+    { cwd: WORKTREE },
+  )
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(await paneLabels($)).toEqual(['Project', 'Worktree: wt'])
+
+  state.cwd = other
+  await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
+  expect(await paneLabels($)).toEqual(['Project', 'Worktree: other'])
+})
+
+test('a removed worktree drops its dashboard', async ($, on) => {
+  const state = fake(on, WORKTREE_FILES, { cwd: WORKTREE })
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(await paneLabels($)).toEqual(['Project', 'Worktree: wt'])
+
+  state.cwd = ROOT
+  state.files.delete(`${WORKTREE}/.git`)
+  state.files.delete(WORKTREE_PATH)
+  await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
+  expect(await paneLabels($)).toEqual([])
+})
+
+// Answers Write calls as the engine does: the file gets the content.
+function fakeWrite(on: On, state: Fake): void {
+  on('tool.call', ($, e) => {
+    if (e.tool !== 'Write') {
+      return { deny: 'not faked' }
+    }
+    state.files.set(e.file_path, e.content)
+    return {
+      result: { type: 'create' as const, filePath: e.file_path, content: e.content, structuredPatch: [] },
+    }
+  })
+}
+
+test('a write inside a worktree of the project enters that worktree', async ($, on) => {
+  const files: Record<string, string> = { ...WORKTREE_FILES }
+  delete files[WORKTREE_PATH]
+  const state = fake(on, files)
+  fakeWrite(on, state)
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(await paneLabels($)).toEqual([])
+
+  await $.tool.call({ tool: 'Write', file_path: WORKTREE_PATH, content: '- [ ] Worktree item\n' })
+  expect(await paneLabels($)).toEqual(['Project', 'Worktree: wt'])
+  // The model wrote the worktree dashboard, so the next prompt does not repeat it.
+  const next = await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
+  expect(next.context).toBeUndefined()
+})
+
+test('a write inside a worktree of another repository does not enter it', async ($, on) => {
+  const elsewhere = '/elsewhere/.claude/worktrees/wt'
+  const state = fake(on, {
+    [PATH]: '- [ ] Project item\n',
+    [`${elsewhere}/.git`]: 'gitdir: /elsewhere/.git/worktrees/wt\n',
+  })
+  fakeWrite(on, state)
+  await $.tool.call({
+    tool: 'Write',
+    file_path: `${elsewhere}/.claude/local/dashboard.md`,
+    content: '- [ ] Other item\n',
+  })
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
   expect(await paneLabels($)).toEqual([])
 })
 
@@ -302,7 +377,9 @@ test('a worktree dashboard alone draws no heading', async ($, on) => {
 })
 
 test('a stored worktree that no longer exists is ignored', async ($, on) => {
-  fake(on, WORKTREE_FILES, { store: { worktrees: { 'session-1': { top: WORKTREE, at: 0 } } } })
+  const files: Record<string, string> = { ...WORKTREE_FILES }
+  delete files[`${WORKTREE}/.git`]
+  fake(on, files, { store: { worktrees: { 'session-1': { top: WORKTREE, at: 0 } } } })
   await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
   expect(await paneLabels($)).toEqual([])
 })
