@@ -27,7 +27,7 @@ This is a Claude Code plugins marketplace repository containing multiple plugins
 | **opinionated-setup** | Python project and Dockerfile setup templates (uv + hatchling toolchain) |
 | **dashboard** | Claude Code mod: a pane of user-facing tasks and questions from `.claude/local/dashboard.md`, plus a skill for keeping it |
 | **skill-feedback** | Captures user corrections to skills and offers to open improvement PRs |
-| **house-style** | Coding conventions: a SessionStart hook that injects `hooks/guidance.md`, and the comment-discipline review agent |
+| **house-style** | Coding conventions: SessionStart and SubagentStart hooks that inject `hooks/guidance.md` into the session and its subagents, and the comment-discipline review agent |
 
 ## Development Commands
 
