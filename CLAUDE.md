@@ -25,7 +25,7 @@ This is a Claude Code plugins marketplace repository containing multiple plugins
 |--------|-------------|
 | **a2a** | Agent-to-agent communication framework using filesystem-based messaging (`~/a2a/`) |
 | **opinionated-setup** | Python project and Dockerfile setup templates (uv + hatchling toolchain) |
-| **dashboard** | Claude Code mod: a pane of user-facing tasks and questions from `.claude/local/dashboard.md`, plus a skill for keeping it |
+| **dashboard** | Claude Code mod: a pane of user-facing tasks and questions from a `dashboard.md` in the project's `~/.claude/projects/` folder, plus a skill for keeping it |
 | **skill-feedback** | Captures user corrections to skills and offers to open improvement PRs |
 | **house-style** | Coding conventions: SessionStart and SubagentStart hooks that inject `hooks/guidance.md` into the session and its subagents, and the comment-discipline review agent |
 

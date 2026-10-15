@@ -3,7 +3,9 @@ import type { On, UiPane } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
 const ROOT = '/project'
-const PATH = `${ROOT}/.claude/local/dashboard.md`
+const HOME = '/home/user'
+const PATH = `${HOME}/.claude/projects/-project/dashboard.md`
+const OLD_PATH = `${ROOT}/.claude/local/dashboard.md`
 
 type Fake = {
   files: Map<string, string>
@@ -14,24 +16,29 @@ type Fake = {
 
 type FakeOptions = {
   isPlaced?: boolean
+  root?: string
   cwd?: string
   dirs?: string[]
   store?: Record<string, unknown>
+  env?: Record<string, string>
 }
 
 // Answers the engine calls the plugin makes, from memory.
 function fake(on: On, files: Record<string, string>, options: FakeOptions | boolean = {}): Fake {
   const {
     isPlaced = true,
-    cwd = ROOT,
+    root = ROOT,
+    cwd = root,
     dirs = [`${ROOT}/.git`],
     store = {},
+    env = { HOME },
   } = typeof options === 'boolean' ? { isPlaced: options } : options
   const state: Fake = { files: new Map(Object.entries(files)), dirs: new Set(dirs), panes: [], cwd }
   let tick = 0
   mock.clock(on)
   mock.store(on, store)
-  on('session.root', () => ({ value: ROOT }))
+  mock.env(on, env)
+  on('session.root', () => ({ value: root }))
   on('session.cwd', () => ({ value: state.cwd }))
   on('session.id', () => ({ value: 'session-1' }))
   on('fs.exists', ($, e) => ({ value: state.files.has(e.path) || state.dirs.has(e.path) }))
@@ -50,6 +57,27 @@ function fake(on: On, files: Record<string, string>, options: FakeOptions | bool
   on('fs.write', ($, e) => {
     state.files.set(e.path, e.text)
     return { value: undefined }
+  })
+  on('fs.list', ($, e) => ({
+    value: [...state.dirs]
+      .filter(dir => dir.startsWith(`${e.path}/`) && !dir.slice(e.path.length + 1).includes('/'))
+      .map(dir => ({
+        name: dir.slice(e.path.length + 1),
+        kind: 'dir' as const,
+        size: 0,
+        mtimeMs: 0,
+        isLink: false,
+      })),
+  }))
+  on('process.run', ($, e) => {
+    const [command, , , path] = e.argv
+    if (command !== 'rm' || path === undefined) {
+      return { deny: 'not faked' }
+    }
+    state.files.delete(path)
+    return {
+      value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }
   })
   on('ui.panes', () => ({ value: state.panes }))
   on('ui.open', ($, e) => {
@@ -382,4 +410,66 @@ test('a stored worktree that no longer exists is ignored', async ($, on) => {
   fake(on, files, { store: { worktrees: { 'session-1': { top: WORKTREE, at: 0 } } } })
   await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
   expect(await paneLabels($)).toEqual([])
+})
+
+test('a dashboard at the old place in the checkout moves to the project folder', async ($, on) => {
+  const state = fake(on, { [OLD_PATH]: '- [ ] Old item\n' })
+  const first = await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(state.files.get(PATH)).toBe('- [ ] Old item\n')
+  expect(state.files.has(OLD_PATH)).toBe(false)
+  expect(first.context?.[0]).toContain(PATH)
+})
+
+test('a session in a worktree moves the main checkout dashboard', async ($, on) => {
+  const files: Record<string, string> = { ...WORKTREE_FILES, [OLD_PATH]: '- [ ] Old item\n' }
+  delete files[PATH]
+  const state = fake(on, files, { cwd: WORKTREE })
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(state.files.get(PATH)).toBe('- [ ] Old item\n')
+  expect(state.files.has(OLD_PATH)).toBe(false)
+  expect(state.files.get(WORKTREE_PATH)).toBe('- [ ] Worktree item\n')
+})
+
+test('a dashboard at the old place stays when the new place has a different one', async ($, on) => {
+  const state = fake(on, { [OLD_PATH]: '- [ ] Old item\n', [PATH]: '- [ ] New item\n' })
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(state.files.get(OLD_PATH)).toBe('- [ ] Old item\n')
+  expect(state.files.get(PATH)).toBe('- [ ] New item\n')
+})
+
+test('a dashboard at the old place goes when the new place has the same text', async ($, on) => {
+  const state = fake(on, { [OLD_PATH]: '- [ ] Item\n', [PATH]: '- [ ] Item\n' })
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(state.files.has(OLD_PATH)).toBe(false)
+  expect(state.files.get(PATH)).toBe('- [ ] Item\n')
+})
+
+test('CLAUDE_CONFIG_DIR replaces ~/.claude', async ($, on) => {
+  const path = '/config/projects/-project/dashboard.md'
+  const state = fake(on, { [OLD_PATH]: '- [ ] Item\n' }, { env: { HOME, CLAUDE_CONFIG_DIR: '/config' } })
+  await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(state.files.get(path)).toBe('- [ ] Item\n')
+})
+
+test('a long project path uses the cut folder that exists', async ($, on) => {
+  const root = `/${'a'.repeat(250)}`
+  const cut = `-${'a'.repeat(199)}-hash`
+  const state = fake(on, {}, { root, dirs: [`${HOME}/.claude/projects`, `${HOME}/.claude/projects/${cut}`] })
+  state.files.set(`${HOME}/.claude/projects/${cut}/dashboard.md`, '- [ ] Item\n')
+  const first = await $.prompt.submit({ text: 'hi', wait: false, origin: { kind: 'composer' } })
+  expect(first.context?.[0]).toContain(`${cut}/dashboard.md`)
+})
+
+test('the system prompt names the project dashboard', async ($, on) => {
+  fake(on, {})
+  on('prompt.compose', () => ({ sections: [] }))
+  const composed = await $.prompt.compose({
+    model: 'model',
+    promptModel: 'model',
+    surfaces: ['terminal'],
+    tools: [],
+    outputStyle: null,
+    traits: [],
+  })
+  expect(composed.sections.at(-1)?.text).toContain(PATH)
 })

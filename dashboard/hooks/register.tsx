@@ -14,27 +14,33 @@ import {
 } from './dashboard'
 
 const PANE = 'dashboard'
+// A worktree's dashboard, relative to its top folder.
 const RELATIVE_PATH = '.claude/local/dashboard.md'
+const PROJECT_FILE = 'dashboard.md'
+// Claude Code cuts a longer project folder name and adds a hash.
+const NAME_LIMIT = 200
 const POLL_MS = 1500
 const MARKDOWN_LIMIT = 10000
 const STORE_KEY = 'worktrees'
 const STORE_DAYS = 30
 
-// Static text, so that it does not change the prompt cache from turn to turn.
-const SECTION = {
-  id: 'dashboard:usage',
-  scope: 'session',
-  text: [
-    '# User dashboard',
-    `The user sees \`${RELATIVE_PATH}\` (relative to the project root) in a pane while it has unchecked \`- [ ]\` items.`,
-    'While you work in a git worktree, that worktree has its own dashboard at the same relative path, shown below the',
-    "project's: put items about the worktree's work there.",
-    'Record there what you need from the user that they may not handle right away (decisions, questions,',
-    'logins, physical or out-of-band tasks), then keep working on what is not blocked.',
-    'Load the `dashboard:using-dashboard` skill before you first write to it.',
-    'Do not restate open dashboard items in your replies: the pane shows them.',
-  ].join('\n'),
-} as const
+// The text changes only when the project changes, so that it does not change
+// the prompt cache from turn to turn.
+const section = (path: string) =>
+  ({
+    id: 'dashboard:usage',
+    scope: 'session',
+    text: [
+      '# User dashboard',
+      `The user sees the project's dashboard, \`${path}\`, in a pane while it has unchecked \`- [ ]\` items.`,
+      `While you work in a git worktree, that worktree has its own dashboard at \`${RELATIVE_PATH}\` inside it, shown`,
+      "below the project's: put items about the worktree's work there.",
+      'Record there what you need from the user that they may not handle right away (decisions, questions,',
+      'logins, physical or out-of-band tasks), then keep working on what is not blocked.',
+      'Load the `dashboard:using-dashboard` skill before you first write to it.',
+      'Do not restate open dashboard items in your replies: the pane shows them.',
+    ].join('\n'),
+  }) as const
 
 const docs = atom({ plugin: 'dashboard', key: 'docs' } as const, [] as DashboardDoc[])
 const seen = atom({ plugin: 'dashboard', key: 'seen' } as const, {} as Record<string, string | null>)
@@ -78,7 +84,64 @@ const openKeys = (list: readonly DashboardDoc[]): string[] =>
 // Module variables reset at each reload; that only costs one extra read.
 const lastMtimes = new Map<string, number | undefined>()
 const located = new Map<string, Located>()
+const projectDirs = new Map<string, string>()
+const migrated = new Set<string>()
 let lastToast = ''
+
+// Claude Code's folder for the project's data: `projects/<name>` in its config
+// folder, <name> being the project path with each character that is not a
+// letter or a digit changed to `-`. Claude Code cuts a name longer than
+// NAME_LIMIT and adds a hash, so for such a name this finds the folder that
+// starts with the cut name.
+async function projectDir($: EngineInterface, project: string): Promise<string> {
+  const known = projectDirs.get(project)
+  if (known !== undefined) {
+    return known
+  }
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
+  const projects = `${config.replace(/\/+$/, '')}/projects`
+  const name = project.replace(/[^a-zA-Z0-9]/g, '-')
+  let found: string | undefined
+  if (name.length > NAME_LIMIT && (await $.fs.exists(projects))) {
+    const start = `${name.slice(0, NAME_LIMIT)}-`
+    found = (await $.fs.list(projects)).find(
+      entry => entry.kind === 'dir' && entry.name.startsWith(start),
+    )?.name
+  }
+  const dir = `${projects}/${found ?? name}`
+  projectDirs.set(project, dir)
+
+  return dir
+}
+
+// Moves the project's dashboard from its old place in the checkout. When the
+// new place has a dashboard with different text, both stay and the user must
+// merge them.
+async function migrate($: EngineInterface, project: string, path: string): Promise<void> {
+  if (migrated.has(project)) {
+    return
+  }
+  migrated.add(project)
+  const old = dashboardIn(project)
+  const text = await readText($, old)
+  if (text === null) {
+    return
+  }
+  const current = await readText($, path)
+  if (current === null) {
+    await $.fs.write(path, text)
+  } else if (current !== text) {
+    $.ui.toast(`Dashboard: ${old} was not moved, because ${path} exists. Merge them by hand.`, {
+      timeoutMs: 15000,
+    })
+    return
+  }
+  try {
+    await $.process.run(['rm', '-f', '--', old])
+  } catch {
+    // The next load removes it, because the two files then have the same text.
+  }
+}
 
 // The nearest folder at or above `dir` with a `.git` entry, and for a linked
 // worktree the main checkout's top folder.
@@ -184,7 +247,9 @@ async function targets($: EngineInterface): Promise<Target[]> {
   if (top !== null && isInside(root, top)) {
     project = (await locate($, top))?.mainTop ?? root
   }
-  const list: Target[] = [{ path: dashboardIn(project), label: 'Project' }]
+  const path = `${await projectDir($, project)}/${PROJECT_FILE}`
+  await migrate($, project, path)
+  const list: Target[] = [{ path, label: 'Project' }]
   if (top !== null && dashboardIn(top) !== list[0]?.path) {
     list.push({ path: dashboardIn(top), label: `Worktree: ${basename(top)}` })
   }
@@ -366,7 +431,7 @@ export const register: Register = on => {
     if (isWrite && result.deny === undefined && result.isError !== true) {
       await enterByWrite($, file)
     }
-    if (file.endsWith(RELATIVE_PATH)) {
+    if (file.endsWith(`/${PROJECT_FILE}`)) {
       const doc = (await refresh($, true)).find(one => one.path === file)
       if (doc !== undefined && e.agentId === undefined) {
         await update($, seen, view => ({ ...view, [doc.path]: doc.text }))
@@ -437,7 +502,12 @@ export const register: Register = on => {
       return composed
     }
 
-    return { sections: [...composed.sections, SECTION] }
+    const project = (await targets($))[0]?.path
+    if (project === undefined) {
+      return composed
+    }
+
+    return { sections: [...composed.sections, section(project)] }
   })
 
   on('turn.complete', async ($, e, next) => {
