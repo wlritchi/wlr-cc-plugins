@@ -47,6 +47,10 @@ solution, and you see an approach that might serve them better, ask the user bef
 Use `docs/specs/` for design specs and `docs/plans/` for implementation plans. If you're continuing
 implementation after a compaction, reread design plans relevant to your current project.
 
+In public or organization-wide repositories, specs, plans, and other documents must never mention
+private infrastructure or private repositories. If the work has a dependency on a repository with
+more restricted access, do not document it here. That repository documents the dependency.
+
 ## Tools
 
 Use ripgrep (`rg`) instead of `grep` for searching. Do not carry grep's flags over: rg is recursive
