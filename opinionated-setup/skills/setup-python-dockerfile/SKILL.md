@@ -20,7 +20,7 @@ Use this template for simpler deployments that don't need OCI labels or versioni
 
 ```dockerfile
 # Minimal multi-stage Dockerfile using uv
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS build
+FROM ghcr.io/astral-sh/uv:python3.15-trixie-slim AS build
 WORKDIR /app
 ARG VERSION=0.0.0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION} UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
@@ -33,7 +33,7 @@ COPY . /app
 # Re-run uv sync to ensure project and extras are installed into .venv
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.15-slim-trixie AS runtime
 WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 # Optional: install runtime system deps
@@ -58,7 +58,7 @@ Use this template for production deployments that need OCI labels, versioning, a
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS build
+FROM ghcr.io/astral-sh/uv:python3.15-trixie-slim AS build
 WORKDIR /app
 ARG VERSION=0.0.0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION} UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
@@ -71,7 +71,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --extra server
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.15-slim-trixie AS runtime
 ARG VERSION
 ARG VCS_REF
 ARG BUILD_DATE
@@ -199,7 +199,7 @@ For monorepo-style projects or images that serve multiple purposes, build a "bas
 ```dockerfile
 # ... build stage as usual ...
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.15-slim-trixie AS runtime
 # ... setup as usual ...
 ENTRYPOINT ["tini", "--"]
 CMD ["echo", "Configure a command via docker run or Kubernetes command override"]

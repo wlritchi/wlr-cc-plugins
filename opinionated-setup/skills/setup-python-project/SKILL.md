@@ -13,11 +13,11 @@ This skill will generate:
 
 1. **pyproject.toml** - Project metadata, dependencies, and tool configuration
 2. **README.md** - Minimal README (required by hatchling)
-3. **.pre-commit-config.yaml** - Pre-commit hooks with yamllint-compliant formatting
+3. **.pre-commit-config.yaml** - Git hooks, run by [prek](https://github.com/j178/prek), with yamllint-compliant formatting
 4. **src/{package}/__init__.py** - Package structure with version string
 5. **tests/test_basic.py** - Basic smoke test
 6. **scripts/run-pytest.sh** - Wrapper script for pytest (avoids YAML line-length issues)
-7. **.git-hook-template** - Git hook wrapper that runs pre-commit via uv
+7. **.git-hook-template** - Git hook wrapper that runs prek via uv
 8. **install-hooks.sh** - Script to install git hooks
 9. **.coveragerc** (optional) - Coverage configuration
 10. **[tool.pyright] in pyproject.toml** (optional) - Pyright type checker configuration
@@ -28,10 +28,10 @@ When you run this skill, ask the user:
 - **Project name** (e.g., exampleproj)
 - **Author name and email**
 - **Python minimum version** (default: 3.12)
-- **Tools to include** - Offer checkboxes for: ruff, mypy, pytest, pre-commit, pyright, pytest-cov
+- **Tools to include** - Offer checkboxes for: ruff, ty, pytest, prek, pyright, pytest-cov
 - **Include coverage enforcement?** (yes/no) - If yes, create .coveragerc
 
-**Note**: This skill uses uv and hatchling as the standard toolchain.
+**Note**: This skill uses uv and hatchling as the standard toolchain. prek is a faster drop-in replacement for pre-commit; it reads the same `.pre-commit-config.yaml`. ty is Astral's type checker, used in place of mypy.
 
 ## Template: pyproject.toml
 
@@ -54,7 +54,7 @@ dynamic = ["version"]
 [dependency-groups]
 dev = [
     # Add selected tools here based on user choices
-    # Example: "ruff", "mypy", "pytest", "pytest-cov", "pyright"
+    # Example: "ruff", "ty", "prek", "pytest", "pytest-cov", "pyright"
 ]
 
 [tool.hatch.version]
@@ -92,15 +92,16 @@ ignore = [
     "S101",   # Allow assert in tests
 ]
 
-[tool.mypy]
-python_version = "{PYTHON_VERSION}"
-strict = true
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-enable_error_code = [
-    "truthy-bool",  # Catch mistakes like "if f.exists()" instead of "if await f.exists()"
-]
+[tool.ty.environment]
+python-version = "{PYTHON_VERSION}"
+
+# Opt-in rules that are off by default, for stricter checking
+[tool.ty.rules]
+possibly-unresolved-reference = "error"
+possibly-missing-attribute = "error"
+possibly-missing-import = "error"
+missing-type-argument = "error"
+blanket-ignore-comment = "error"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -115,29 +116,39 @@ addopts = [
 
 **IMPORTANT**: Must start with `---` for yamllint compliance. Use wrapper scripts for complex commands to avoid line-length violations.
 
-**VERSION NOTE**: Before creating this file, check for the latest versions of uv-pre-commit, ruff-pre-commit, pre-commit-hooks, yamllint, and codespell. The versions below are examples and may be outdated.
+prek reads this file unchanged, so the config also stays usable by upstream pre-commit. prek automatically runs its Rust-native implementations of the `pre-commit-hooks` hooks below. Do not change that repo to `repo: builtin`, which upstream pre-commit cannot read.
+
+Omit the `ty` hook if the user did not select ty.
+
+**VERSION NOTE**: Before creating this file, check for the latest versions of uv-pre-commit, ruff-pre-commit, ty-pre-commit, pre-commit-hooks, yamllint, and codespell. The versions below are examples and may be outdated. After creating the file, `uv run prek update` bumps every `rev` to the latest tag.
 
 ```yaml
 ---
 default_install_hook_types: [pre-commit, post-checkout]
 default_stages: [pre-commit, pre-push, manual]
 repos:
-  # Keep lockfile in sync - check https://github.com/astral-sh/uv-pre-commit for latest
+  # Keep lockfile in sync
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.5.30  # CHECK FOR LATEST VERSION
+    rev: 0.13.5  # CHECK FOR LATEST VERSION
     hooks:
       - id: uv-lock
         require_serial: true
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.6  # CHECK FOR LATEST VERSION
+    rev: v0.17.2  # CHECK FOR LATEST VERSION
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
+  # Type-checks the whole project, not only staged files
+  - repo: https://github.com/astral-sh/ty-pre-commit
+    rev: v0.0.92  # CHECK FOR LATEST VERSION
+    hooks:
+      - id: ty
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0  # CHECK FOR LATEST VERSION
+    rev: v6.0.0  # CHECK FOR LATEST VERSION
     hooks:
       - id: end-of-file-fixer
         exclude: '\.md$'
@@ -152,12 +163,12 @@ repos:
       - id: mixed-line-ending
 
   - repo: https://github.com/adrienverge/yamllint
-    rev: v1.35.1  # CHECK FOR LATEST VERSION
+    rev: v1.38.0  # CHECK FOR LATEST VERSION
     hooks:
       - id: yamllint
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.3.0  # CHECK FOR LATEST VERSION
+    rev: v2.4.3  # CHECK FOR LATEST VERSION
     hooks:
       - id: codespell
         args: [--quiet-level=2]
@@ -170,10 +181,9 @@ repos:
         entry: bash scripts/run-pytest.sh
         language: system
         pass_filenames: false
-
-ci:
-  autoupdate_schedule: monthly
 ```
+
+Do not add a `ci:` section for pre-commit.ci. The ty hook needs network access, which pre-commit.ci blocks. The GitHub Actions workflow below runs prek instead.
 
 ## Template: scripts/run-pytest.sh
 
@@ -187,18 +197,17 @@ exec uv run pytest "$@"
 
 ## Template: .git-hook-template
 
-**IMPORTANT**: This template is installed into .git/hooks/ by install-hooks.sh. It allows pre-commit to run via uv without a global install.
+**IMPORTANT**: This template is installed into .git/hooks/ by install-hooks.sh. It allows prek to run via uv without a global install. Use it instead of `prek install`: that shim stores the absolute path of the prek binary, so it runs the main checkout's venv from every git worktree.
 
 ```bash
 #!/usr/bin/env bash
-# Git hook wrapper that runs pre-commit via uv
-# This allows pre-commit to be managed by uv instead of requiring global install
+# Git hook wrapper that runs prek via uv
+# This allows prek to be managed by uv instead of requiring global install
 
 HOOK_TYPE="$(basename "$0")"
 HOOK_DIR="$(dirname "$0")"
 
-exec uv run pre-commit hook-impl \
-    --config .pre-commit-config.yaml \
+exec uv run prek hook-impl \
     --hook-type "$HOOK_TYPE" \
     --hook-dir "$HOOK_DIR" -- "$@"
 ```
@@ -247,7 +256,7 @@ echo "  git commit --allow-empty -m 'test commit'"
 ## Installation
 
 ```bash
-pip install -e .[dev]
+uv sync
 ```
 
 ## Development
@@ -273,7 +282,7 @@ See setup instructions below.
 """Basic smoke tests."""
 
 
-def test_placeholder():
+def test_placeholder() -> None:
     """TODO: Replace with real tests."""
     pass
 ```
@@ -342,7 +351,7 @@ uv sync --group dev
 
 # Verify setup
 uv run pytest
-uv run pre-commit run --all-files
+uv run prek run --all-files
 ```
 
 ## Verification Steps
@@ -353,15 +362,18 @@ After setup, verify everything works:
 # Run tests
 uv run pytest
 
-# Run linters
-uv run pre-commit run --all-files
+# Run linters and the type checker
+uv run prek run --all-files
+
+# Run the type checker alone
+uv run ty check
 
 # Test git hooks
 git add .
 git commit --allow-empty -m "test: verify hooks work"
 
 # Build the package
-uv run python -m build
+uv build
 ```
 
 ## CI Integration (GitHub Actions)
@@ -375,13 +387,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["{PYTHON_VERSION}", "3.12", "3.13"]
+        # List every minor version from {PYTHON_VERSION} through the latest
+        # release. This example assumes a minimum of 3.12.
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v10
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -389,15 +403,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
-      - name: Run pre-commit
-        run: uv run pre-commit run --all-files
+      - name: Run prek
+        run: uv run prek run --all-files
 
       - name: Run tests with coverage
         run: |
           uv run pytest --cov={PACKAGE_NAME} --cov-report=xml --cov-report=term
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         if: matrix.python-version == '{PYTHON_VERSION}'
 ```
 
@@ -406,7 +420,7 @@ jobs:
 When executing this skill:
 
 1. **Ask the user** for all required information (project name, author, python version, tools, etc.)
-2. **Check for latest versions** of pre-commit hook repos (uv-pre-commit, ruff-pre-commit, etc.)
+2. **Check for latest versions** of hook repos (uv-pre-commit, ruff-pre-commit, ty-pre-commit, etc.)
 3. **Create all files** using the Write tool - substitute placeholders with actual values
 4. **Make scripts executable**: Run `chmod +x scripts/run-pytest.sh` and `chmod +x install-hooks.sh`
 5. **Initialize git** if not already a repo: `git init`
