@@ -19,8 +19,9 @@ This skill will generate:
 6. **scripts/run-pytest.sh** - Wrapper script for pytest (avoids YAML line-length issues)
 7. **.git-hook-template** - Git hook wrapper that runs prek via uv
 8. **install-hooks.sh** - Script to install git hooks
-9. **.coveragerc** (optional) - Coverage configuration
-10. **[tool.pyright] in pyproject.toml** (optional) - Pyright type checker configuration
+9. **.gitignore** - Ignores bytecode, the venv, build output, and tool caches
+10. **.coveragerc** (optional) - Coverage configuration
+11. **[tool.pyright] in pyproject.toml** (optional) - Pyright type checker configuration
 
 ## User Prompts
 
@@ -243,6 +244,33 @@ echo "To test the hooks, run:"
 echo "  git commit --allow-empty -m 'test commit'"
 ```
 
+## Template: .gitignore
+
+**IMPORTANT**: Always create this file before the first `git add`. The setup steps run pytest first, which creates `__pycache__/` directories that would otherwise be committed.
+
+```gitignore
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+```
 
 ## Template: README.md
 
