@@ -71,6 +71,13 @@ Do not run `find` over `/` or a whole home directory; scope it to the directorie
 tool is not on the PATH, assume it is not installed, unless you can run it with `uvx`, `bunx`, or
 similar.
 
+## CI patterns
+
+When setting up new CI workflows, follow these guidelines:
+
+- Release version numbers come from git tags, not the repo contents, whenever possible.
+- In workflows that auto-tag, CI pushes its newly chosen git tag before building anything else.
+
 ## One-off scripts
 
 If you're writing a one-off script outside the context of a full Python project, use this template
